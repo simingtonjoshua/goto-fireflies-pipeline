@@ -29,6 +29,18 @@ const conversationMetadata = new Map(); // conversationSpaceId -> latest call me
 const recordingMetadata = new Map(); // recordingId -> call metadata snapshot
 const pendingByRecordingId = new Map(); // recordingId -> call metadata, kept until Fireflies confirms transcription
 
+// Observed on 2026-07-18: some calls generate TWO RECORDING_UPLOADED notifications with
+// different recording_ids for what is the same physical recording (byte-identical),
+// likely because the extension has multiple devices (desk phone + softphone clients)
+// ringing simultaneously and each leg gets its own recording artifact. Only one of the
+// two recording_ids ever shows up in the call-state events we track, so the second one
+// arrives with no known metadata and would otherwise get uploaded to Fireflies as a
+// duplicate transcript with a generic "unknown number/unknown time" title. Guard against
+// this by remembering recent upload byte-sizes and skipping any recording that matches
+// one already uploaded within the last couple minutes.
+const recentUploadSizes = new Map(); // byteLength -> timestamp of last upload
+const DUPLICATE_WINDOW_MS = 2 * 60 * 1000;
+
 // GoTo pings the webhook with an empty request (User-Agent: "GoTo Notifications")
 // when the notification channel is first created, just to verify reachability.
 app.get('/webhooks/goto', (req, res) => res.sendStatus(200));
@@ -157,6 +169,16 @@ function trackCallState(payload) {
 async function handleRecording(recordingId) {
   console.log(`Fetching recording ${recordingId} from GoTo...`);
   const { buffer, contentType } = await fetchRecordingContent(recordingId);
+
+  const now = Date.now();
+  const lastSeen = recentUploadSizes.get(buffer.length);
+  if (lastSeen && now - lastSeen < DUPLICATE_WINDOW_MS) {
+    console.log(
+      `Skipping recording ${recordingId} (${buffer.length} bytes) - matches a recording uploaded ${Math.round((now - lastSeen) / 1000)}s ago, likely a duplicate leg recording of the same call. Not uploading to Fireflies.`
+    );
+    return;
+  }
+  recentUploadSizes.set(buffer.length, now);
 
   console.log(`Staging recording ${recordingId} (${buffer.length} bytes, ${contentType})...`);
   const publicUrl = await stageRecording(buffer, contentType);
