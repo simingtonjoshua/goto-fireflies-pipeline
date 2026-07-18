@@ -1,5 +1,5 @@
 // Thin wrapper around the GoTo Connect APIs we need:
-//   - Admin API (/admin/rest/v1/me) to discover the account key
+//   - Users API (/users/v1/me) to discover the account key
 //   - Notification Channel API (create a webhook channel)
 //   - Call Events API (subscribe to call state changes)
 //   - Recording API (subscribe to recording-ready notifications, fetch recording bytes)
@@ -9,11 +9,13 @@
 //   https://developer.goto.com/guides/GoToConnect/14_HOW_useNotificationChannelApi/
 //   https://developer.goto.com/guides/GoToConnect/15_HOW_useCallEventsApi/
 //   https://community.goto.com/discussion/323514 (recording content endpoint)
+//   https://developer.goto.com/GoToConnect/#tag/Recording (Recording Subscriptions schema)
 //
-// NOTE: the Recording subscription endpoint (/recording/v1/subscriptions) is inferred
-// from the same pattern as Call Events (both are documented as going through the
-// Notification Channel API). Verify against https://developer.goto.com/GoToConnect
-// (interactive API explorer) before relying on it in production.
+// Verified live against the real API on 2026-07-18: /recording/v1/subscriptions takes
+// a flat { accountKey, channelId, eventTypes } body (eventTypes: RECORDING_UPLOADED,
+// RECORDING_TRANSCRIPT_UPLOADED) - not the { accountKeys: [...] } shape used by Call
+// Events. Also, /admin/rest/v1/me requires an admin-scoped token and returns 401 for
+// this PAT-derived token, so account key discovery uses /users/v1/me instead.
 
 const fetch = require('node-fetch');
 const { getAccessToken } = require('./auth');
@@ -36,14 +38,20 @@ async function gotoFetch(url, options = {}) {
 }
 
 async function getAccountKey() {
-  const res = await gotoFetch(`${ADMIN_BASE}/admin/rest/v1/me`);
+  // /admin/rest/v1/me requires an admin-scoped token and returned 401 not.authenticated
+  // for the PAT-derived token this service uses. /users/v1/me works with the scopes
+  // this OAuth client already has and returns one entry per account the user belongs to.
+  const res = await gotoFetch(`${ADMIN_BASE}/users/v1/me`);
   if (!res.ok) {
-    throw new Error(`Failed to fetch /admin/rest/v1/me (${res.status}): ${await res.text()}`);
+    throw new Error(`Failed to fetch /users/v1/me (${res.status}): ${await res.text()}`);
   }
   const data = await res.json();
-  const accounts = data.accounts || [];
-  if (!accounts.length) throw new Error('No accounts returned for this user/token');
-  return accounts[0].key; // first account; log all of them if the user belongs to more than one
+  const items = data.items || [];
+  if (!items.length) throw new Error('No accounts returned for this user/token');
+  // Prefer the account that actually has phone numbers provisioned (the real phone
+  // system account), falling back to the first entry if none do.
+  const withPhones = items.find((i) => (i.outboundPhoneNumbers || []).length > 0);
+  return (withPhones || items[0]).accountKey;
 }
 
 async function createWebhookChannel(webhookUrl, nickname = 'fireflies-pipeline') {
@@ -82,8 +90,9 @@ async function subscribeRecordingEvents(channelId, accountKey) {
   const res = await gotoFetch(`${API_BASE}/recording/v1/subscriptions`, {
     method: 'POST',
     body: JSON.stringify({
+      accountKey,
       channelId,
-      accountKeys: [{ id: accountKey }],
+      eventTypes: ['RECORDING_UPLOADED', 'RECORDING_TRANSCRIPT_UPLOADED'],
     }),
   });
   if (!res.ok && res.status !== 207) {
