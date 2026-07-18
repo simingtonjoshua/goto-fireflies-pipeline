@@ -33,13 +33,45 @@ const pendingByRecordingId = new Map(); // recordingId -> call metadata, kept un
 // different recording_ids for what is the same physical recording (byte-identical),
 // likely because the extension has multiple devices (desk phone + softphone clients)
 // ringing simultaneously and each leg gets its own recording artifact. Only one of the
-// two recording_ids ever shows up in the call-state events we track, so the second one
-// arrives with no known metadata and would otherwise get uploaded to Fireflies as a
-// duplicate transcript with a generic "unknown number/unknown time" title. Guard against
-// this by remembering recent upload byte-sizes and skipping any recording that matches
-// one already uploaded within the last couple minutes.
+// two recording_ids typically shows up in the call-state events we track. Guard against
+// uploading both by remembering recent upload byte-sizes (fallback safety net) and, more
+// importantly, by batching notifications that land within a short window and preferring
+// to upload whichever recording_id we actually have call metadata for - otherwise the
+// dedup logic can end up keeping the untracked/generic-titled copy and discarding the
+// one with real caller info, depending on arrival order (observed on 2026-07-18).
 const recentUploadSizes = new Map(); // byteLength -> timestamp of last upload
 const DUPLICATE_WINDOW_MS = 2 * 60 * 1000;
+
+let pendingRecordingBatch = [];
+let recordingBatchTimer = null;
+const BATCH_WINDOW_MS = 1500;
+
+function queueRecording(recordingId) {
+  pendingRecordingBatch.push(recordingId);
+  if (recordingBatchTimer) return;
+  recordingBatchTimer = setTimeout(() => {
+    const batch = pendingRecordingBatch;
+    pendingRecordingBatch = [];
+    recordingBatchTimer = null;
+    processRecordingBatch(batch).catch((err) =>
+      console.error('Error processing recording batch:', err)
+    );
+  }, BATCH_WINDOW_MS);
+}
+
+async function processRecordingBatch(batch) {
+  if (batch.length === 1) {
+    return handleRecording(batch[0]);
+  }
+
+  const withMeta = batch.find((id) => recordingMetadata.has(id));
+  const winner = withMeta || batch[0];
+  const skipped = batch.filter((id) => id !== winner);
+  console.log(
+    `Recording batch ${JSON.stringify(batch)} - uploading only ${winner} (known metadata: ${!!withMeta}), skipping ${JSON.stringify(skipped)} as duplicate leg recordings of the same call.`
+  );
+  return handleRecording(winner);
+}
 
 // GoTo pings the webhook with an empty request (User-Agent: "GoTo Notifications")
 // when the notification channel is first created, just to verify reachability.
@@ -55,7 +87,7 @@ app.post('/webhooks/goto', async (req, res) => {
   try {
     const recordingId = extractRecordingId(payload);
     if (recordingId) {
-      await handleRecording(recordingId);
+      queueRecording(recordingId);
       return;
     }
 
