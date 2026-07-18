@@ -4,10 +4,30 @@ const fs = require('fs');
 
 const { fetchRecordingContent } = require('./gotoClient');
 const { stageRecording, getLocalFile } = require('./storage');
-const { uploadAudio } = require('./fireflies');
+const { uploadAudio, updateMeetingChannel } = require('./fireflies');
 
 const app = express();
 app.use(express.json({ limit: '5mb' }));
+
+// The Fireflies "Call Recordings" channel every call transcript should land in.
+// Looked up once via the channels query on 2026-07-18 (Joshua's workspace already had
+// this channel). Override with FIREFLIES_CALL_RECORDINGS_CHANNEL_ID in .env if it's
+// ever recreated and gets a new id.
+const CALL_RECORDINGS_CHANNEL_ID =
+  process.env.FIREFLIES_CALL_RECORDINGS_CHANNEL_ID || '6a5b4b13499df03d1fb00897';
+
+// In-memory correlation state. This is intentionally ephemeral (lost on restart,
+// redeploy, or the free-tier instance spinning down) - it only needs to survive the
+// few seconds between a call's STARTING/ENDING events and its RECORDING_UPLOADED
+// notification, and then again until Fireflies' own webhook confirms the transcript is
+// ready (usually well under a minute for short calls, but can take longer for long
+// ones). If the service restarts in that window the channel auto-assignment for that
+// specific call will be skipped - the transcript still appears in Fireflies, just
+// unfiled. See README for options if this needs to be made durable (e.g. writing this
+// map to a small database or KV store instead of memory).
+const conversationMetadata = new Map(); // conversationSpaceId -> latest call metadata
+const recordingMetadata = new Map(); // recordingId -> call metadata snapshot
+const pendingByRecordingId = new Map(); // recordingId -> call metadata, kept until Fireflies confirms transcription
 
 // GoTo pings the webhook with an empty request (User-Agent: "GoTo Notifications")
 // when the notification channel is first created, just to verify reachability.
@@ -27,27 +47,49 @@ app.post('/webhooks/goto', async (req, res) => {
       return;
     }
 
-    // Otherwise this is a call-state event (STARTING/ACTIVE/ENDING) - just log it.
-    // Useful for correlating with a recording notification that arrives shortly after.
-    const callState = payload?.content?.state?.type;
-    if (callState) {
-      console.log(`Call event: ${callState} (conversationSpaceId=${payload?.content?.metadata?.conversationSpaceId})`);
+    if (payload?.source === 'call-events' && payload?.type === 'call-state') {
+      trackCallState(payload);
     }
   } catch (err) {
     console.error('Error handling GoTo notification:', err);
   }
 });
 
+// Fireflies calls this back once a transcript we uploaded finishes processing (set via
+// the `webhook` field on uploadAudio). Payload: { meetingId, eventType, clientReferenceId }
+// where meetingId is the Fireflies transcript id and clientReferenceId is the GoTo
+// recordingId we set when uploading. See https://docs.fireflies.ai/graphql-api/webhooks
+app.post('/webhooks/fireflies', async (req, res) => {
+  res.sendStatus(200);
+
+  const payload = req.body;
+  console.log('Fireflies notification received:', JSON.stringify(payload));
+
+  try {
+    if (payload?.eventType !== 'Transcription completed') return;
+
+    const transcriptId = payload.meetingId;
+    const recordingId = payload.clientReferenceId;
+    const meta = recordingId ? pendingByRecordingId.get(recordingId) : null;
+
+    console.log('Call transcript ready:', JSON.stringify({ transcriptId, recordingId, ...meta }));
+
+    await updateMeetingChannel(transcriptId, CALL_RECORDINGS_CHANNEL_ID);
+    console.log(`Assigned transcript ${transcriptId} to the Call Recordings channel.`);
+
+    if (recordingId) pendingByRecordingId.delete(recordingId);
+  } catch (err) {
+    console.error('Error handling Fireflies notification:', err);
+  }
+});
+
 // Confirmed against a live payload on 2026-07-18: GoTo's recording-ready notification
 // looks like { source: "recording-service", type: "RECORDING_UPLOADED", content: { recording_id } }.
-// Call-state events look like { source: "call-events", type: "call-state", content: { state: {...} } }
-// and never carry a recording id at this top level (recordings are only referenced inside
-// content.state.participants[].recordings[].id, which is informational, not a ready signal).
+// Call-state events look like { source: "call-events", type: "call-state", content: { state: {...} } }.
 function extractRecordingId(payload) {
   if (payload?.type === 'RECORDING_UPLOADED' && payload?.content?.recording_id) {
     return payload.content.recording_id;
   }
-  // Keep the older guesses as a fallback in case the shape varies by event source.
   return (
     payload?.recordingId ||
     payload?.recording?.id ||
@@ -58,6 +100,50 @@ function extractRecordingId(payload) {
   );
 }
 
+// Tracks call-state events (STARTING/ACTIVE/ENDING) so that by the time a
+// RECORDING_UPLOADED notification arrives for a given recordingId, we already know
+// that call's direction, the outside phone number, and when it happened.
+function trackCallState(payload) {
+  const content = payload.content || {};
+  const metadata = content.metadata || {};
+  const state = content.state || {};
+  const conversationSpaceId = metadata.conversationSpaceId;
+  if (!conversationSpaceId) return;
+
+  const participants = state.participants || [];
+  const external = participants.find((p) => p?.type?.value === 'PHONE_NUMBER');
+  const internal = participants.find((p) => p?.type?.value === 'LINE');
+
+  const existing = conversationMetadata.get(conversationSpaceId) || {};
+  const merged = {
+    conversationSpaceId,
+    direction: metadata.direction || existing.direction,
+    dialString: metadata.dialString || existing.dialString,
+    callCreated: metadata.callCreated || existing.callCreated,
+    accountKey: metadata.accountKey || existing.accountKey,
+    externalNumber: external?.number || existing.externalNumber,
+    externalName: external?.name || existing.externalName,
+    internalName: internal?.name || existing.internalName,
+    internalExtension: internal?.extensionNumber || existing.internalExtension,
+    callState: state.type || existing.callState,
+    callEnded: state.type === 'ENDING' ? state.timestamp : existing.callEnded,
+  };
+  conversationMetadata.set(conversationSpaceId, merged);
+
+  // Whenever a recording id shows up (on a participant or on the state itself),
+  // remember which call it belongs to so handleRecording() can look it up later.
+  const recordingIds = new Set();
+  for (const p of participants) {
+    for (const r of p.recordings || []) recordingIds.add(r.id);
+  }
+  for (const r of state.recordings || []) recordingIds.add(r.id);
+  for (const id of recordingIds) recordingMetadata.set(id, merged);
+
+  console.log(
+    `Call event: ${state.type} (conversationSpaceId=${conversationSpaceId}, direction=${merged.direction}, number=${merged.externalNumber})`
+  );
+}
+
 async function handleRecording(recordingId) {
   console.log(`Fetching recording ${recordingId} from GoTo...`);
   const { buffer, contentType } = await fetchRecordingContent(recordingId);
@@ -65,9 +151,36 @@ async function handleRecording(recordingId) {
   console.log(`Staging recording ${recordingId} (${buffer.length} bytes, ${contentType})...`);
   const publicUrl = await stageRecording(buffer, contentType);
 
-  console.log(`Sending ${recordingId} to Fireflies: ${publicUrl}`);
-  const result = await uploadAudio(publicUrl, `GoTo Connect call ${recordingId}`);
+  const meta = recordingMetadata.get(recordingId) || {};
+  const title = buildTitle(recordingId, meta);
+  console.log(`Sending ${recordingId} to Fireflies as "${title}"...`);
+
+  const webhook = process.env.PUBLIC_BASE_URL
+    ? `${process.env.PUBLIC_BASE_URL.replace(/\/$/, '')}/webhooks/fireflies`
+    : undefined;
+
+  pendingByRecordingId.set(recordingId, meta);
+
+  const result = await uploadAudio({
+    url: publicUrl,
+    title,
+    clientReferenceId: recordingId,
+    webhook,
+  });
   console.log('Fireflies response:', result);
+}
+
+// Builds a title that makes the call identifiable at a glance in the Fireflies list -
+// e.g. "GoTo OUTBOUND call - +19163908378 - 7/18/2026, 2:30:40 AM". All the raw
+// metadata (direction, number, timestamps, conversationSpaceId) is also logged
+// alongside the transcript id once Fireflies confirms processing is done (see the
+// /webhooks/fireflies handler above) so it can be greped out of the Render logs or
+// piped somewhere else later.
+function buildTitle(recordingId, meta) {
+  const when = meta.callCreated ? new Date(meta.callCreated).toLocaleString('en-US') : 'unknown time';
+  const direction = meta.direction || 'call';
+  const number = meta.externalNumber || meta.dialString || 'unknown number';
+  return `GoTo ${direction} call - ${number} - ${when}`;
 }
 
 // Serves locally staged recordings (only used when STORAGE_BACKEND=local).
