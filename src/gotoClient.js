@@ -102,10 +102,35 @@ async function subscribeRecordingEvents(channelId, accountKey) {
 }
 
 // Downloads the raw recording audio bytes for a given recordingId.
+//
+// This is a two-step flow, confirmed live on 2026-07-18:
+//   1. GET /recording/v1/recordings/{id}/content -> a short-lived content token
+//      (JSON body: { token: { token, expires }, status }). This step requires the
+//      normal OAuth Bearer token and only succeeds once the recording's status is
+//      UPLOADED.
+//   2. GET /recording/v1/recordings/{id}/content/{contentToken} -> the actual audio
+//      bytes. The content token goes in the URL path, but the request must ALSO carry
+//      the same Bearer access token - a plain unauthenticated request (e.g. a browser
+//      just navigating to the URL) gets AUTHN_INVALID_TOKEN even with a fresh,
+//      unexpired content token.
 async function fetchRecordingContent(recordingId) {
-  const res = await gotoFetch(`${API_BASE}/recording/v1/recordings/${recordingId}/content`);
+  const tokenRes = await gotoFetch(`${API_BASE}/recording/v1/recordings/${recordingId}/content`);
+  if (!tokenRes.ok) {
+    throw new Error(
+      `Failed to fetch content token for recording ${recordingId} (${tokenRes.status}): ${await tokenRes.text()}`
+    );
+  }
+  const tokenBody = await tokenRes.json();
+  const contentToken = tokenBody?.token?.token;
+  if (!contentToken) {
+    throw new Error(
+      `No content token returned for recording ${recordingId} (status: ${tokenBody?.status}): ${JSON.stringify(tokenBody)}`
+    );
+  }
+
+  const res = await gotoFetch(`${API_BASE}/recording/v1/recordings/${recordingId}/content/${contentToken}`);
   if (!res.ok) {
-    throw new Error(`Failed to fetch recording ${recordingId} (${res.status}): ${await res.text()}`);
+    throw new Error(`Failed to download recording ${recordingId} (${res.status}): ${await res.text()}`);
   }
   const contentType = res.headers.get('content-type') || 'audio/mpeg';
   const buffer = await res.buffer();
