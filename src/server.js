@@ -240,8 +240,15 @@ async function handleRecording(recordingId) {
 // alongside the transcript id once Fireflies confirms processing is done (see the
 // /webhooks/fireflies handler above) so it can be greped out of the Render logs or
 // piped somewhere else later.
+//
+// The GoTo timestamps are UTC (ISO 8601, e.g. "2026-07-18T10:41:40.8Z"). Joshua is on
+// Pacific time, so the title is formatted with an explicit America/Los_Angeles timezone
+// rather than relying on the server's local time (Render's containers default to UTC),
+// which was previously making every title's timestamp look ~7 hours off.
 function buildTitle(recordingId, meta) {
-  const when = meta.callCreated ? new Date(meta.callCreated).toLocaleString('en-US') : 'unknown time';
+  const when = meta.callCreated
+    ? new Date(meta.callCreated).toLocaleString('en-US', { timeZone: 'America/Los_Angeles' })
+    : 'unknown time';
   const direction = meta.direction || 'call';
   const number = meta.externalNumber || meta.dialString || 'unknown number';
   return `GoTo ${direction} call - ${number} - ${when}`;
