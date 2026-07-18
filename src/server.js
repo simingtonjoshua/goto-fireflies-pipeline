@@ -29,23 +29,31 @@ app.post('/webhooks/goto', async (req, res) => {
 
     // Otherwise this is a call-state event (STARTING/ACTIVE/ENDING) - just log it.
     // Useful for correlating with a recording notification that arrives shortly after.
-    const callState = payload?.state?.type;
+    const callState = payload?.content?.state?.type;
     if (callState) {
-      console.log(`Call event: ${callState} (conversationSpaceId=${payload?.metadata?.conversationSpaceId})`);
+      console.log(`Call event: ${callState} (conversationSpaceId=${payload?.content?.metadata?.conversationSpaceId})`);
     }
   } catch (err) {
     console.error('Error handling GoTo notification:', err);
   }
 });
 
-// Best-effort extraction since the exact recording-notification schema should be
-// confirmed against a live payload after the subscription is created (see README).
+// Confirmed against a live payload on 2026-07-18: GoTo's recording-ready notification
+// looks like { source: "recording-service", type: "RECORDING_UPLOADED", content: { recording_id } }.
+// Call-state events look like { source: "call-events", type: "call-state", content: { state: {...} } }
+// and never carry a recording id at this top level (recordings are only referenced inside
+// content.state.participants[].recordings[].id, which is informational, not a ready signal).
 function extractRecordingId(payload) {
+  if (payload?.type === 'RECORDING_UPLOADED' && payload?.content?.recording_id) {
+    return payload.content.recording_id;
+  }
+  // Keep the older guesses as a fallback in case the shape varies by event source.
   return (
     payload?.recordingId ||
     payload?.recording?.id ||
     payload?.data?.recordingId ||
     payload?.body?.recordingId ||
+    payload?.content?.recording_id ||
     null
   );
 }
