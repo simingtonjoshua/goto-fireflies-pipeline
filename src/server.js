@@ -114,6 +114,16 @@ function trackCallState(payload) {
   const external = participants.find((p) => p?.type?.value === 'PHONE_NUMBER');
   const internal = participants.find((p) => p?.type?.value === 'LINE');
 
+  // NOTE: GoTo nests the actual per-participant details (number, name, extensionNumber,
+  // caller) under `type`, not on the participant object itself - confirmed against a
+  // real inbound call payload on 2026-07-18. For PHONE_NUMBER participants, `type.number`
+  // is the DID that was dialed/answered (e.g. the office number on an inbound call), while
+  // `type.caller` holds the true originating party's name/number - prefer that when present
+  // since it's the more useful "who was this call with" value.
+  const externalType = external?.type || {};
+  const externalCaller = externalType.caller || {};
+  const internalType = internal?.type || {};
+
   const existing = conversationMetadata.get(conversationSpaceId) || {};
   const merged = {
     conversationSpaceId,
@@ -121,10 +131,10 @@ function trackCallState(payload) {
     dialString: metadata.dialString || existing.dialString,
     callCreated: metadata.callCreated || existing.callCreated,
     accountKey: metadata.accountKey || existing.accountKey,
-    externalNumber: external?.number || existing.externalNumber,
-    externalName: external?.name || existing.externalName,
-    internalName: internal?.name || existing.internalName,
-    internalExtension: internal?.extensionNumber || existing.internalExtension,
+    externalNumber: externalCaller.number || externalType.number || existing.externalNumber,
+    externalName: externalCaller.name || externalType.name || existing.externalName,
+    internalName: internalType.name || existing.internalName,
+    internalExtension: internalType.extensionNumber || existing.internalExtension,
     callState: state.type || existing.callState,
     callEnded: state.type === 'ENDING' ? state.timestamp : existing.callEnded,
   };
@@ -153,7 +163,7 @@ async function handleRecording(recordingId) {
 
   const meta = recordingMetadata.get(recordingId) || {};
   const title = buildTitle(recordingId, meta);
-  console.log(`Sending ${recordingId} to Fireflies as "${title}"...`);
+  console.log(`Sending ${recordingId} to Fireflies as \"${title}\"...`);
 
   const webhook = process.env.PUBLIC_BASE_URL
     ? `${process.env.PUBLIC_BASE_URL.replace(/\/$/, '')}/webhooks/fireflies`
