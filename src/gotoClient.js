@@ -65,6 +65,22 @@ async function getAccountKey() {
   return (withPhones || items[0]).accountKey;
 }
 
+// Looks up the channelId for a previously-created notification channel by its nickname.
+// Used by the one-off /admin/register-new-subscriptions route (see server.js, added
+// 2026-07-20) so we can attach the new Call History / Call Parking subscriptions to the
+// SAME channel setup.js already created, without re-running the whole setup script -
+// which would duplicate the call-events and recording subscriptions it also creates (see
+// the "safe to re-run" caveat in setup.js). Render's free tier has no Shell access, so
+// this HTTP-triggerable route is how the new subscriptions get registered post-deploy.
+async function getChannelId(nickname) {
+  const res = await gotoFetch(`${API_BASE}/notification-channel/v1/channels/${encodeURIComponent(nickname)}`);
+  if (!res.ok) {
+    throw new Error(`Failed to look up notification channel "${nickname}" (${res.status}): ${await res.text()}`);
+  }
+  const data = await res.json();
+  return data.channelId;
+}
+
 async function createWebhookChannel(webhookUrl, nickname = 'fireflies-pipeline') {
   const res = await gotoFetch(
     `${API_BASE}/notification-channel/v1/channels/${encodeURIComponent(nickname)}`,
@@ -245,6 +261,7 @@ async function fetchRecordingContent(recordingId) {
 module.exports = {
   getAccountKey,
   createWebhookChannel,
+  getChannelId,
   subscribeCallEvents,
   subscribeRecordingEvents,
   subscribeCallHistoryEvents,
