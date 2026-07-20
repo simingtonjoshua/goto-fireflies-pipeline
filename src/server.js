@@ -2,9 +2,10 @@ require('dotenv').config();
 const express = require('express');
 const fs = require('fs');
 
-const { fetchRecordingContent } = require('./gotoClient');
+const { fetchRecordingContent, fetchTranscript } = require('./gotoClient');
 const { stageRecording, getLocalFile } = require('./storage');
 const { uploadAudio, updateMeetingChannel } = require('./fireflies');
+const interactions = require('./interactions');
 
 const app = express();
 app.use(express.json({ limit: '5mb' }));
@@ -13,6 +14,11 @@ app.use(express.json({ limit: '5mb' }));
 // Looked up once via the channels query on 2026-07-18 (Joshua's workspace already had
 // this channel). Override with FIREFLIES_CALL_RECORDINGS_CHANNEL_ID in .env if it's
 // ever recreated and gets a new id.
+//
+// NOTE: this Fireflies path is being kept running as-is while the new pipeline (GoTo's
+// own transcription, Google Drive archival, OpenAI summarization, direct Heymarket
+// posting - see src/interactions.js) is built out alongside it. Once that new pipeline
+// is fully wired up and verified, this Fireflies leg can likely be retired.
 const CALL_RECORDINGS_CHANNEL_ID =
   process.env.FIREFLIES_CALL_RECORDINGS_CHANNEL_ID || '6a5b4b13499df03d1fb00897';
 
@@ -85,14 +91,33 @@ app.post('/webhooks/goto', async (req, res) => {
   console.log('GoTo notification received:', JSON.stringify(payload));
 
   try {
-    const recordingId = extractRecordingId(payload);
-    if (recordingId) {
-      queueRecording(recordingId);
+    const notification = classifyNotification(payload);
+
+    if (notification.kind === 'recording-uploaded') {
+      queueRecording(notification.recordingId);
+      return;
+    }
+
+    if (notification.kind === 'transcript-uploaded') {
+      handleTranscriptReady(notification.recordingId).catch((err) =>
+        console.error(`Error handling transcript for recording ${notification.recordingId}:`, err)
+      );
       return;
     }
 
     if (payload?.source === 'call-events' && payload?.type === 'call-state') {
       trackCallState(payload);
+      return;
+    }
+
+    if (payload?.source === 'call-history') {
+      interactions.recordCallHistoryEvent(payload);
+      return;
+    }
+
+    if (payload?.source === 'call-parking') {
+      interactions.recordCallParkingEvent(payload);
+      return;
     }
   } catch (err) {
     console.error('Error handling GoTo notification:', err);
@@ -127,21 +152,25 @@ app.post('/webhooks/fireflies', async (req, res) => {
   }
 });
 
-// Confirmed against a live payload on 2026-07-18: GoTo's recording-ready notification
-// looks like { source: "recording-service", type: "RECORDING_UPLOADED", content: { recording_id } }.
-// Call-state events look like { source: "call-events", type: "call-state", content: { state: {...} } }.
-function extractRecordingId(payload) {
+// GoTo's recording-service notifications come in two flavors, confirmed against live
+// payloads on 2026-07-18 (RECORDING_UPLOADED) and 2026-07-20 (RECORDING_TRANSCRIPT_UPLOADED,
+// once the Advanced Reporting & Analytics add-on was enabled):
+//   { source: "recording-service", type: "RECORDING_UPLOADED", content: { recording_id } }
+//   { source: "recording-service", type: "RECORDING_TRANSCRIPT_UPLOADED", content: { recording_id } }
+// These must be told apart explicitly - a previous version of this function used a
+// generic fallback (any payload with content.recording_id) that treated both the same,
+// which meant every transcript-ready notification was silently re-triggering an
+// unnecessary re-fetch/re-upload attempt of a recording we'd already processed (masked
+// by the byte-size dedup, but wasteful and fragile - found while investigating the new
+// transcript notification on 2026-07-20).
+function classifyNotification(payload) {
   if (payload?.type === 'RECORDING_UPLOADED' && payload?.content?.recording_id) {
-    return payload.content.recording_id;
+    return { kind: 'recording-uploaded', recordingId: payload.content.recording_id };
   }
-  return (
-    payload?.recordingId ||
-    payload?.recording?.id ||
-    payload?.data?.recordingId ||
-    payload?.body?.recordingId ||
-    payload?.content?.recording_id ||
-    null
-  );
+  if (payload?.type === 'RECORDING_TRANSCRIPT_UPLOADED' && payload?.content?.recording_id) {
+    return { kind: 'transcript-uploaded', recordingId: payload.content.recording_id };
+  }
+  return { kind: 'unknown' };
 }
 
 // Tracks call-state events (STARTING/ACTIVE/ENDING) so that by the time a
@@ -184,6 +213,23 @@ function trackCallState(payload) {
   };
   conversationMetadata.set(conversationSpaceId, merged);
 
+  // Feeds the new interaction-grouping/CSR-chain tracker (src/interactions.js) in
+  // parallel with the existing conversationMetadata bookkeeping above. Kept as a
+  // separate call (rather than folded into `merged`) so the new pipeline can evolve
+  // independently of the Fireflies-based one without the two stepping on each other.
+  interactions.recordLegState(conversationSpaceId, {
+    legId: internal?.legId || external?.legId,
+    internalName: internalType.name,
+    internalExtension: internalType.extensionNumber,
+    externalName: merged.externalName,
+    externalNumber: merged.externalNumber,
+    direction: merged.direction,
+    dialString: merged.dialString,
+    callCreated: merged.callCreated,
+    callEnded: merged.callEnded,
+    accountKey: merged.accountKey,
+  });
+
   // Whenever a recording id shows up (on a participant or on the state itself),
   // remember which call it belongs to so handleRecording() can look it up later.
   const recordingIds = new Set();
@@ -196,6 +242,26 @@ function trackCallState(payload) {
   console.log(
     `Call event: ${state.type} (conversationSpaceId=${conversationSpaceId}, direction=${merged.direction}, number=${merged.externalNumber})`
   );
+}
+
+// New pipeline path (2026-07-20): fetches the actual transcript content from GoTo now
+// that the Advanced Reporting & Analytics add-on is enabled, and hands it to
+// interactions.js to be grouped with the rest of its interaction. Runs alongside the
+// existing Fireflies flow (handleRecording below), not instead of it, until the
+// summarization/Drive/Heymarket steps are built and this can be verified end-to-end.
+async function handleTranscriptReady(recordingId) {
+  console.log(`Fetching transcript for recording ${recordingId} from GoTo...`);
+  const transcript = await fetchTranscript(recordingId);
+
+  const meta = recordingMetadata.get(recordingId);
+  if (!meta || !meta.conversationSpaceId) {
+    console.log(
+      `Transcript for ${recordingId} has no known conversationSpaceId yet - this is exactly the "orphan recording" case (see the parked-call investigation from 2026-07-19/20). Dropping for now; Call History correlation (src/interactions.js) may still resolve the recording itself once we also track recordingId -> legId, which isn't wired up yet.`
+    );
+    return;
+  }
+
+  interactions.recordTranscript(meta.conversationSpaceId, recordingId, transcript);
 }
 
 async function handleRecording(recordingId) {
@@ -217,7 +283,7 @@ async function handleRecording(recordingId) {
 
   const meta = recordingMetadata.get(recordingId) || {};
   const title = buildTitle(recordingId, meta);
-  console.log(`Sending ${recordingId} to Fireflies as \"${title}\"...`);
+  console.log(`Sending ${recordingId} to Fireflies as "${title}"...`);
 
   const webhook = process.env.PUBLIC_BASE_URL
     ? `${process.env.PUBLIC_BASE_URL.replace(/\/$/, '')}/webhooks/fireflies`
