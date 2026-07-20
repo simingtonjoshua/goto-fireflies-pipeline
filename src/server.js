@@ -6,7 +6,7 @@ const {
   fetchRecordingContent,
   fetchTranscript,
   getAccountKey,
-  getChannelId,
+  createWebhookChannel,
   subscribeCallHistoryEvents,
   subscribeCallParkingEvents,
 } = require('./gotoClient');
@@ -344,10 +344,18 @@ app.get('/recordings/:file', (req, res) => {
 // of `npm run setup`'s new subscription calls against the live deployment: hit this route
 // once after a deploy, check the JSON response, then it can be removed in a follow-up
 // commit since running it again would register duplicate subscriptions.
+//
+// NOTE: GoTo's notification-channel endpoint only supports POST (confirmed live on
+// 2026-07-20 - a GET attempt returned 405 METHOD_NOT_ALLOWED), not a GET-by-nickname
+// lookup. So instead of looking up the existing channel, this re-POSTs to
+// createWebhookChannel() with the SAME nickname + webhook URL setup.js originally used -
+// since the nickname is the path identifier, this should upsert/return the same
+// channelId rather than creating a second channel.
 app.get('/admin/register-new-subscriptions', async (req, res) => {
   try {
     const accountKey = process.env.GOTO_ACCOUNT_KEY || (await getAccountKey());
-    const channelId = await getChannelId('fireflies-pipeline');
+    const webhookUrl = `${process.env.PUBLIC_BASE_URL.replace(/\/$/, '')}/webhooks/goto`;
+    const channelId = await createWebhookChannel(webhookUrl);
     const result = { accountKey, channelId };
 
     try {
