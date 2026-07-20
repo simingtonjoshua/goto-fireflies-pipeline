@@ -2,7 +2,14 @@ require('dotenv').config();
 const express = require('express');
 const fs = require('fs');
 
-const { fetchRecordingContent, fetchTranscript } = require('./gotoClient');
+const {
+  fetchRecordingContent,
+  fetchTranscript,
+  getAccountKey,
+  getChannelId,
+  subscribeCallHistoryEvents,
+  subscribeCallParkingEvents,
+} = require('./gotoClient');
 const { stageRecording, getLocalFile } = require('./storage');
 const { uploadAudio, updateMeetingChannel } = require('./fireflies');
 const interactions = require('./interactions');
@@ -327,6 +334,40 @@ app.get('/recordings/:file', (req, res) => {
   if (!entry) return res.sendStatus(404);
   res.setHeader('Content-Type', entry.contentType);
   fs.createReadStream(entry.filePath).pipe(res);
+});
+
+// One-off admin route (added 2026-07-20): registers the new Call History + Call Parking
+// subscriptions on the SAME notification channel setup.js already created, WITHOUT
+// re-running setup.js itself (which would duplicate the call-events/recording
+// subscriptions it also creates - see the "safe to re-run" caveat in setup.js). Render's
+// free tier has no Shell access, so this is the practical way to trigger the equivalent
+// of `npm run setup`'s new subscription calls against the live deployment: hit this route
+// once after a deploy, check the JSON response, then it can be removed in a follow-up
+// commit since running it again would register duplicate subscriptions.
+app.get('/admin/register-new-subscriptions', async (req, res) => {
+  try {
+    const accountKey = process.env.GOTO_ACCOUNT_KEY || (await getAccountKey());
+    const channelId = await getChannelId('fireflies-pipeline');
+    const result = { accountKey, channelId };
+
+    try {
+      result.callHistory = await subscribeCallHistoryEvents(channelId, accountKey);
+    } catch (err) {
+      result.callHistoryError = err.message;
+    }
+
+    try {
+      result.callParking = await subscribeCallParkingEvents(channelId, accountKey);
+    } catch (err) {
+      result.callParkingError = err.message;
+    }
+
+    console.log('Admin: registered new subscriptions:', JSON.stringify(result));
+    res.json(result);
+  } catch (err) {
+    console.error('Admin: failed to register new subscriptions:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.get('/healthz', (req, res) => res.json({ ok: true }));
