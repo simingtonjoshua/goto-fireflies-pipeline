@@ -1,17 +1,17 @@
 {
-  "name": "goto-fireflies-pipeline",
-  "version": "1.0.0",
-  "private": true,
-  "description": "Receives GoTo Connect call recording notifications and pushes recordings to Fireflies.ai for transcription.",
-  "type": "commonjs",
-  "main": "src/server.js",
-  "scripts": {
-    "start": "node src/server.js",
-    "setup": "node src/setup.js"
-  },
-  "dependencies": {
-    "express": "^4.19.2",
-    "node-fetch": "^2.7.0",
-    "dotenv": "^16.4.5"
-  }
+    "name": "goto-fireflies-pipeline",
+    "version": "1.0.0",
+    "private": true,
+    "description": "Receives GoTo Connect call recording notifications, fetches transcripts directly from GoTo's Advanced Reporting & Analytics add-on, groups multi-leg calls into interactions, and archives recordings to Google Drive.",
+    "type": "commonjs",
+    "main": "src/server.js",
+    "scripts": {
+          "start": "node src/server.js",
+          "setup": "node src/setup.js"
+    },
+    "dependencies": {
+          "express": "^4.19.2",
+          "node-fetch": "^2.7.0",
+          "dotenv": "^16.4.5"
+    }
 }
