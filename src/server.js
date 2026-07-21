@@ -242,43 +242,32 @@ async function handleRecording(recordingId) {
     if (lastSeen && now - lastSeen < DUPLICATE_WINDOW_MS) {
           console.log(
                   `Skipping recording ${recordingId} (${buffer.length} bytes) - matches a recording archived ${Math.round((now - lastSeen) / 1000)}s ago, likely a duplicate leg recording of the same call.`
-                );
-          return;
-    }
-    recentUploadSizes.set(buffer.length, now);
+                async function archiveToDrive(recordingId, buffer, contentType, meta) {
+                  try {
+                                const ext = driveClient.extForContentType(contentType);
+                                const folderName = driveClient.buildCallFolderName({
+                                                    callCreated: meta.callCreated,
+                                                    direction: meta.direction,
+                                                    externalNumber: meta.externalNumber || meta.dialString,
+                                });
+                                const topFolderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
+                                const folder = await driveClient.getOrCreateCallFolder(topFolderId, folderName);
+                                const filename = `Call Recording.${ext}`;
 
-  const meta = recordingMetadata.get(recordingId) || {};
-    await archiveToDrive(recordingId, buffer, contentType, meta);
-}
+                            const { webViewLink } = await driveClient.uploadRecording(buffer, contentType, filename, folder.id);
+                                console.log(`Archived recording ${recordingId} to Google Drive folder "${folderName}": ${webViewLink}`);
 
-// Uploads a recording to Joshua's personal Google Drive folder for permanent archival
-// (see src/driveClient.js) and attaches the resulting link to this leg's interaction
-// record once we know which conversationSpaceId it belongs to. Wrapped in its own
-// try/catch so a Drive outage or misconfiguration never takes down the rest of the
-// webhook handler.
-async function archiveToDrive(recordingId, buffer, contentType, meta) {
-    try {
-          const ext = driveClient.extForContentType(contentType);
-          const when = meta.callCreated
-            ? new Date(meta.callCreated).toISOString().replace(/[:.]/g, '-')
-                  : new Date().toISOString().replace(/[:.]/g, '-');
-          const number = (meta.externalNumber || meta.dialString || 'unknown-number').replace(/[^\d+]/g, '') || 'unknown-number';
-          const filename = `${when}_${meta.direction || 'call'}_${number}_${recordingId}.${ext}`;
-
-      const { webViewLink } = await driveClient.uploadRecording(buffer, contentType, filename);
-          console.log(`Archived recording ${recordingId} to Google Drive: ${webViewLink}`);
-
-      if (meta.conversationSpaceId) {
-              interactions.recordRecordingLink(meta.conversationSpaceId, recordingId, webViewLink);
-      } else {
-              console.log(
-                        `Recording ${recordingId} archived to Drive but has no known conversationSpaceId yet - the link won't be attached to an interaction (same "orphan recording" case handleTranscriptReady logs).`
-                      );
-      }
-    } catch (err) {
-          console.error(`Error archiving recording ${recordingId} to Google Drive:`, err);
-    }
-}
+                            if (meta.conversationSpaceId) {
+                                              interactions.recordRecordingLink(meta.conversationSpaceId, recordingId, webViewLink, folder);
+                            } else {
+                                              console.log(
+                                                                        `Recording ${recordingId} archived to Drive but has no known conversationSpaceId yet - the link won't be attached to an interaction (same "orphan recording" case handleTranscriptReady logs).`
+                                                                );
+                            }
+                  } catch (err) {
+                                console.error(`Error archiving recording ${recordingId} to Google Drive:`, err);
+                  }
+          }
 
 // One-off admin route (added 2026-07-20): registers the new Call History + Call Parking
 // subscriptions on the SAME notification channel setup.js already created, WITHOUT
@@ -334,6 +323,19 @@ app.get('/admin/debug-transcript/:recordingId', async (req, res) => {
         }
 });
 
+
+// One-off admin route (added 2026-07-21): renames the top-level Drive destination
+// folder from "Call Recordings" to "Call Recordings & Transcriptions" now that
+// per-call transcript Docs live there too (see driveClient.js). Hit once, confirm the
+// JSON response, then this can be removed in a follow-up commit.
+app.get('/admin/rename-drive-folder', async (req, res) => {
+        try {
+                      const folder = await driveClient.renameFolder(process.env.GOOGLE_DRIVE_FOLDER_ID, 'Call Recordings & Transcriptions');
+                      res.json(folder);
+        } catch (err) {
+                      res.status(500).json({ error: err.message });
+        }
+});
 
 app.get('/healthz', (req, res) => res.json({ ok: true }));
 
