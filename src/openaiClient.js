@@ -108,6 +108,36 @@
 //    compressing them into a fill-in-the-blank shape. Length is whatever the call
 //    actually needs - a one-line note for a quick callback, a fuller paragraph for a
 //    detailed booking - rather than a fixed template or number of sentences.
+// 10) NO-TRANSCRIPT ATTRIBUTION + UTC-TIME FIX (added 2026-07-21, found on two real
+//    calls): 253-444-7157, an outbound call placed by Emily Kingdon that captured no
+//    transcript (likely no answer/short call), got summarized as "The call was made by
+//    the customer at (253) 444-7157" - backwards, since Emily's team placed this call
+//    TO that number, the customer didn't call in. A second real call, 415-786-7738 -
+//    this one WITH a full, unambiguous transcript of Kristine Vandervort placing an
+//    outbound call to Amber to book a consultation - still opened with "Amber called
+//    Budget Blinds," the same backwards framing, confirming this wasn't just a
+//    no-transcript edge case: the model needed to be told the call's direction
+//    explicitly rather than inferring it, even when the transcript content alone made
+//    it obvious to a person. The same 253-444-7157 summary also said the call
+//    "started ... at 8:10 PM" when it actually started at 1:10 PM Pacific - the model
+//    was handed the raw ISO UTC timestamp ("...T20:10:00.000Z") in the metadata context
+//    and simply read the UTC clock digits back as if they were correct, with nothing
+//    telling it otherwise. Two root causes, two fixes:
+//    a) `direction` (OUTBOUND/INBOUND) was never given to the model as its own labeled
+//       context line - it was only implied indirectly by whether a "Caller ID" line
+//       happened to be present. There's now an explicit "Call direction: ..." context
+//       line that also spells out what OUTBOUND/INBOUND means in plain terms, plus a
+//       matching IMPORTANT instruction in SYSTEM_PROMPT.
+//    b) `callCreated`/`callEnded` are now passed through driveClient.formatPacific()
+//       (the same helper already used for the Doc's own "Call started"/"Call ended"
+//       lines) before ever reaching the model, so it only ever sees the already-correct
+//       local time and never has to do (or botch) its own timezone conversion.
+//    A no-transcript call has no real conversation for a model to summarize anyway -
+//    it's pure metadata - so as a further safety net this class of call now skips the
+//    OpenAI call entirely: buildNoTranscriptSummary() below builds that one sentence
+//    directly from the same already-correct direction/name/time data, which guarantees
+//    both of these bugs can't recur for this case rather than just making them less
+//    likely.
 
 const fetch = require('node-fetch');
 const driveClient = require('./driveClient');
@@ -116,19 +146,19 @@ const OPENAI_URL = 'https://api.openai.com/v1/chat/completions';
 const MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
 function normalizeTranscript(raw) {
-        if (!raw) return [];
-        const items = Array.isArray(raw) ? raw : raw.results || raw.items || raw.transcriptions || [];
-        if (!Array.isArray(items)) return [];
+            if (!raw) return [];
+            const items = Array.isArray(raw) ? raw : raw.results || raw.items || raw.transcriptions || [];
+            if (!Array.isArray(items)) return [];
 
   return items
-          .filter((item) => item && (item.transcript || item.text))
-          .map((item) => ({
-                            channel: item.channel ?? 0,
-                            text: (item.transcript || item.text || '').trim(),
-                            startTimeMs: item.startTimeMs ?? item.start_time_ms ?? 0,
-          }))
-          .filter((item) => item.text)
-          .sort((a, b) => a.startTimeMs - b.startTimeMs);
+              .filter((item) => item && (item.transcript || item.text))
+              .map((item) => ({
+                                    channel: item.channel ?? 0,
+                                    text: (item.transcript || item.text || '').trim(),
+                                    startTimeMs: item.startTimeMs ?? item.start_time_ms ?? 0,
+              }))
+              .filter((item) => item.text)
+              .sort((a, b) => a.startTimeMs - b.startTimeMs);
 }
 
 // A Budget Blinds team member making one of these calls always announces the business
@@ -146,34 +176,34 @@ const SELF_ID_PATTERN = /budget\s+(blinds|lines)\b/i;
 // inferred - callers should fall back to generic "Channel N" labels in that case rather
 // than guessing.
 function inferChannelRoles(utterances, direction) {
-        const channelsInOrder = [];
-        for (const u of utterances) {
-                      if (!channelsInOrder.includes(u.channel)) channelsInOrder.push(u.channel);
-                      if (channelsInOrder.length >= 2) break;
-        }
-        if (channelsInOrder.length < 2) return {};
+            const channelsInOrder = [];
+            for (const u of utterances) {
+                              if (!channelsInOrder.includes(u.channel)) channelsInOrder.push(u.channel);
+                              if (channelsInOrder.length >= 2) break;
+            }
+            if (channelsInOrder.length < 2) return {};
 
   const [first, second] = channelsInOrder;
 
   const textByChannel = {};
-        for (const u of utterances) {
-                      textByChannel[u.channel] = `${textByChannel[u.channel] || ''} ${u.text}`;
-        }
-        const selfIdChannels = channelsInOrder.filter((c) => SELF_ID_PATTERN.test(textByChannel[c] || ''));
-        if (selfIdChannels.length === 1) {
-                      const teamMemberChannel = selfIdChannels[0];
-                      const customerChannel = teamMemberChannel === first ? second : first;
-                      return { [teamMemberChannel]: 'TeamMember', [customerChannel]: 'Customer' };
-        }
+            for (const u of utterances) {
+                              textByChannel[u.channel] = `${textByChannel[u.channel] || ''} ${u.text}`;
+            }
+            const selfIdChannels = channelsInOrder.filter((c) => SELF_ID_PATTERN.test(textByChannel[c] || ''));
+            if (selfIdChannels.length === 1) {
+                              const teamMemberChannel = selfIdChannels[0];
+                              const customerChannel = teamMemberChannel === first ? second : first;
+                              return { [teamMemberChannel]: 'TeamMember', [customerChannel]: 'Customer' };
+            }
 
   // Fallback: order-of-first-utterance + call-direction heuristic. Only trustworthy
   // when direction is definitively known - an unknown/missing direction (the metadata
   // race described in the header comment) makes this a coin flip, so give up rather
   // than risk labeling the two sides backwards.
   if (direction !== 'OUTBOUND' && direction !== 'INBOUND') return {};
-        const teamMemberChannel = direction === 'OUTBOUND' ? second : first;
-        const customerChannel = teamMemberChannel === first ? second : first;
-        return { [teamMemberChannel]: 'TeamMember', [customerChannel]: 'Customer' };
+            const teamMemberChannel = direction === 'OUTBOUND' ? second : first;
+            const customerChannel = teamMemberChannel === first ? second : first;
+            return { [teamMemberChannel]: 'TeamMember', [customerChannel]: 'Customer' };
 }
 
 // Formats one leg's transcript as an array of { seconds, label, text } rows. seconds is
@@ -185,61 +215,61 @@ function inferChannelRoles(utterances, direction) {
 // formatTranscriptForDoc (what gets written into the Google Doc), so both always show
 // the exact same labeling.
 function formatLegTranscript(leg) {
-        const utterances = normalizeTranscript(leg.transcript);
-        if (!utterances.length) return [];
+            const utterances = normalizeTranscript(leg.transcript);
+            if (!utterances.length) return [];
 
   const roles = inferChannelRoles(utterances, leg.direction);
-        const teamMemberName = (leg.csrChain && leg.csrChain.length) ? leg.csrChain[leg.csrChain.length - 1].name : null;
-        const startMs = utterances[0].startTimeMs || 0;
+            const teamMemberName = (leg.csrChain && leg.csrChain.length) ? leg.csrChain[leg.csrChain.length - 1].name : null;
+            const startMs = utterances[0].startTimeMs || 0;
 
   return utterances.map((u) => {
-              const role = roles[u.channel];
-              let label;
-              if (role === 'TeamMember') label = teamMemberName || 'Team Member';
-              else if (role === 'Customer') label = 'Customer';
-              else label = `Channel ${u.channel}`;
-              const seconds = Math.max(0, Math.round((u.startTimeMs - startMs) / 1000));
-              return { seconds, label, text: u.text };
+                  const role = roles[u.channel];
+                  let label;
+                  if (role === 'TeamMember') label = teamMemberName || 'Team Member';
+                  else if (role === 'Customer') label = 'Customer';
+                  else label = `Channel ${u.channel}`;
+                  const seconds = Math.max(0, Math.round((u.startTimeMs - startMs) / 1000));
+                  return { seconds, label, text: u.text };
   });
 }
 
 // Concatenates every leg's transcript rows, in chronological order by the leg's own
 // callCreated timestamp, across the whole interaction.
 function allTranscriptRows(legRecords) {
-        const ordered = [...legRecords].sort((a, b) =>
-                      (a.callCreated || '').localeCompare(b.callCreated || '')
-                                                                                        );
-        const rows = [];
-        for (const leg of ordered) {
-                      for (const row of formatLegTranscript(leg)) rows.push(row);
-        }
-        return rows;
+            const ordered = [...legRecords].sort((a, b) =>
+                              (a.callCreated || '').localeCompare(b.callCreated || '')
+                                                                                            );
+            const rows = [];
+            for (const leg of ordered) {
+                              for (const row of formatLegTranscript(leg)) rows.push(row);
+            }
+            return rows;
 }
 
 // Plain-text "[Ns] Label: text" lines, one per transcript row, for the model.
 function buildConversationText(legRecords) {
-        return allTranscriptRows(legRecords)
-          .map((r) => `[${r.seconds}s] ${r.label}: ${r.text}`)
-          .join('\n');
+            return allTranscriptRows(legRecords)
+              .map((r) => `[${r.seconds}s] ${r.label}: ${r.text}`)
+              .join('\n');
 }
 
 // Same rows as buildConversationText, but HTML-escaped and wrapped as <p> tags for
 // direct inclusion in the transcript+summary Google Doc (see
 // driveClient.createTranscriptDoc / interactions.js finalizeInteraction).
 function escapeHtml(text) {
-        return text
-          .replace(/&/g, '&amp;')
-          .replace(/</g, '&lt;')
-          .replace(/>/g, '&gt;');
+            return text
+              .replace(/&/g, '&amp;')
+              .replace(/</g, '&lt;')
+              .replace(/>/g, '&gt;');
 }
 
 function formatTranscriptForDoc(legRecords) {
-        const rows = allTranscriptRows(legRecords);
-        if (!rows.length) return '<p><i>No transcript was available for this call.</i></p>';
+            const rows = allTranscriptRows(legRecords);
+            if (!rows.length) return '<p><i>No transcript was available for this call.</i></p>';
 
   return rows
-          .map((r) => `<p><b>[${r.seconds}s] ${escapeHtml(r.label)}:</b> ${escapeHtml(r.text)}</p>`)
-          .join('\n');
+              .map((r) => `<p><b>[${r.seconds}s] ${escapeHtml(r.label)}:</b> ${escapeHtml(r.text)}</p>`)
+              .join('\n');
 }
 
 // Free-form call summary instructions (see header comment item 9 - FORMAT REDESIGN,
@@ -266,54 +296,87 @@ IMPORTANT - never invent a phone number: only ever write a phone number that app
 
 IMPORTANT - a one-sided transcript is still a transcript: if the transcript is just an automated voicemail greeting followed by the team member leaving a message (no customer speech at all), that is NOT "no transcript available" - summarize what the team member said in the message (who they were trying to reach, what it was about, any callback info given). Only say a transcript was unavailable if the transcript section given to you is truly empty (no lines at all).
 
-IMPORTANT - vendor/solicitation calls are not customer calls: if the caller is clearly a vendor, salesperson, recruiter, advertiser, or other outside business calling to sell or pitch something TO Budget Blinds (rather than asking about window treatments themselves), do not refer to them as "the customer" anywhere in the summary. Identify the caller by their actual name and company if stated (e.g. "Natalie from Clear Channel Outdoor"), and describe plainly what they were soliciting and what was said - do not frame it as a customer inquiry.`;
+IMPORTANT - vendor/solicitation calls are not customer calls: if the caller is clearly a vendor, salesperson, recruiter, advertiser, or other outside business calling to sell or pitch something TO Budget Blinds (rather than asking about window treatments themselves), do not refer to them as "the customer" anywhere in the summary. Identify the caller by their actual name and company if stated (e.g. "Natalie from Clear Channel Outdoor"), and describe plainly what they were soliciting and what was said - do not frame it as a customer inquiry.
+
+IMPORTANT - who called whom: the metadata includes this call's direction. OUTBOUND means a Budget Blinds team member placed this call to the customer's number - never describe an outbound call as something the customer initiated (e.g. never say "the customer called" for an outbound call). INBOUND means the customer called in to Budget Blinds. Also always use the times exactly as given in the metadata (they're already in the correct local time) - never do your own timezone conversion or restate a time differently than given.`;
+
+// Builds the summary directly, without calling OpenAI at all, for a call with no
+// transcript text whatsoever (see header comment item 10 - NO-TRANSCRIPT ATTRIBUTION +
+// UTC-TIME FIX). There's no real conversation content for a model to summarize in this
+// case anyway - it's pure metadata - so this generates the one sentence that's actually
+// knowable directly from data that's already correct, rather than asking the model to
+// guess at it (which produced two real bugs: describing an outbound call as something
+// the customer did, and restating a raw UTC timestamp as if it were the correct local
+// time).
+function buildNoTranscriptSummary({ csrPath, externalNumber, direction, callCreated }) {
+            const displayNumber = driveClient.formatPhoneForDisplay(externalNumber);
+            const when = driveClient.formatPacific(callCreated);
+            const lastTeamMember = (csrPath && csrPath.length)
+              ? csrPath[csrPath.length - 1].replace(/\s*\([^)]*\)\s*$/, '').trim()
+                            : null;
+            const teamMemberPhrase = lastTeamMember || 'a Budget Blinds team member';
+
+  if (direction === 'OUTBOUND') {
+                  return `No transcript was available for this call. ${teamMemberPhrase} placed an outbound call to ${displayNumber} on ${when}, but no conversation audio or transcript was captured for it (likely no answer, a voicemail with no message left, or a call too short to record).`;
+  }
+          if (direction === 'INBOUND') {
+                          return `No transcript was available for this call. ${displayNumber} called in to Budget Blinds and was connected to ${teamMemberPhrase} on ${when}, but no conversation audio or transcript was captured for it.`;
+          }
+          return `No transcript was available for this call involving ${displayNumber} on ${when}.`;
+}
 
 // Sends the assembled call context to OpenAI and returns the formatted summary.
 // Throws on failure - the caller (src/interactions.js) catches and logs so a
 // summarization failure never crashes the webhook handler.
 async function summarizeInteraction({ legRecords, csrPath, externalName, externalNumber, direction, callCreated, callEnded }) {
-        const conversationText = buildConversationText(legRecords);
+            const conversationText = buildConversationText(legRecords);
+
+  // A call with genuinely no transcript text has no real content for a model to
+  // summarize - see buildNoTranscriptSummary above and header comment item 10 for why
+  // this is built directly in code instead of asking OpenAI to describe it.
+  if (!conversationText) {
+                  return buildNoTranscriptSummary({ csrPath, externalNumber, direction, callCreated });
+  }
 
   const contextLines = [
-              `Customer phone number: ${driveClient.formatPhoneForDisplay(externalNumber)}`,
-              direction !== 'OUTBOUND' && externalName
-                ? `Caller ID on file for this number (a carrier/line label, not necessarily a person's name - see instructions above): ${externalName}`
-                : null,
-              `Team member path (in order, if transferred/parked): ${(csrPath || []).join(' -> ') || 'unknown'}`,
-              `Call started: ${callCreated || 'unknown'}`,
-              `Call ended: ${callEnded || 'unknown'}`,
-            ].filter(Boolean);
-        const context = contextLines.join('\n');
+                  `Customer phone number: ${driveClient.formatPhoneForDisplay(externalNumber)}`,
+                  `Call direction: ${direction || 'unknown'} (OUTBOUND = a Budget Blinds team member placed this call to the customer; INBOUND = the customer called Budget Blinds - never describe an outbound call as something the customer did)`,
+                  direction !== 'OUTBOUND' && externalName
+                    ? `Caller ID on file for this number (a carrier/line label, not necessarily a person's name - see instructions above): ${externalName}`
+                    : null,
+                  `Team member path (in order, if transferred/parked): ${(csrPath || []).join(' -> ') || 'unknown'}`,
+                  `Call started: ${driveClient.formatPacific(callCreated)}`,
+                  `Call ended: ${driveClient.formatPacific(callEnded)}`,
+                ].filter(Boolean);
+            const context = contextLines.join('\n');
 
-  const userPrompt = conversationText
-          ? `${context}\n\nTranscript:\n${conversationText}`
-              : `${context}\n\n(No transcript text was available for this call - summarize using only the metadata above, and say so explicitly.)`;
+  const userPrompt = `${context}\n\nTranscript:\n${conversationText}`;
 
   const res = await fetch(OPENAI_URL, {
-              method: 'POST',
-              headers: {
-                                  Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-                                  'Content-Type': 'application/json',
-              },
-              body: JSON.stringify({
-                                  model: MODEL,
-                                  temperature: 0.2,
-                                  messages: [
-                                      { role: 'system', content: SYSTEM_PROMPT },
-                                      { role: 'user', content: userPrompt },
-                                                              ],
-              }),
+                  method: 'POST',
+                  headers: {
+                                          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+                                          'Content-Type': 'application/json',
+                  },
+                  body: JSON.stringify({
+                                          model: MODEL,
+                                          temperature: 0.2,
+                                          messages: [
+                                                  { role: 'system', content: SYSTEM_PROMPT },
+                                                  { role: 'user', content: userPrompt },
+                                                                          ],
+                  }),
   });
 
   if (!res.ok) {
-              throw new Error(`OpenAI summarization failed (${res.status}): ${await res.text()}`);
+                  throw new Error(`OpenAI summarization failed (${res.status}): ${await res.text()}`);
   }
 
   const data = await res.json();
-        let summary = data.choices?.[0]?.message?.content?.trim();
-        if (!summary) {
-                      throw new Error(`OpenAI response had no summary content: ${JSON.stringify(data)}`);
-        }
+            let summary = data.choices?.[0]?.message?.content?.trim();
+            if (!summary) {
+                              throw new Error(`OpenAI response had no summary content: ${JSON.stringify(data)}`);
+            }
 
   // Defensive strip (added 2026-07-21, see header comment item 8): kept as a safety net
   // even after the item-9 format redesign removed the three rigid categories - in case
