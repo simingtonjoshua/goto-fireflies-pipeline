@@ -87,6 +87,19 @@
 //    product. SERVICE/SUPPORT ISSUE now explicitly excludes appointment scheduling
 //    actions (booking, rescheduling, cancelling), and GENERAL INQUIRY now explicitly
 //    lists appointment cancellation as an example, alongside check-in/reschedule.
+// 8) Fixed two more bugs found on a real call (916-498-4568, 2026-07-21): a vendor
+//    (Natalie from Clear Channel Outdoor, an out-of-home advertising company) called
+//    trying to reach James/Amy to sell Budget Blinds on advertising - not a customer
+//    call at all. The summary called her "the customer," which is wrong framing (she's
+//    not asking about window treatments, she's soliciting US). SYSTEM_PROMPT now has an
+//    explicit instruction to identify vendor/solicitation calls as such by name/company
+//    rather than defaulting to "the customer." Separately, the same summary's actual
+//    text started with the literal words "GENERAL INQUIRY - ", even though the prompt
+//    already said to output ONLY the paragraph with no type-announcing header - the
+//    model didn't reliably follow that instruction. Reworded that instruction to be
+//    more explicit and added a defensive code-level strip (see summarizeInteraction)
+//    that removes a leading category-name label from the model's response if one slips
+//    through anyway, so a prompt-following slip can't leak into the posted summary.
 
 const fetch = require('node-fetch');
 const driveClient = require('./driveClient');
@@ -95,19 +108,19 @@ const OPENAI_URL = 'https://api.openai.com/v1/chat/completions';
 const MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
 function normalizeTranscript(raw) {
-              if (!raw) return [];
-              const items = Array.isArray(raw) ? raw : raw.results || raw.items || raw.transcriptions || [];
-              if (!Array.isArray(items)) return [];
+    if (!raw) return [];
+    const items = Array.isArray(raw) ? raw : raw.results || raw.items || raw.transcriptions || [];
+    if (!Array.isArray(items)) return [];
 
   return items
-                .filter((item) => item && (item.transcript || item.text))
-                .map((item) => ({
-                                  channel: item.channel ?? 0,
-                                  text: (item.transcript || item.text || '').trim(),
-                                  startTimeMs: item.startTimeMs ?? item.start_time_ms ?? 0,
-                }))
-                .filter((item) => item.text)
-                .sort((a, b) => a.startTimeMs - b.startTimeMs);
+      .filter((item) => item && (item.transcript || item.text))
+      .map((item) => ({
+              channel: item.channel ?? 0,
+              text: (item.transcript || item.text || '').trim(),
+              startTimeMs: item.startTimeMs ?? item.start_time_ms ?? 0,
+      }))
+      .filter((item) => item.text)
+      .sort((a, b) => a.startTimeMs - b.startTimeMs);
 }
 
 // A Budget Blinds team member making one of these calls always announces the business
@@ -125,34 +138,34 @@ const SELF_ID_PATTERN = /budget\s+(blinds|lines)\b/i;
 // inferred - callers should fall back to generic "Channel N" labels in that case rather
 // than guessing.
 function inferChannelRoles(utterances, direction) {
-              const channelsInOrder = [];
-              for (const u of utterances) {
-                              if (!channelsInOrder.includes(u.channel)) channelsInOrder.push(u.channel);
-                              if (channelsInOrder.length >= 2) break;
-              }
-              if (channelsInOrder.length < 2) return {};
+    const channelsInOrder = [];
+    for (const u of utterances) {
+          if (!channelsInOrder.includes(u.channel)) channelsInOrder.push(u.channel);
+          if (channelsInOrder.length >= 2) break;
+    }
+    if (channelsInOrder.length < 2) return {};
 
   const [first, second] = channelsInOrder;
 
   const textByChannel = {};
-              for (const u of utterances) {
-                              textByChannel[u.channel] = `${textByChannel[u.channel] || ''} ${u.text}`;
-              }
-              const selfIdChannels = channelsInOrder.filter((c) => SELF_ID_PATTERN.test(textByChannel[c] || ''));
-              if (selfIdChannels.length === 1) {
-                              const teamMemberChannel = selfIdChannels[0];
-                              const customerChannel = teamMemberChannel === first ? second : first;
-                              return { [teamMemberChannel]: 'TeamMember', [customerChannel]: 'Customer' };
-              }
+    for (const u of utterances) {
+          textByChannel[u.channel] = `${textByChannel[u.channel] || ''} ${u.text}`;
+    }
+    const selfIdChannels = channelsInOrder.filter((c) => SELF_ID_PATTERN.test(textByChannel[c] || ''));
+    if (selfIdChannels.length === 1) {
+          const teamMemberChannel = selfIdChannels[0];
+          const customerChannel = teamMemberChannel === first ? second : first;
+          return { [teamMemberChannel]: 'TeamMember', [customerChannel]: 'Customer' };
+    }
 
   // Fallback: order-of-first-utterance + call-direction heuristic. Only trustworthy
   // when direction is definitively known - an unknown/missing direction (the metadata
   // race described in the header comment) makes this a coin flip, so give up rather
   // than risk labeling the two sides backwards.
   if (direction !== 'OUTBOUND' && direction !== 'INBOUND') return {};
-              const teamMemberChannel = direction === 'OUTBOUND' ? second : first;
-              const customerChannel = teamMemberChannel === first ? second : first;
-              return { [teamMemberChannel]: 'TeamMember', [customerChannel]: 'Customer' };
+    const teamMemberChannel = direction === 'OUTBOUND' ? second : first;
+    const customerChannel = teamMemberChannel === first ? second : first;
+    return { [teamMemberChannel]: 'TeamMember', [customerChannel]: 'Customer' };
 }
 
 // Formats one leg's transcript as an array of { seconds, label, text } rows. seconds is
@@ -164,61 +177,61 @@ function inferChannelRoles(utterances, direction) {
 // formatTranscriptForDoc (what gets written into the Google Doc), so both always show
 // the exact same labeling.
 function formatLegTranscript(leg) {
-              const utterances = normalizeTranscript(leg.transcript);
-              if (!utterances.length) return [];
+    const utterances = normalizeTranscript(leg.transcript);
+    if (!utterances.length) return [];
 
   const roles = inferChannelRoles(utterances, leg.direction);
-              const teamMemberName = (leg.csrChain && leg.csrChain.length) ? leg.csrChain[leg.csrChain.length - 1].name : null;
-              const startMs = utterances[0].startTimeMs || 0;
+    const teamMemberName = (leg.csrChain && leg.csrChain.length) ? leg.csrChain[leg.csrChain.length - 1].name : null;
+    const startMs = utterances[0].startTimeMs || 0;
 
   return utterances.map((u) => {
-                  const role = roles[u.channel];
-                  let label;
-                  if (role === 'TeamMember') label = teamMemberName || 'Team Member';
-                  else if (role === 'Customer') label = 'Customer';
-                  else label = `Channel ${u.channel}`;
-                  const seconds = Math.max(0, Math.round((u.startTimeMs - startMs) / 1000));
-                  return { seconds, label, text: u.text };
+        const role = roles[u.channel];
+        let label;
+        if (role === 'TeamMember') label = teamMemberName || 'Team Member';
+        else if (role === 'Customer') label = 'Customer';
+        else label = `Channel ${u.channel}`;
+        const seconds = Math.max(0, Math.round((u.startTimeMs - startMs) / 1000));
+        return { seconds, label, text: u.text };
   });
 }
 
 // Concatenates every leg's transcript rows, in chronological order by the leg's own
 // callCreated timestamp, across the whole interaction.
 function allTranscriptRows(legRecords) {
-              const ordered = [...legRecords].sort((a, b) =>
-                              (a.callCreated || '').localeCompare(b.callCreated || '')
-                                                     );
-              const rows = [];
-              for (const leg of ordered) {
-                              for (const row of formatLegTranscript(leg)) rows.push(row);
-              }
-              return rows;
+    const ordered = [...legRecords].sort((a, b) =>
+          (a.callCreated || '').localeCompare(b.callCreated || '')
+                                           );
+    const rows = [];
+    for (const leg of ordered) {
+          for (const row of formatLegTranscript(leg)) rows.push(row);
+    }
+    return rows;
 }
 
 // Plain-text "[Ns] Label: text" lines, one per transcript row, for the model.
 function buildConversationText(legRecords) {
-              return allTranscriptRows(legRecords)
-                .map((r) => `[${r.seconds}s] ${r.label}: ${r.text}`)
-                .join('\n');
+    return allTranscriptRows(legRecords)
+      .map((r) => `[${r.seconds}s] ${r.label}: ${r.text}`)
+      .join('\n');
 }
 
 // Same rows as buildConversationText, but HTML-escaped and wrapped as <p> tags for
 // direct inclusion in the transcript+summary Google Doc (see
 // driveClient.createTranscriptDoc / interactions.js finalizeInteraction).
 function escapeHtml(text) {
-              return text
-                .replace(/&/g, '&amp;')
-                .replace(/</g, '&lt;')
-                .replace(/>/g, '&gt;');
+    return text
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
 }
 
 function formatTranscriptForDoc(legRecords) {
-              const rows = allTranscriptRows(legRecords);
-              if (!rows.length) return '<p><i>No transcript was available for this call.</i></p>';
+    const rows = allTranscriptRows(legRecords);
+    if (!rows.length) return '<p><i>No transcript was available for this call.</i></p>';
 
   return rows
-                .map((r) => `<p><b>[${r.seconds}s] ${escapeHtml(r.label)}:</b> ${escapeHtml(r.text)}</p>`)
-                .join('\n');
+      .map((r) => `<p><b>[${r.seconds}s] ${escapeHtml(r.label)}:</b> ${escapeHtml(r.text)}</p>`)
+      .join('\n');
 }
 
 // The three call-type formats, spelled out exactly as specified (2026-07-21, revised
@@ -233,7 +246,9 @@ IMPORTANT - never invent a phone number: only ever write a phone number that app
 
 IMPORTANT - a one-sided transcript is still a transcript: if the transcript is just an automated voicemail greeting followed by the team member leaving a message (no customer speech at all), that is NOT "no transcript available" - summarize what the team member said in the message (who they were trying to reach, what it was about, any callback info given). Only say a transcript was unavailable if the transcript section given to you is truly empty (no lines at all).
 
-First, decide which of these three call types this call actually was, then output ONLY the matching format below - nothing else, no extra commentary, no headers announcing which type you picked:
+IMPORTANT - vendor/solicitation calls are not customer calls: if the caller is clearly a vendor, salesperson, recruiter, advertiser, or other outside business calling to sell or pitch something TO Budget Blinds (rather than asking about window treatments themselves), do not refer to them as "the customer" anywhere in the summary. Use GENERAL INQUIRY format, identify the caller by their actual name and company if stated (e.g. "Natalie from Clear Channel Outdoor"), and describe plainly what they were soliciting and what was said - do not frame it as a customer inquiry.
+
+First, decide which of these three call types this call actually was, then write ONLY the matching format below and nothing else. Do not add any commentary, and do not begin your response with the words "CONSULTATION BOOKING", "SERVICE/SUPPORT ISSUE", "GENERAL INQUIRY", or any other label announcing which type you picked - for the paragraph format in particular, start directly with the first sentence of the paragraph itself, never with a category name.
 
 1) CONSULTATION BOOKING - a NEW free in-home design consultation (or installation) was booked or confirmed DURING this call. Use exactly this format, filling in every {placeholder}. If a detail was never mentioned, write "Not mentioned" for that placeholder rather than guessing or inventing it. IMPORTANT: if the customer already had an appointment before this call and was simply checking on it, confirming it, or asking to move it earlier/later - even if the team member looked into it and nothing actually changed - that is NOT a new booking. Use GENERAL INQUIRY instead and describe what the customer asked for and the actual outcome (e.g. what date they already had, whether an earlier slot was available, what was decided).
 
@@ -252,56 +267,64 @@ Order/product reference: {order number, purchase date, or product described, if 
 Photos/video requested: {Yes/No - whether the team member asked the customer to send photos or a video}
 Escalated: {Yes/No - and to whom or what team if that was said, e.g. "Yes - escalated to install team"}
 
-3) GENERAL INQUIRY - anything else (general questions, pricing questions with no booking, a voicemail message left with no live conversation, an existing-appointment check-in/reschedule/cancellation request, misc. calls). Write a short, factual paragraph (4-8 sentences) covering: why the call happened, what was said or resolved (or, for a voicemail, what message was left and any callback info given), and any follow-up action needed. Do not invent details not in the transcript.`;
+3) GENERAL INQUIRY - anything else (general questions, pricing questions with no booking, a voicemail message left with no live conversation, an existing-appointment check-in/reschedule/cancellation request, a vendor/solicitation call, misc. calls). Write a short, factual paragraph (4-8 sentences) covering: why the call happened, what was said or resolved (or, for a voicemail, what message was left and any callback info given), and any follow-up action needed. Do not invent details not in the transcript.`;
 
 // Sends the assembled call context to OpenAI and returns the formatted summary (already
 // in whichever of the three shapes above matched this call). Throws on failure - the
 // caller (src/interactions.js) catches and logs so a summarization failure never crashes
 // the webhook handler.
 async function summarizeInteraction({ legRecords, csrPath, externalName, externalNumber, direction, callCreated, callEnded }) {
-              const conversationText = buildConversationText(legRecords);
+    const conversationText = buildConversationText(legRecords);
 
   const contextLines = [
-                  `Customer phone number: ${driveClient.formatPhoneForDisplay(externalNumber)}`,
-                  direction !== 'OUTBOUND' && externalName
-                    ? `Caller ID on file for this number (a carrier/line label, not necessarily a person's name - see instructions above): ${externalName}`
-                    : null,
-                  `Team member path (in order, if transferred/parked): ${(csrPath || []).join(' -> ') || 'unknown'}`,
-                  `Call started: ${callCreated || 'unknown'}`,
-                  `Call ended: ${callEnded || 'unknown'}`,
-                ].filter(Boolean);
-              const context = contextLines.join('\n');
+        `Customer phone number: ${driveClient.formatPhoneForDisplay(externalNumber)}`,
+        direction !== 'OUTBOUND' && externalName
+          ? `Caller ID on file for this number (a carrier/line label, not necessarily a person's name - see instructions above): ${externalName}`
+          : null,
+        `Team member path (in order, if transferred/parked): ${(csrPath || []).join(' -> ') || 'unknown'}`,
+        `Call started: ${callCreated || 'unknown'}`,
+        `Call ended: ${callEnded || 'unknown'}`,
+      ].filter(Boolean);
+    const context = contextLines.join('\n');
 
   const userPrompt = conversationText
-                ? `${context}\n\nTranscript:\n${conversationText}`
-                  : `${context}\n\n(No transcript text was available for this call - summarize using only the metadata above, and say so explicitly.)`;
+      ? `${context}\n\nTranscript:\n${conversationText}`
+        : `${context}\n\n(No transcript text was available for this call - summarize using only the metadata above, and say so explicitly.)`;
 
   const res = await fetch(OPENAI_URL, {
-                  method: 'POST',
-                  headers: {
-                                    Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-                                    'Content-Type': 'application/json',
-                  },
-                  body: JSON.stringify({
-                                    model: MODEL,
-                                    temperature: 0.2,
-                                    messages: [
-                                                { role: 'system', content: SYSTEM_PROMPT },
-                                                { role: 'user', content: userPrompt },
-                                                      ],
-                  }),
+        method: 'POST',
+        headers: {
+                Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+                'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+                model: MODEL,
+                temperature: 0.2,
+                messages: [
+                  { role: 'system', content: SYSTEM_PROMPT },
+                  { role: 'user', content: userPrompt },
+                        ],
+        }),
   });
 
   if (!res.ok) {
-                  throw new Error(`OpenAI summarization failed (${res.status}): ${await res.text()}`);
+        throw new Error(`OpenAI summarization failed (${res.status}): ${await res.text()}`);
   }
 
   const data = await res.json();
-              const summary = data.choices?.[0]?.message?.content?.trim();
-              if (!summary) {
-                              throw new Error(`OpenAI response had no summary content: ${JSON.stringify(data)}`);
-              }
-              return summary;
+    let summary = data.choices?.[0]?.message?.content?.trim();
+    if (!summary) {
+          throw new Error(`OpenAI response had no summary content: ${JSON.stringify(data)}`);
+    }
+
+  // Defensive strip (added 2026-07-21, see header comment item 8): the prompt tells the
+  // model never to prefix the paragraph format with the category name it picked, but a
+  // real call (916-498-4568) showed the model doing it anyway ("GENERAL INQUIRY - ...").
+  // Strip a leading category label here too, so a prompt-following slip can't leak into
+  // the posted Heymarket note / Doc even if the wording instruction alone isn't enough.
+  summary = summary.replace(/^\s*(CONSULTATION BOOKING|SERVICE\/SUPPORT ISSUE|GENERAL INQUIRY)\s*[-:]\s*/i, '');
+
+  return summary;
 }
 
 module.exports = { summarizeInteraction, formatTranscriptForDoc };
