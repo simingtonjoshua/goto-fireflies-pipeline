@@ -1,106 +1,102 @@
-# GoTo Connect → Fireflies recording pipeline
+# GoTo Connect call recording + transcription pipeline
 
-Listens for GoTo Connect call recording notifications and automatically sends each
-recording to Fireflies.ai for transcription.
+Listens for GoTo Connect call recording notifications, fetches each call's transcript
+directly from GoTo (via the Advanced Reporting & Analytics add-on - no third-party
+transcription service involved), archives the recording audio to Google Drive, and
+groups multi-leg calls (parks/transfers) into a single logical interaction using GoTo's
+Call History `originatorId`.
 
 ```
 GoTo Connect call ends
         │
         ▼
-GoTo webhook notification  ──►  this service  ──►  fetch recording bytes from GoTo
-                                                              │
-                                                              ▼
-                                          stage recording at a public URL (local or S3)
-                                                              │
-                                                              ▼
-                                          Fireflies.ai uploadAudio (transcription starts)
+GoTo webhook notification  ──►  this service
+                                     │
+                    ┌────────────────┼─────────────────────┐
+                    ▼                                       ▼
+      fetch transcript from GoTo               fetch recording bytes from GoTo
+      (Advanced Reporting & Analytics)                      │
+                    │                                        ▼
+                    │                      archive to Joshua's Google Drive
+                    │                      ("Call Recordings" folder)
+                    └────────────────┬─────────────────────┘
+                                     ▼
+                    src/interactions.js groups legs into one
+                    interaction (originatorId), attaches transcript(s)
+                    + Drive link(s), and finalizes after a quiet period
+                                     │
+                                     ▼
+                    (next) OpenAI summary → posted to Heymarket
 ```
 
-## What's already done
+## Status
 
-- GoTo Connect OAuth client (`GoToConnect Zapier Recording I`, id `9fee6460-aae5-40a8-bc0c-6234f6c7ca0e`)
-  already has every scope this needs: `call-events.v1.events.read`,
-  `call-events.v1.notifications.manage`, `recording.v1.read`,
-  `recording.v1.notifications.manage`, plus the Personal Access Token grant type.
-- A new client secret and a new Personal Access Token were generated for this
-  integration and saved to `.env.secrets` (not committed, not shown in chat).
-- A Fireflies API key was pulled from Settings → MCP & Dev Tools and saved the same way.
+- Done: GoTo webhook receiving call-state, recording, transcript, Call History, and
+-   Call Parking events.
+-   - Done: transcripts fetched directly from GoTo - this pipeline does not use Fireflies
+    -   or any other third-party transcription service.
+    -   - Done: recordings archived to Google Drive (`src/driveClient.js`), with the resulting
+        -   link attached to the interaction.
+        -   - Done: multi-leg call grouping (parks/transfers) via Call History `originatorId`.
+            - - Not started: OpenAI summarization of the grouped interaction.
+              - - Not started: posting that summary (+ Drive link) to Heymarket as a private note.
+               
+                - ## Environment variables
+               
+                - See `.env.example`. Required: `GOTO_CLIENT_ID`, `GOTO_CLIENT_SECRET`, `GOTO_PAT`,
+                - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN`,
+                - `GOOGLE_DRIVE_FOLDER_ID`, `PUBLIC_BASE_URL`. `GOTO_ACCOUNT_KEY` is optional (auto-
+                - discovered if left blank) and `OPENAI_API_KEY` is reserved for the summarization step.
+               
+                - ## Setup
+               
+                - 1. Deploy this service somewhere with a public HTTPS URL (see Hosting below).
+                  2. 2. Set `PUBLIC_BASE_URL` in the environment to that URL.
+                     3. 3. Run `npm install && npm run setup` **once, after deploying** - it creates the GoTo
+                        4.    notification channel and subscribes it to call-state and recording notifications.
+                        5.4. Call History and Call Parking subscriptions can be (re)registered on that same
+                             channel, without duplicating the others, via the one-off
+                             `/admin/register-new-subscriptions` route (see the comment above it in
+                             `src/server.js` for why it's separate from `npm run setup`).
+                          5. Make a test call - including a park and a transfer - and check the logs for
+                          6.    `INTERACTION READY FOR SUMMARY`.
+                       
+                          7.## Hosting
 
-Copy the values from `.env.secrets` into `.env` (based on `.env.example`) wherever you
-deploy this.
+                        Currently deployed on [Render.com](https://render.com) (free web service, Docker
+                        runtime). The included `Dockerfile` also works unmodified on Fly.io, Railway, or any
+                        other container host that gives you a public HTTPS URL.
 
-## What you still need to do
+                        ## Google Drive archival
 
-1. **Deploy this service somewhere with a public HTTPS URL** (see Hosting below).
-2. Set `PUBLIC_BASE_URL` in `.env` to that URL.
-3. Run `npm install && npm run setup` **once, after deploying** — it creates the GoTo
-   notification channel and subscribes it to call events + recording notifications.
-4. Make a test call, check the logs, and confirm a transcript shows up in Fireflies.
+                        `src/driveClient.js` uploads each recording to a "Call Recordings" folder in
+                        jsimington@budgetblinds.com's personal Google Drive, using a pre-authorized OAuth2
+                        refresh token with the minimal `drive.file` scope (this app can only see/manage files
+                        it creates itself - it cannot browse the rest of the Drive). That folder can be moved
+                        anywhere in Drive (e.g. under "Budget Blinds Company File Center") without breaking
+                        this app's access, since `drive.file` grants are tied to the file's resource id, not
+                        its location in the folder hierarchy.
 
-## Hosting recommendation
+                        ## Known unverified areas
 
-This service needs to be **always-on** and **reachable from the public internet over
-HTTPS**, because GoTo pushes webhook events to it in real time. A few good, low-effort
-options, roughly in order of simplicity:
-
-- **[Render.com](https://render.com)** — connect this folder as a GitHub repo, create a
-  "Web Service," it builds from the included `Dockerfile` (or just `npm start` with a
-  Node environment) and gives you a permanent `https://your-app.onrender.com` URL for
-  free/cheap. Easiest option if you don't already have cloud infrastructure.
-- **[Fly.io](https://fly.io)** — `fly launch` picks up the Dockerfile automatically,
-  similarly cheap, slightly more CLI-driven.
-- **Railway.app** — similar to Render, git-push deploys.
-- **An existing AWS/Azure/GCP account** — if Budget Blinds already has one, this runs
-  fine as a small container on ECS Fargate / App Service / Cloud Run. Use
-  `STORAGE_BACKEND=s3` in that case since S3 is already in reach.
-
-Whichever you pick, set the environment variables from `.env.example` in that
-platform's dashboard/secrets manager — don't commit `.env` or `.env.secrets`.
-
-## Storage backend
-
-Fireflies' `uploadAudio` API requires a public HTTPS URL to the audio file, not raw
-bytes, so this service stages each recording somewhere downloadable first:
-
-- `STORAGE_BACKEND=local` (default) — serves the file from this same service at a
-  random, one-time URL that expires after an hour. Zero extra setup.
-- `STORAGE_BACKEND=s3` — uploads to an S3 bucket and hands Fireflies a presigned URL.
-  Requires `npm install @aws-sdk/client-s3 @aws-sdk/s3-request-presigner` and the
-  `AWS_*` / `S3_BUCKET` variables in `.env`.
-
-## One thing to verify after first real call
-
-GoTo's Recording API notification payload shape wasn't confirmed against a live
-example while building this (this environment couldn't reach GoTo's API directly to
-test — see below). `src/server.js`'s `extractRecordingId()` guesses at a few common
-field names. After the first real call:
-
-1. Check the service logs for `GoTo notification received: {...}` — that's the raw
-   payload GoTo sent.
-2. Confirm the recording ID field name matches what `extractRecordingId()` expects; if
-   not, add the correct path.
-3. Also sanity-check `subscribeRecordingEvents()` in `src/gotoClient.js` — the
-   `/recording/v1/subscriptions` endpoint was inferred from the Call Events API's
-   documented pattern (both are described as going through the same Notification
-   Channel API), not confirmed against GoTo's interactive API explorer at
-   https://developer.goto.com/GoToConnect. If `npm run setup` errors on that step,
-   check the explorer for the exact path/body.
-
-## Why this wasn't fully tested end-to-end here
-
-This was built and the GoTo/Fireflies credentials were provisioned from inside a
-sandboxed environment whose outbound network is allowlisted — it couldn't reach
-`authentication.logmeininc.com`, `api.goto.com`, or `api.fireflies.ai` to run a live
-test. Everything here is built directly from GoTo's and Fireflies' published API docs
-plus the credentials collected in the browser, but the first real deploy should be
-treated as the actual integration test.
-
-## Local development
-
-```
-npm install
-cp .env.example .env   # then fill in values from .env.secrets
-npm start               # runs the webhook server
-# in another terminal, once PUBLIC_BASE_URL is a real reachable URL:
-npm run setup
-```
+                        - Whether the Call History subscription, given only `{ accountKey, channelId }` with
+                        -   no `userKeys`, covers the whole account rather than just the calling principal's own
+                        -     calls. If `src/interactions.js` logs show Call History events for only one user,
+                        -   `userKeys` (or per-extension `extensions`) needs to be added explicitly - see the
+                        -     comment above `subscribeCallHistoryEvents` in `src/gotoClient.js`.
+                        - - The exact payload shape of Call Parking events (`handleCallParkingEvent` in
+                          -   `src/interactions.js` currently just logs the raw payload). Not fatal either way -
+                          -     Call History correlation still catches parks, just without the instant signal.
+                          - - Which physical transcript channel (0 or 1) maps to the CSR vs. the customer - see the
+                            -   comment above `fetchTranscript` in `src/gotoClient.js`.
+                           
+                            -   ## Local development
+                           
+                            -   ```
+                                npm install
+                                cp .env.example .env   # then fill in real values
+                                npm start               # runs the webhook server
+                                # in another terminal, once PUBLIC_BASE_URL is a real reachable URL:
+                                npm run setup
+                                ```
+                                
