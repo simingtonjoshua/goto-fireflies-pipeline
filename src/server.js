@@ -154,24 +154,32 @@ function trackCallState(payload) {
   // is the DID that was dialed/answered (e.g. the office number on an inbound call), while
   // `type.caller` holds the true originating party's name/number - prefer that when present
   // since it's the more useful "who was this call with" value.
-  const externalType = external?.type || {};
-    const externalCaller = externalType.caller || {};
-    const internalType = internal?.type || {};
+const externalType = external?.type || {};
+        const externalCaller = externalType.caller || {};
+        const externalCallee = externalType.callee || {};
+        const internalType = internal?.type || {};
 
-  const existing = conversationMetadata.get(conversationSpaceId) || {};
-    const merged = {
-          conversationSpaceId,
-          direction: metadata.direction || existing.direction,
-          dialString: metadata.dialString || existing.dialString,
-          callCreated: metadata.callCreated || existing.callCreated,
-          accountKey: metadata.accountKey || existing.accountKey,
-          externalNumber: externalCaller.number || externalType.number || existing.externalNumber,
-          externalName: externalCaller.name || externalType.name || existing.externalName,
-          internalName: internalType.name || existing.internalName,
-          internalExtension: internalType.extensionNumber || existing.internalExtension,
-          callState: state.type || existing.callState,
-          callEnded: state.type === 'ENDING' ? state.timestamp : existing.callEnded,
-    };
+      const existing = conversationMetadata.get(conversationSpaceId) || {};
+        const callDirection = metadata.direction || existing.direction;
+        const resolvedExternalNumber = callDirection === 'OUTBOUND'
+              ? (externalCallee.number || externalCaller.number || externalType.number)
+                      : (externalCaller.number || externalCallee.number || externalType.number);
+        const resolvedExternalName = callDirection === 'OUTBOUND'
+              ? (externalCallee.name || externalCaller.name || externalType.name)
+                      : (externalCaller.name || externalCallee.name || externalType.name);
+        const merged = {
+                      conversationSpaceId,
+                      direction: callDirection,
+                      dialString: metadata.dialString || existing.dialString,
+                      callCreated: metadata.callCreated || existing.callCreated,
+                      accountKey: metadata.accountKey || existing.accountKey,
+                      externalNumber: resolvedExternalNumber || existing.externalNumber,
+                      externalName: resolvedExternalName || existing.externalName,
+                      internalName: internalType.name || existing.internalName,
+                      internalExtension: internalType.extensionNumber || existing.internalExtension,
+                      callState: state.type || existing.callState,
+                      callEnded: state.type === 'ENDING' ? state.timestamp : existing.callEnded,
+        };
     conversationMetadata.set(conversationSpaceId, merged);
 
   // Feeds the interaction-grouping/CSR-chain tracker (src/interactions.js) in parallel
