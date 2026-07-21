@@ -132,6 +132,20 @@ function recordTranscript(conversationSpaceId, recordingId, transcript) {
   scheduleFinalize(groupKeyFor(conversationSpaceId));
 }
 
+// Attaches a Google Drive archival link for this leg's recording (see
+// server.js handleRecording -> driveClient.uploadRecording, added 2026-07-20), and
+// (re)starts the interaction's quiet-period timer the same way recordTranscript does.
+// Kept as its own entry point (rather than folded into recordTranscript) since the Drive
+// upload and the transcript fetch are two independent async operations that can finish
+// in either order.
+function recordRecordingLink(conversationSpaceId, recordingId, driveLink) {
+  if (!conversationSpaceId) return;
+  const leg = getOrCreateLeg(conversationSpaceId);
+  leg.recordingId = leg.recordingId || recordingId;
+  leg.driveLink = driveLink;
+  scheduleFinalize(groupKeyFor(conversationSpaceId));
+}
+
 function groupKeyFor(conversationSpaceId) {
   return originatorForConversation.get(conversationSpaceId) || conversationSpaceId;
 }
@@ -193,6 +207,7 @@ async function finalizeInteraction(groupKey) {
     callCreated: legRecords.map((l) => l.callCreated).filter(Boolean).sort()[0],
     callEnded: legRecords.map((l) => l.callEnded).filter(Boolean).sort().slice(-1)[0],
     transcriptsAttached: legRecords.filter((l) => l.transcript).length,
+    recordingLinks: legRecords.filter((l) => l.driveLink).map((l) => l.driveLink),
   };
 
   console.log('INTERACTION READY FOR SUMMARY:', JSON.stringify(summary, null, 2));
@@ -202,10 +217,11 @@ async function finalizeInteraction(groupKey) {
   //      conversation text.
   //   2. Send that + csrPath + timeline to OpenAI (gpt-4o-mini) for the Heymarket-ready
   //      summary, with structured extraction for known call types.
-  //   3. Upload the leg recordings (already downloaded as part of handling
-  //      RECORDING_UPLOADED) to the Google Drive folder for permanent archival, and get
-  //      a shareable link.
-  //   4. POST the summary + link to Heymarket directly (not via Zapier) as a private
+  //   3. DONE (2026-07-20): leg recordings are uploaded to Joshua's personal Google
+  //      Drive for permanent archival as soon as they're fetched (see server.js
+  //      handleRecording -> driveClient.uploadRecording), and the resulting links are
+  //      attached above via recordRecordingLink/summary.recordingLinks.
+  //   4. POST the summary + link(s) to Heymarket directly (not via Zapier) as a private
   //      note from the integration user.
 
   // Clean up now that this interaction is closed.
@@ -221,5 +237,6 @@ module.exports = {
   recordCallHistoryEvent,
   recordCallParkingEvent,
   recordTranscript,
+  recordRecordingLink,
   legIdToConversation,
 };
