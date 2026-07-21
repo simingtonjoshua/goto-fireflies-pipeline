@@ -80,4 +80,4 @@ async function stageRecording(buffer, contentType) {
   return stageLocal(buffer, contentType);
 }
 
-module.exports = { stageRecording, getLocalFile };
+module.exports = { stageRecording, getLocalFile, extForContentType };
