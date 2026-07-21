@@ -9,17 +9,23 @@
 // `legId` that also appears on participants in the ordinary call-events stream - that
 // shared legId is the join between the two event streams.
 //
-// UNVERIFIED as of this writing (2026-07-20), pending a live test:
+// UNVERIFIED as of this writing (2026-07-21), pending a live test:
 //   - Whether Call History Subscription, given only { accountKey, channelId } with no
 //     userKeys, actually covers the whole account rather than just one user.
 //   - The exact payload shape of Call Parking events (no live payload has been seen yet;
 //     handleCallParkingEvent() just logs the raw payload for now).
+//   - The exact shape of the transcript JSON from GoTo's Transcriptions endpoint, and
+//     which physical channel (0 or 1) is the CSR vs. the customer - see the comments in
+//     src/openaiClient.js and src/gotoClient.js.
 //
 // Resilience: if we never learn an originatorId for a given conversationSpaceId (e.g.
 // the Call History subscription turns out not to be wired up correctly, or the event
 // simply hasn't arrived yet), we still finalize using conversationSpaceId alone once the
 // quiet period elapses - a plain, non-parked, non-transferred call should never get
 // stuck waiting on a piece of data it doesn't actually need.
+
+const openaiClient = require('./openaiClient');
+const heymarketClient = require('./heymarketClient');
 
 const FINALIZE_QUIET_MS = 30 * 1000; // see conversation 2026-07-20: parks/transfers on
 // this account resolve almost instantly once GoTo's own signals are used, so this only
@@ -43,12 +49,12 @@ const conversationsForOriginator = new Map();
 const closeTimers = new Map();
 
 function getOrCreateLeg(conversationSpaceId) {
-  let leg = legs.get(conversationSpaceId);
-  if (!leg) {
-    leg = { csrChain: [], transcript: null, recordingId: null };
-    legs.set(conversationSpaceId, leg);
-  }
-  return leg;
+    let leg = legs.get(conversationSpaceId);
+    if (!leg) {
+          leg = { csrChain: [], transcript: null, recordingId: null };
+          legs.set(conversationSpaceId, leg);
+    }
+    return leg;
 }
 
 // Call this from trackCallState() for every call-state event, in addition to (not
@@ -57,25 +63,25 @@ function getOrCreateLeg(conversationSpaceId) {
 // 2026-07-20 showed the previous last-write-wins approach silently lost the first CSR
 // once the call was handed to a second one.
 function recordLegState(conversationSpaceId, { legId, internalName, internalExtension, externalName, externalNumber, direction, dialString, callCreated, callEnded, accountKey }) {
-  const leg = getOrCreateLeg(conversationSpaceId);
-  if (legId) {
-    leg.legId = legId;
-    legIdToConversation.set(legId, conversationSpaceId);
-  }
-  if (externalName) leg.externalName = externalName;
-  if (externalNumber) leg.externalNumber = externalNumber;
-  if (direction) leg.direction = direction;
-  if (dialString) leg.dialString = dialString;
-  if (callCreated) leg.callCreated = callCreated;
-  if (callEnded) leg.callEnded = callEnded;
-  if (accountKey) leg.accountKey = accountKey;
+    const leg = getOrCreateLeg(conversationSpaceId);
+    if (legId) {
+          leg.legId = legId;
+          legIdToConversation.set(legId, conversationSpaceId);
+    }
+    if (externalName) leg.externalName = externalName;
+    if (externalNumber) leg.externalNumber = externalNumber;
+    if (direction) leg.direction = direction;
+    if (dialString) leg.dialString = dialString;
+    if (callCreated) leg.callCreated = callCreated;
+    if (callEnded) leg.callEnded = callEnded;
+    if (accountKey) leg.accountKey = accountKey;
 
   if (internalName || internalExtension) {
-    const last = leg.csrChain[leg.csrChain.length - 1];
-    const isSame = last && last.name === internalName && last.extension === internalExtension;
-    if (!isSame) {
-      leg.csrChain.push({ name: internalName, extension: internalExtension, enteredAt: new Date().toISOString() });
-    }
+        const last = leg.csrChain[leg.csrChain.length - 1];
+        const isSame = last && last.name === internalName && last.extension === internalExtension;
+        if (!isSame) {
+                leg.csrChain.push({ name: internalName, extension: internalExtension, enteredAt: new Date().toISOString() });
+        }
   }
 }
 
@@ -84,35 +90,35 @@ function recordLegState(conversationSpaceId, { legId, internalName, internalExte
 // the ordinary call-events stream, and remembers the originatorId for next time too, in
 // case the transcript/recording for this leg hasn't arrived yet.
 function recordCallHistoryEvent(payload) {
-  const content = payload?.content || {};
-  const { originatorId, legId } = content;
-  if (!originatorId || !legId) return;
+    const content = payload?.content || {};
+    const { originatorId, legId } = content;
+    if (!originatorId || !legId) return;
 
   const conversationSpaceId = legIdToConversation.get(legId);
-  console.log(
-    `Call History event: legId=${legId} originatorId=${originatorId}` +
-      (conversationSpaceId ? ` -> conversationSpaceId=${conversationSpaceId}` : ' (no matching conversationSpaceId seen yet)')
-  );
-  if (!conversationSpaceId) return;
+    console.log(
+          `Call History event: legId=${legId} originatorId=${originatorId}` +
+            (conversationSpaceId ? ` -> conversationSpaceId=${conversationSpaceId}` : ' (no matching conversationSpaceId seen yet)')
+        );
+    if (!conversationSpaceId) return;
 
   linkConversationToOriginator(conversationSpaceId, originatorId);
 }
 
 function linkConversationToOriginator(conversationSpaceId, originatorId) {
-  const already = originatorForConversation.get(conversationSpaceId);
-  if (already === originatorId) return;
+    const already = originatorForConversation.get(conversationSpaceId);
+    if (already === originatorId) return;
 
   originatorForConversation.set(conversationSpaceId, originatorId);
-  if (!conversationsForOriginator.has(originatorId)) {
-    conversationsForOriginator.set(originatorId, new Set());
-  }
-  conversationsForOriginator.get(originatorId).add(conversationSpaceId);
+    if (!conversationsForOriginator.has(originatorId)) {
+          conversationsForOriginator.set(originatorId, new Set());
+    }
+    conversationsForOriginator.get(originatorId).add(conversationSpaceId);
 
   // If this conversationSpaceId already had its own quiet-period timer running under
   // its own id (because we didn't know its originatorId yet), cancel it - it now belongs
   // to a shared group, which gets its own timer.
   cancelTimer(conversationSpaceId);
-  scheduleFinalize(originatorId);
+    scheduleFinalize(originatorId);
 }
 
 // Not verified against a real payload yet - logging generously so the first live park
@@ -120,16 +126,16 @@ function linkConversationToOriginator(conversationSpaceId, originatorId) {
 // linkConversationToOriginator() the same way recordCallHistoryEvent() does, but instantly
 // (no need to wait on Call History at all for the park case specifically).
 function recordCallParkingEvent(payload) {
-  console.log('Call Parking event received (shape not yet mapped):', JSON.stringify(payload));
+    console.log('Call Parking event received (shape not yet mapped):', JSON.stringify(payload));
 }
 
 // Attaches a fetched transcript (see gotoClient.fetchTranscript) to the leg for this
 // recording's conversationSpaceId, and (re)starts that interaction's quiet-period timer.
 function recordTranscript(conversationSpaceId, recordingId, transcript) {
-  const leg = getOrCreateLeg(conversationSpaceId);
-  leg.recordingId = recordingId;
-  leg.transcript = transcript;
-  scheduleFinalize(groupKeyFor(conversationSpaceId));
+    const leg = getOrCreateLeg(conversationSpaceId);
+    leg.recordingId = recordingId;
+    leg.transcript = transcript;
+    scheduleFinalize(groupKeyFor(conversationSpaceId));
 }
 
 // Attaches a Google Drive archival link for this leg's recording (see
@@ -139,104 +145,128 @@ function recordTranscript(conversationSpaceId, recordingId, transcript) {
 // upload and the transcript fetch are two independent async operations that can finish
 // in either order.
 function recordRecordingLink(conversationSpaceId, recordingId, driveLink) {
-  if (!conversationSpaceId) return;
-  const leg = getOrCreateLeg(conversationSpaceId);
-  leg.recordingId = leg.recordingId || recordingId;
-  leg.driveLink = driveLink;
-  scheduleFinalize(groupKeyFor(conversationSpaceId));
+    if (!conversationSpaceId) return;
+    const leg = getOrCreateLeg(conversationSpaceId);
+    leg.recordingId = leg.recordingId || recordingId;
+    leg.driveLink = driveLink;
+    scheduleFinalize(groupKeyFor(conversationSpaceId));
 }
 
 function groupKeyFor(conversationSpaceId) {
-  return originatorForConversation.get(conversationSpaceId) || conversationSpaceId;
+    return originatorForConversation.get(conversationSpaceId) || conversationSpaceId;
 }
 
 function cancelTimer(key) {
-  const timer = closeTimers.get(key);
-  if (timer) {
-    clearTimeout(timer);
-    closeTimers.delete(key);
-  }
+    const timer = closeTimers.get(key);
+    if (timer) {
+          clearTimeout(timer);
+          closeTimers.delete(key);
+    }
 }
 
 function scheduleFinalize(groupKey) {
-  cancelTimer(groupKey);
-  const timer = setTimeout(() => {
-    closeTimers.delete(groupKey);
-    finalizeInteraction(groupKey).catch((err) =>
-      console.error(`Error finalizing interaction ${groupKey}:`, err)
-    );
-  }, FINALIZE_QUIET_MS);
-  closeTimers.set(groupKey, timer);
+    cancelTimer(groupKey);
+    const timer = setTimeout(() => {
+          closeTimers.delete(groupKey);
+          finalizeInteraction(groupKey).catch((err) =>
+                  console.error(`Error finalizing interaction ${groupKey}:`, err)
+                                                  );
+    }, FINALIZE_QUIET_MS);
+    closeTimers.set(groupKey, timer);
 }
 
 // groupKey is either an originatorId (multi-leg interaction) or a bare
 // conversationSpaceId (single-leg call where we never learned an originatorId).
 function conversationSpaceIdsFor(groupKey) {
-  return conversationsForOriginator.get(groupKey) || new Set([groupKey]);
+    return conversationsForOriginator.get(groupKey) || new Set([groupKey]);
 }
 
-// This is the seam for the next build phase: OpenAI summarization, Google Drive
-// archival, and the Heymarket post all plug in here. For now it just logs the fully
-// assembled interaction so we can confirm the grouping/CSR-chain/transcript logic is
-// correct before wiring in anything that costs money or posts somewhere externally.
+// Assembles the finished interaction, summarizes it with OpenAI (src/openaiClient.js),
+// and posts that summary + Drive link(s) to Heymarket as a private note
+// (src/heymarketClient.js). Both steps are wrapped in their own try/catch and never
+// throw out of this function - a summarization or Heymarket outage should never crash
+// the webhook handler or block cleanup of this interaction's in-memory state below.
 async function finalizeInteraction(groupKey) {
-  const conversationSpaceIds = [...conversationSpaceIdsFor(groupKey)];
-  const legRecords = conversationSpaceIds.map((id) => ({ conversationSpaceId: id, ...legs.get(id) })).filter((l) => l.legId || l.transcript || l.externalNumber);
+    const conversationSpaceIds = [...conversationSpaceIdsFor(groupKey)];
+    const legRecords = conversationSpaceIds.map((id) => ({ conversationSpaceId: id, ...legs.get(id) })).filter((l) => l.legId || l.transcript || l.externalNumber);
 
   if (!legRecords.length) {
-    console.log(`Interaction ${groupKey} closed with no leg data recorded - nothing to summarize.`);
-    return;
+        console.log(`Interaction ${groupKey} closed with no leg data recorded - nothing to summarize.`);
+        return;
   }
 
   const csrChain = [];
-  for (const leg of legRecords) {
-    for (const entry of leg.csrChain || []) {
-      const last = csrChain[csrChain.length - 1];
-      if (!last || last.name !== entry.name || last.extension !== entry.extension) {
-        csrChain.push(entry);
-      }
+    for (const leg of legRecords) {
+          for (const entry of leg.csrChain || []) {
+                  const last = csrChain[csrChain.length - 1];
+                  if (!last || last.name !== entry.name || last.extension !== entry.extension) {
+                            csrChain.push(entry);
+                  }
+          }
     }
-  }
+
+  const csrPath = csrChain.map((c) => `${c.name || 'unknown'} (${c.extension || 'unknown ext'})`);
+    const externalNumber = legRecords.find((l) => l.externalNumber)?.externalNumber;
+    const externalName = legRecords.find((l) => l.externalName)?.externalName;
+    const callCreated = legRecords.map((l) => l.callCreated).filter(Boolean).sort()[0];
+    const callEnded = legRecords.map((l) => l.callEnded).filter(Boolean).sort().slice(-1)[0];
+    const recordingLinks = legRecords.filter((l) => l.driveLink).map((l) => l.driveLink);
 
   const summary = {
-    groupKey,
-    legCount: legRecords.length,
-    externalNumber: legRecords.find((l) => l.externalNumber)?.externalNumber,
-    externalName: legRecords.find((l) => l.externalName)?.externalName,
-    csrPath: csrChain.map((c) => `${c.name || 'unknown'} (${c.extension || 'unknown ext'})`),
-    callCreated: legRecords.map((l) => l.callCreated).filter(Boolean).sort()[0],
-    callEnded: legRecords.map((l) => l.callEnded).filter(Boolean).sort().slice(-1)[0],
-    transcriptsAttached: legRecords.filter((l) => l.transcript).length,
-    recordingLinks: legRecords.filter((l) => l.driveLink).map((l) => l.driveLink),
+        groupKey,
+        legCount: legRecords.length,
+        externalNumber,
+        externalName,
+        csrPath,
+        callCreated,
+        callEnded,
+        transcriptsAttached: legRecords.filter((l) => l.transcript).length,
+        recordingLinks,
   };
 
   console.log('INTERACTION READY FOR SUMMARY:', JSON.stringify(summary, null, 2));
 
-  // TODO next build phase:
-  //   1. Concatenate leg transcripts in chronological order (callCreated) into one
-  //      conversation text.
-  //   2. Send that + csrPath + timeline to OpenAI (gpt-4o-mini) for the Heymarket-ready
-  //      summary, with structured extraction for known call types.
-  //   3. DONE (2026-07-20): leg recordings are uploaded to Joshua's personal Google
-  //      Drive for permanent archival as soon as they're fetched (see server.js
-  //      handleRecording -> driveClient.uploadRecording), and the resulting links are
-  //      attached above via recordRecordingLink/summary.recordingLinks.
-  //   4. POST the summary + link(s) to Heymarket directly (not via Zapier) as a private
-  //      note from the integration user.
+  try {
+        const summaryText = await openaiClient.summarizeInteraction({
+                legRecords,
+                csrPath,
+                externalName,
+                externalNumber,
+                callCreated,
+                callEnded,
+        });
+
+      const noteLines = [summaryText];
+        if (recordingLinks.length) {
+                noteLines.push('', `Recording: ${recordingLinks.join(', ')}`);
+        }
+        const noteText = noteLines.join('\n');
+
+      if (externalNumber) {
+              await heymarketClient.postPrivateNote(externalNumber, noteText);
+              console.log(`Posted Heymarket private note for interaction ${groupKey} (${externalNumber}).`);
+      } else {
+              console.log(
+                        `Interaction ${groupKey} has no externalNumber - skipping Heymarket post. Summary was:\n${summaryText}`
+                      );
+      }
+  } catch (err) {
+        console.error(`Error summarizing/posting interaction ${groupKey}:`, err);
+  }
 
   // Clean up now that this interaction is closed.
   for (const id of conversationSpaceIds) {
-    legs.delete(id);
-    originatorForConversation.delete(id);
+        legs.delete(id);
+        originatorForConversation.delete(id);
   }
-  conversationsForOriginator.delete(groupKey);
+    conversationsForOriginator.delete(groupKey);
 }
 
 module.exports = {
-  recordLegState,
-  recordCallHistoryEvent,
-  recordCallParkingEvent,
-  recordTranscript,
-  recordRecordingLink,
-  legIdToConversation,
+    recordLegState,
+    recordCallHistoryEvent,
+    recordCallParkingEvent,
+    recordTranscript,
+    recordRecordingLink,
+    legIdToConversation,
 };
