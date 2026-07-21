@@ -321,6 +321,19 @@ app.get('/admin/register-new-subscriptions', async (req, res) => {
           res.status(500).json({ error: err.message });
     }
 });
+// TEMPORARY debug route (added 2026-07-21, remove after use): fetches and returns the
+// raw transcript JSON for a given recordingId, so we can see GoTo's actual transcript
+// shape/format instead of guessing from the docs. Not auth-protected - fine for a
+// short-lived debug aid, but should be deleted before this is left running long-term.
+app.get('/admin/debug-transcript/:recordingId', async (req, res) => {
+        try {
+                      const transcript = await fetchTranscript(req.params.recordingId);
+                      res.json(transcript);
+        } catch (err) {
+                      res.status(500).json({ error: err.message });
+        }
+});
+
 
 app.get('/healthz', (req, res) => res.json({ ok: true }));
 
