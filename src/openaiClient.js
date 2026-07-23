@@ -181,6 +181,39 @@
 // (menu options, hold-time announcements) rather than a live person, so future calls
 // like the Kristine/Hunter-Douglas one describe it as an automated system rather than
 // inventing a customer identity from it.
+// 12) ROLE-SWAP + HOLD-TIME FIX (added 2026-07-23, found on two real calls to
+// 916-410-1621 the same morning - an inbound call and the outbound callback right
+// after it - where BOTH calls had Team Member and Customer completely swapped
+// throughout, and the summaries read as if the customer were confirming pricing and
+// the team member (Joshua Simington) were describing his own broken blinds). Two
+// distinct causes of the swap, both in inferChannelRoles()'s fallback path, since
+// neither call ever said "Budget Blinds" in a form the old SELF_ID_PATTERN covered:
+// a) The inbound call's greeting was transcribed as "It's a great day here at Bunch
+// of Lines, this is Christine" - a new speech-to-text mishearing of the business
+// name ("Bunch of" instead of "Budget") that SELF_ID_PATTERN's "budget blinds/lines"
+// wording didn't match at all, so self-ID never fired and the call fell to the
+// order-of-first-utterance fallback - which guessed wrong because of a stray
+// one-word fragment at [0s] ("to ask you") that happened to land on the customer's
+// channel, making it look like the customer spoke first. b) The outbound callback
+// never mentioned the business name at all (Joshua called back about a specific
+// charger issue), so self-ID never fired there either, and the order+direction
+// fallback assumed the customer speaks first on an outbound call - but Joshua, the
+// one placing the call, opened the conversation himself as soon as it connected,
+// breaking that assumption. Rather than lean further on speech order (now shown
+// unreliable in both directions across three real calls), inferChannelRoles() adds
+// two more content-based signals it tries before ever falling back to order: (i)
+// GREETING_SCRIPT_PATTERN matches Budget Blinds' own standard phone greeting ("it's
+// a great day here at ___") regardless of how the business name itself got
+// transcribed, and (ii) SERVICE_REP_PATTERNS matches phrases a team member says that
+// a real customer describing their own problem essentially never would ("may I
+// place you on hold," "let me pull up your file," "direct ship order," "let me see
+// if he's available"). Both matched correctly on these two real calls and would have
+// produced the right labels. Separately, per Joshua's request: summaries should now
+// note when someone was placed on hold and for how long. detectHoldPeriods() scans
+// the labeled transcript for an explicit hold-related phrase (not just a pause -
+// only a phrase that actually says so) and measures the gap until the next line as
+// the hold's rough duration, and a SYSTEM_PROMPT instruction tells the model to
+// mention it when present.
 
 const fetch = require('node-fetch');
 const driveClient = require('./driveClient');
@@ -189,19 +222,19 @@ const OPENAI_URL = 'https://api.openai.com/v1/chat/completions';
 const MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
 function normalizeTranscript(raw) {
-              if (!raw) return [];
-              const items = Array.isArray(raw) ? raw : raw.results || raw.items || raw.transcriptions || [];
-              if (!Array.isArray(items)) return [];
+    if (!raw) return [];
+    const items = Array.isArray(raw) ? raw : raw.results || raw.items || raw.transcriptions || [];
+    if (!Array.isArray(items)) return [];
 
   return items
-                .filter((item) => item && (item.transcript || item.text))
-                .map((item) => ({
-                                  channel: item.channel ?? 0,
-                                  text: (item.transcript || item.text || '').trim(),
-                                  startTimeMs: item.startTimeMs ?? item.start_time_ms ?? 0,
-                }))
-                .filter((item) => item.text)
-                .sort((a, b) => a.startTimeMs - b.startTimeMs);
+      .filter((item) => item && (item.transcript || item.text))
+      .map((item) => ({
+              channel: item.channel ?? 0,
+              text: (item.transcript || item.text || '').trim(),
+              startTimeMs: item.startTimeMs ?? item.start_time_ms ?? 0,
+      }))
+      .filter((item) => item.text)
+      .sort((a, b) => a.startTimeMs - b.startTimeMs);
 }
 
 // A Budget Blinds team member making one of these calls always announces the business
@@ -227,57 +260,91 @@ const SELF_ID_CUE = /\b(this is|i'm|i am|my name is|calling on behalf of|speakin
 // it - "with" alone is a much weaker signal than the other cues, so it's only trusted
 // right up against the mention rather than anywhere in the wider window.
 function hasSelfIntroduction(text) {
-              if (!text) return false;
-              const mentionPattern = /budget\s+(blinds|lines)\b/gi;
-              let match;
-              while ((match = mentionPattern.exec(text))) {
-                              const windowStart = Math.max(0, match.index - 60);
-                              const windowEnd = Math.min(text.length, match.index + match[0].length + 60);
-                              if (SELF_ID_CUE.test(text.slice(windowStart, windowEnd))) return true;
+    if (!text) return false;
+    const mentionPattern = /budget\s+(blinds|lines)\b/gi;
+    let match;
+    while ((match = mentionPattern.exec(text))) {
+          const windowStart = Math.max(0, match.index - 60);
+          const windowEnd = Math.min(text.length, match.index + match[0].length + 60);
+          if (SELF_ID_CUE.test(text.slice(windowStart, windowEnd))) return true;
 
-                const immediatelyBefore = text.slice(Math.max(0, match.index - 15), match.index);
-                              if (/\bwith\s*$/i.test(immediatelyBefore)) return true;
-              }
-              return false;
+      const immediatelyBefore = text.slice(Math.max(0, match.index - 15), match.index);
+          if (/\bwith\s*$/i.test(immediatelyBefore)) return true;
+    }
+    return false;
+}
+
+// Budget Blinds' own standard phone greeting ("It's a great day here at Budget
+// Blinds, this is ___") matched independent of how the business name itself gets
+// transcribed (see header comment item 12 - GoTo's speech-to-text rendered it as
+// "Bunch of Lines" on one real call, which SELF_ID_PATTERN's "budget blinds/lines"
+// wording doesn't cover at all, but the surrounding script phrasing is a reliable
+// team-member signal on its own).
+const GREETING_SCRIPT_PATTERN = /\bit'?s a (great|good) day here at\b/i;
+
+// Phrases a Budget Blinds team member says that a real customer describing their own
+// problem essentially never would - checking an account/order/file, placing someone
+// on hold, or arranging a shipment (see header comment item 12, confirmed on two real
+// calls, 916-410-1621, where neither call ever said the business name at all and the
+// order-of-speech fallback guessed backwards on both).
+const SERVICE_REP_PATTERNS = [
+    /\bmay i (place|put) you on hold\b/i,
+    /\blet me see if (he|she|they)'?s? available\b/i,
+    /\blet me (pull up|take a look at|look at|check) (your|that|the) (file|account|order)\b/i,
+    /\bdirect ship order\b/i,
+    /\bcall me back if\b/i,
+  ];
+
+// True if `text` contains a reliable signal that this channel is the Budget Blinds
+// team member: their own self-introduction (hasSelfIntroduction), the standard
+// greeting script regardless of business-name mishearing (GREETING_SCRIPT_PATTERN),
+// or one of the service-rep-only phrases (SERVICE_REP_PATTERNS). Tried before ever
+// falling back to the less reliable order-of-first-utterance heuristic in
+// inferChannelRoles below.
+function hasTeamMemberSignal(text) {
+    if (!text) return false;
+    if (hasSelfIntroduction(text)) return true;
+    if (GREETING_SCRIPT_PATTERN.test(text)) return true;
+    return SERVICE_REP_PATTERNS.some((pattern) => pattern.test(text));
 }
 
 // Labels each channel number as a team member or "Customer" for one leg's transcript.
-// Tries the content-based self-identification signal FIRST (see header comment above -
-// far more reliable than direction, and works even when `direction` metadata never
-// arrived), falling back to the order-of-first-utterance + call-direction heuristic
-// only when neither channel ever says the business name. Returns {} (no labels) if
-// there's only one channel with any speech at all, or if roles genuinely can't be
-// inferred - callers should fall back to generic "Channel N" labels in that case rather
-// than guessing.
+// Tries the content-based signals FIRST (see header comment above - far more reliable
+// than direction, and works even when `direction` metadata never arrived), falling
+// back to the order-of-first-utterance + call-direction heuristic only when neither
+// channel matches any of them. Returns {} (no labels) if there's only one channel with
+// any speech at all, or if roles genuinely can't be inferred - callers should fall
+// back to generic "Channel N" labels in that case rather than guessing.
 function inferChannelRoles(utterances, direction) {
-              const channelsInOrder = [];
-              for (const u of utterances) {
-                              if (!channelsInOrder.includes(u.channel)) channelsInOrder.push(u.channel);
-                              if (channelsInOrder.length >= 2) break;
-              }
-              if (channelsInOrder.length < 2) return {};
+    const channelsInOrder = [];
+    for (const u of utterances) {
+          if (!channelsInOrder.includes(u.channel)) channelsInOrder.push(u.channel);
+          if (channelsInOrder.length >= 2) break;
+    }
+    if (channelsInOrder.length < 2) return {};
 
   const [first, second] = channelsInOrder;
 
   const textByChannel = {};
-              for (const u of utterances) {
-                              textByChannel[u.channel] = `${textByChannel[u.channel] || ''} ${u.text}`;
-              }
-              const selfIdChannels = channelsInOrder.filter((c) => hasSelfIntroduction(textByChannel[c] || ''));
-              if (selfIdChannels.length === 1) {
-                              const teamMemberChannel = selfIdChannels[0];
-                              const customerChannel = teamMemberChannel === first ? second : first;
-                              return { [teamMemberChannel]: 'TeamMember', [customerChannel]: 'Customer' };
-              }
+    for (const u of utterances) {
+          textByChannel[u.channel] = `${textByChannel[u.channel] || ''} ${u.text}`;
+    }
+    const signalChannels = channelsInOrder.filter((c) => hasTeamMemberSignal(textByChannel[c] || ''));
+    if (signalChannels.length === 1) {
+          const teamMemberChannel = signalChannels[0];
+          const customerChannel = teamMemberChannel === first ? second : first;
+          return { [teamMemberChannel]: 'TeamMember', [customerChannel]: 'Customer' };
+    }
 
   // Fallback: order-of-first-utterance + call-direction heuristic. Only trustworthy
-  // when direction is definitively known - an unknown/missing direction (the metadata
-  // race described in the header comment) makes this a coin flip, so give up rather
-  // than risk labeling the two sides backwards.
+  // when direction is definitively known, and even then has now been seen to guess
+  // wrong on real calls in both directions (see header comment item 12) - kept only
+  // as a last resort for calls with no other signal at all, and still skipped
+  // entirely rather than guessing when direction itself isn't reliably known.
   if (direction !== 'OUTBOUND' && direction !== 'INBOUND') return {};
-              const teamMemberChannel = direction === 'OUTBOUND' ? second : first;
-              const customerChannel = teamMemberChannel === first ? second : first;
-              return { [teamMemberChannel]: 'TeamMember', [customerChannel]: 'Customer' };
+    const teamMemberChannel = direction === 'OUTBOUND' ? second : first;
+    const customerChannel = teamMemberChannel === first ? second : first;
+    return { [teamMemberChannel]: 'TeamMember', [customerChannel]: 'Customer' };
 }
 
 // Known GoTo speech-to-text mishearings of a real team member's name, confirmed
@@ -295,16 +362,20 @@ const KNOWN_NAME_MISHEARINGS = { christine: 'Kristine' };
 // at all, leaving nothing to correct GoTo's mis-transcribed "Christine" against).
 // Returns null if no self-introduction phrase is found.
 function extractSelfStatedTeamMemberName(utterances, roles) {
-              const teamMemberChannelKey = Object.keys(roles).find((ch) => roles[ch] === 'TeamMember');
-              if (teamMemberChannelKey === undefined) return null;
-              const text = utterances
-                .filter((u) => String(u.channel) === teamMemberChannelKey)
-                .map((u) => u.text)
-                .join(' ');
-              const match = text.match(/\bthis is ([A-Z][a-zA-Z']+)\b/) || text.match(/\bmy name is ([A-Z][a-zA-Z']+)\b/);
-              if (!match) return null;
-              const stated = match[1];
-              return KNOWN_NAME_MISHEARINGS[stated.toLowerCase()] || stated;
+    const teamMemberChannelKey = Object.keys(roles).find((ch) => roles[ch] === 'TeamMember');
+    if (teamMemberChannelKey === undefined) return null;
+    const text = utterances
+      .filter((u) => String(u.channel) === teamMemberChannelKey)
+      .map((u) => u.text)
+      .join(' ');
+    // Case-insensitive (fixed 2026-07-23: a capitalized "This is Christine." at the
+  // start of a new sentence - e.g. "...How can I help you? This is Christine." split
+  // across two sentences - was missed by an earlier case-sensitive version of this
+  // regex, which only matched a lowercase mid-sentence "this is").
+  const match = text.match(/\bthis is ([A-Za-z][a-zA-Z']+)\b/i) || text.match(/\bmy name is ([A-Za-z][a-zA-Z']+)\b/i);
+    if (!match) return null;
+    const stated = match[1];
+    return KNOWN_NAME_MISHEARINGS[stated.toLowerCase()] || stated;
 }
 
 // Formats one leg's transcript as an array of { seconds, label, text } rows. seconds is
@@ -316,63 +387,104 @@ function extractSelfStatedTeamMemberName(utterances, roles) {
 // buildConversationText (what gets sent to the model) and formatTranscriptForDoc (what
 // gets written into the Google Doc), so both always show the exact same labeling.
 function formatLegTranscript(leg) {
-              const utterances = normalizeTranscript(leg.transcript);
-              if (!utterances.length) return [];
+    const utterances = normalizeTranscript(leg.transcript);
+    if (!utterances.length) return [];
 
   const roles = inferChannelRoles(utterances, leg.direction);
-              const teamMemberName = (leg.csrChain && leg.csrChain.length)
-                ? leg.csrChain[leg.csrChain.length - 1].name
-                              : extractSelfStatedTeamMemberName(utterances, roles);
-              const startMs = utterances[0].startTimeMs || 0;
+    const teamMemberName = (leg.csrChain && leg.csrChain.length)
+      ? leg.csrChain[leg.csrChain.length - 1].name
+          : extractSelfStatedTeamMemberName(utterances, roles);
+    const startMs = utterances[0].startTimeMs || 0;
 
   return utterances.map((u) => {
-                  const role = roles[u.channel];
-                  let label;
-                  if (role === 'TeamMember') label = teamMemberName || 'Team Member';
-                  else if (role === 'Customer') label = 'Customer';
-                  else label = `Channel ${u.channel}`;
-                  const seconds = Math.max(0, Math.round((u.startTimeMs - startMs) / 1000));
-                  return { seconds, label, text: u.text };
+        const role = roles[u.channel];
+        let label;
+        if (role === 'TeamMember') label = teamMemberName || 'Team Member';
+        else if (role === 'Customer') label = 'Customer';
+        else label = `Channel ${u.channel}`;
+        const seconds = Math.max(0, Math.round((u.startTimeMs - startMs) / 1000));
+        return { seconds, label, text: u.text };
   });
 }
 
 // Concatenates every leg's transcript rows, in chronological order by the leg's own
 // callCreated timestamp, across the whole interaction.
 function allTranscriptRows(legRecords) {
-              const ordered = [...legRecords].sort((a, b) =>
-                              (a.callCreated || '').localeCompare(b.callCreated || '')
-                                                     );
-              const rows = [];
-              for (const leg of ordered) {
-                              for (const row of formatLegTranscript(leg)) rows.push(row);
-              }
-              return rows;
+    const ordered = [...legRecords].sort((a, b) =>
+          (a.callCreated || '').localeCompare(b.callCreated || '')
+                                           );
+    const rows = [];
+    for (const leg of ordered) {
+          for (const row of formatLegTranscript(leg)) rows.push(row);
+    }
+    return rows;
 }
 
 // Plain-text "[Ns] Label: text" lines, one per transcript row, for the model.
-function buildConversationText(legRecords) {
-              return allTranscriptRows(legRecords)
-                .map((r) => `[${r.seconds}s] ${r.label}: ${r.text}`)
-                .join('\n');
+function buildConversationText(rows) {
+    return rows.map((r) => `[${r.seconds}s] ${r.label}: ${r.text}`).join('\n');
 }
 
 // Same rows as buildConversationText, but HTML-escaped and wrapped as <p> tags for
 // direct inclusion in the transcript+summary Google Doc (see
 // driveClient.createTranscriptDoc / interactions.js finalizeInteraction).
 function escapeHtml(text) {
-              return text
-                .replace(/&/g, '&amp;')
-                .replace(/</g, '&lt;')
-                .replace(/>/g, '&gt;');
+    return text
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
 }
 
 function formatTranscriptForDoc(legRecords) {
-              const rows = allTranscriptRows(legRecords);
-              if (!rows.length) return '<p><i>No transcript was available for this call.</i></p>';
+    const rows = allTranscriptRows(legRecords);
+    if (!rows.length) return '<p><i>No transcript was available for this call.</i></p>';
 
   return rows
-                .map((r) => `<p><b>[${r.seconds}s] ${escapeHtml(r.label)}:</b> ${escapeHtml(r.text)}</p>`)
-                .join('\n');
+      .map((r) => `<p><b>[${r.seconds}s] ${escapeHtml(r.label)}:</b> ${escapeHtml(r.text)}</p>`)
+      .join('\n');
+}
+
+// Matches an explicit hold-related phrase - NOT just a pause or a short "let me
+// check" moment, only a line that actually says someone is being placed on hold (see
+// header comment item 12, per Joshua's request that summaries note hold time). A
+// normal brief silence while someone looks something up is not reported as a hold;
+// only this kind of explicit phrase triggers detectHoldPeriods below.
+const HOLD_REQUEST_PATTERN = /\b(may i (place|put) you on hold|please hold|(can|could) you hold|hold (on|please|for a (moment|second|minute))|(one|just a) (moment|second|minute)(,| )please|bear with me)\b/i;
+
+// Scans the labeled transcript rows for an explicit hold request and estimates how
+// long the hold lasted. The actual silence usually doesn't start on the very next
+// line (a quick "okay" or "thank you" often follows before the line actually goes
+// quiet), so this looks a few rows ahead of the hold-request line for the first real
+// gap of at least 10 seconds between consecutive rows, and reports that as the hold's
+// duration. Returns [] if no hold was detected.
+const HOLD_MIN_GAP_SECONDS = 10;
+const HOLD_LOOKAHEAD_ROWS = 6;
+function detectHoldPeriods(rows) {
+    const holds = [];
+    for (let i = 0; i < rows.length; i++) {
+          if (!HOLD_REQUEST_PATTERN.test(rows[i].text)) continue;
+          const searchLimit = Math.min(rows.length - 1, i + HOLD_LOOKAHEAD_ROWS);
+          for (let j = i; j < searchLimit; j++) {
+                  const durationSeconds = rows[j + 1].seconds - rows[j].seconds;
+                  if (durationSeconds >= HOLD_MIN_GAP_SECONDS) {
+                            holds.push({ startSeconds: rows[j].seconds, durationSeconds });
+                            break;
+                  }
+          }
+    }
+    return holds;
+}
+
+// Builds the "Hold periods detected: ..." context line for the model from
+// detectHoldPeriods' output, or null if there were none (in which case no hold-related
+// line is added to the context at all, and the SYSTEM_PROMPT instruction tells the
+// model not to mention holds when this is absent).
+function formatHoldContextLine(holds) {
+    if (!holds.length) return null;
+    const parts = holds.map(
+          (h) => `placed on hold for about ${h.durationSeconds}s starting at ${h.startSeconds}s into the call`
+        );
+    return `Hold periods detected: ${parts.join('; ')}.`;
 }
 
 // Free-form call summary instructions (see header comment item 9 - FORMAT REDESIGN,
@@ -405,7 +517,9 @@ IMPORTANT - who called whom: the metadata includes this call's direction. OUTBOU
 
 IMPORTANT - supplier/vendor support calls (the reverse case): sometimes this call is Budget Blinds contacting - or being contacted back by - an outside supplier or vendor's OWN support/order line about a problem with an order Budget Blinds placed with them (e.g. missing or incorrect parts in a shipment). In this scenario Budget Blinds is the one being served, not the customer described elsewhere in these instructions. Identify the external party by their real name and company if stated (e.g. "Jackie from Custom Browns Group"), describe the order/shipment problem as Budget Blinds' own issue rather than a customer's, and read the transcript literally to determine which side actually reported the problem - do not assume the external party is the one with the complaint just because that's the more common pattern; a Budget Blinds team member can be the one describing what's wrong with a shipment they received.
 
-IMPORTANT - automated systems are not customers: if the "Customer"-labeled channel is clearly an automated phone system, IVR menu, or hold-queue recording (menu options, "press one," hold-time announcements, a scripted greeting) rather than a live person, describe it as such (e.g. "an automated support line" or "the hold system") rather than treating it as a customer. This is common when a Budget Blinds team member calls an outside vendor's own support line, and there may be no real third-party "customer" on the call at all.`;
+IMPORTANT - automated systems are not customers: if the "Customer"-labeled channel is clearly an automated phone system, IVR menu, or hold-queue recording (menu options, "press one," hold-time announcements, a scripted greeting) rather than a live person, describe it as such (e.g. "an automated support line" or "the hold system") rather than treating it as a customer. This is common when a Budget Blinds team member calls an outside vendor's own support line, and there may be no real third-party "customer" on the call at all.
+
+IMPORTANT - hold time: if the metadata includes a "Hold periods detected" line, mention in the summary that the caller was placed on hold and roughly how long it lasted (e.g. "the customer was placed on hold for about 45 seconds while ___ checked on availability"). If that line is absent, don't mention holds at all - don't guess at a hold happening just because there was a pause in the transcript.`;
 
 // Builds the summary directly, without calling OpenAI at all, for a call with no
 // transcript text whatsoever (see header comment item 10 - NO-TRANSCRIPT ATTRIBUTION +
@@ -416,74 +530,76 @@ IMPORTANT - automated systems are not customers: if the "Customer"-labeled chann
 // the customer did, and restating a raw UTC timestamp as if it were the correct local
 // time).
 function buildNoTranscriptSummary({ csrPath, externalNumber, direction, callCreated }) {
-              const displayNumber = driveClient.formatPhoneForDisplay(externalNumber);
-              const when = driveClient.formatPacific(callCreated);
-              const lastTeamMember = (csrPath && csrPath.length)
-                ? csrPath[csrPath.length - 1].replace(/\s*\([^)]*\)\s*$/, '').trim()
-                              : null;
-              const teamMemberPhrase = lastTeamMember || 'a Budget Blinds team member';
+    const displayNumber = driveClient.formatPhoneForDisplay(externalNumber);
+    const when = driveClient.formatPacific(callCreated);
+    const lastTeamMember = (csrPath && csrPath.length)
+      ? csrPath[csrPath.length - 1].replace(/\s*\([^)]*\)\s*$/, '').trim()
+          : null;
+    const teamMemberPhrase = lastTeamMember || 'a Budget Blinds team member';
 
   if (direction === 'OUTBOUND') {
-                  return `No transcript was available for this call. ${teamMemberPhrase} placed an outbound call to ${displayNumber} on ${when}, but no conversation audio or transcript was captured for it (likely no answer, a voicemail with no message left, or a call too short to record).`;
+        return `No transcript was available for this call. ${teamMemberPhrase} placed an outbound call to ${displayNumber} on ${when}, but no conversation audio or transcript was captured for it (likely no answer, a voicemail with no message left, or a call too short to record).`;
   }
-              if (direction === 'INBOUND') {
-                              return `No transcript was available for this call. ${displayNumber} called in to Budget Blinds and was connected to ${teamMemberPhrase} on ${when}, but no conversation audio or transcript was captured for it.`;
-              }
-              return `No transcript was available for this call involving ${displayNumber} on ${when}.`;
+    if (direction === 'INBOUND') {
+          return `No transcript was available for this call. ${displayNumber} called in to Budget Blinds and was connected to ${teamMemberPhrase} on ${when}, but no conversation audio or transcript was captured for it.`;
+    }
+    return `No transcript was available for this call involving ${displayNumber} on ${when}.`;
 }
 
 // Sends the assembled call context to OpenAI and returns the formatted summary.
 // Throws on failure - the caller (src/interactions.js) catches and logs so a
 // summarization failure never crashes the webhook handler.
 async function summarizeInteraction({ legRecords, csrPath, externalName, externalNumber, direction, callCreated, callEnded }) {
-              const conversationText = buildConversationText(legRecords);
+    const rows = allTranscriptRows(legRecords);
+    const conversationText = buildConversationText(rows);
 
   // A call with genuinely no transcript text has no real content for a model to
   // summarize - see buildNoTranscriptSummary above and header comment item 10 for why
   // this is built directly in code instead of asking OpenAI to describe it.
   if (!conversationText) {
-                  return buildNoTranscriptSummary({ csrPath, externalNumber, direction, callCreated });
+        return buildNoTranscriptSummary({ csrPath, externalNumber, direction, callCreated });
   }
 
   const contextLines = [
-                  `Customer phone number: ${driveClient.formatPhoneForDisplay(externalNumber)}`,
-                  `Call direction: ${direction || 'unknown'} (OUTBOUND = a Budget Blinds team member placed this call to the customer; INBOUND = the customer called Budget Blinds - never describe an outbound call as something the customer did)`,
-                  direction !== 'OUTBOUND' && externalName
-                    ? `Caller ID on file for this number (a carrier/line label, not necessarily a person's name - see instructions above): ${externalName}`
-                    : null,
-                  `Team member path (in order, if transferred/parked): ${(csrPath || []).join(' -> ') || 'unknown'}`,
-                  `Call started: ${driveClient.formatPacific(callCreated)}`,
-                  `Call ended: ${driveClient.formatPacific(callEnded)}`,
-                ].filter(Boolean);
-              const context = contextLines.join('\n');
+        `Customer phone number: ${driveClient.formatPhoneForDisplay(externalNumber)}`,
+        `Call direction: ${direction || 'unknown'} (OUTBOUND = a Budget Blinds team member placed this call to the customer; INBOUND = the customer called Budget Blinds - never describe an outbound call as something the customer did)`,
+        direction !== 'OUTBOUND' && externalName
+          ? `Caller ID on file for this number (a carrier/line label, not necessarily a person's name - see instructions above): ${externalName}`
+          : null,
+        `Team member path (in order, if transferred/parked): ${(csrPath || []).join(' -> ') || 'unknown'}`,
+        `Call started: ${driveClient.formatPacific(callCreated)}`,
+        `Call ended: ${driveClient.formatPacific(callEnded)}`,
+        formatHoldContextLine(detectHoldPeriods(rows)),
+      ].filter(Boolean);
+    const context = contextLines.join('\n');
 
   const userPrompt = `${context}\n\nTranscript:\n${conversationText}`;
 
   const res = await fetch(OPENAI_URL, {
-                  method: 'POST',
-                  headers: {
-                                    Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-                                    'Content-Type': 'application/json',
-                  },
-                  body: JSON.stringify({
-                                    model: MODEL,
-                                    temperature: 0.2,
-                                    messages: [
-                                                { role: 'system', content: SYSTEM_PROMPT },
-                                                { role: 'user', content: userPrompt },
-                                                      ],
-                  }),
+        method: 'POST',
+        headers: {
+                Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+                'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+                model: MODEL,
+                temperature: 0.2,
+                messages: [
+                  { role: 'system', content: SYSTEM_PROMPT },
+                  { role: 'user', content: userPrompt },
+                        ],
+        }),
   });
 
   if (!res.ok) {
-                  throw new Error(`OpenAI summarization failed (${res.status}): ${await res.text()}`);
+        throw new Error(`OpenAI summarization failed (${res.status}): ${await res.text()}`);
   }
 
   const data = await res.json();
-              let summary = data.choices?.[0]?.message?.content?.trim();
-              if (!summary) {
-                              throw new Error(`OpenAI response had no summary content: ${JSON.stringify(data)}`);
-              }
+    let summary = data.choices?.[0]?.message?.content?.trim();
+    if (!summary) {
+          throw new Error(`OpenAI response had no summary content: ${JSON.stringify(data)}`);
+    }
 
   // Defensive strip (added 2026-07-21, see header comment item 8): kept as a safety net
   // even after the item-9 format redesign removed the three rigid categories - in case
