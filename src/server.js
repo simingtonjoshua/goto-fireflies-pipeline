@@ -13,6 +13,7 @@ const driveClient = require('./driveClient');
 const interactions = require('./interactions');
 const openaiClient = require('./openaiClient');
 const heymarketClient = require('./heymarketClient');
+const feedbackMonitor = require('./feedbackMonitor');
 
 const app = express();
 app.use(express.json({ limit: '5mb' }));
@@ -524,6 +525,34 @@ app.post('/admin/post-note', async (req, res) => {
                   console.error('Admin: failed to post note:', err);
                   res.status(500).json({ error: err.message });
         }
+});
+
+// Polls Heymarket contact notes for "@transcript" team feedback flags (added
+// 2026-07-30, per Joshua - see src/feedbackMonitor.js for why this is a poll rather
+// than a webhook - Heymarket only allows one webhook URL per team, and this account's
+// is already committed elsewhere, plus there's no webhook event for contact-note
+// changes anyway). Every cycle just re-checks contact notes for any phone number with
+// a recent call (see src/interactions.js's Calls-sheet logging).
+const FEEDBACK_POLL_INTERVAL_MS = 5 * 60 * 1000;
+setInterval(() => {
+feedbackMonitor.pollFeedback().catch((err) => console.error('Error polling Heymarket feedback:', err));
+}, FEEDBACK_POLL_INTERVAL_MS);
+// Also run once shortly after startup instead of waiting a full interval.
+setTimeout(() => {
+feedbackMonitor.pollFeedback().catch((err) => console.error('Error polling Heymarket feedback:', err));
+}, 15 * 1000);
+
+// Manual trigger for the feedback poll (added 2026-07-30) - forces an immediate check
+// instead of waiting up to FEEDBACK_POLL_INTERVAL_MS, same pattern as the other
+// /admin/* routes in this file.
+app.get('/admin/poll-feedback', async (req, res) => {
+try {
+const result = await feedbackMonitor.pollFeedback();
+res.json({ ok: true, ...result });
+} catch (err) {
+console.error('Admin: failed to poll feedback:', err);
+res.status(500).json({ error: err.message });
+}
 });
 
 app.get('/healthz', (req, res) => res.json({ ok: true }));
