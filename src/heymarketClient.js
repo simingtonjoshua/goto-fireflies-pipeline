@@ -98,4 +98,34 @@ async function postPrivateNote(phoneNumber, text, direction) {
   return res.json();
 }
 
-module.exports = { postPrivateNote };
+
+
+const CONTACT_GET_URL = 'https://api.heymarket.com/v1/contact/get';
+
+// Looks up a Heymarket contact (including their `note` array - date/id/name/text/
+// user_id per note) by phone number, for the "@transcript" feedback-flagging feature
+// (added 2026-07-30, per Joshua - see src/feedbackMonitor.js). Returns null if no
+// contact exists yet for this number, rather than throwing, since that's an expected,
+// harmless case here (a brand-new caller with no Heymarket contact record yet).
+async function getContactByPhone(phoneNumber) {
+const digits = normalizePhoneNumber(phoneNumber);
+if (!digits) return null;
+
+const res = await fetch(CONTACT_GET_URL, {
+method: 'POST',
+headers: {
+Authorization: `Bearer ${generateJwt()}`,
+'Content-Type': 'application/json',
+},
+body: JSON.stringify({ phone: digits }),
+});
+
+if (res.status === 404) return null;
+if (!res.ok) {
+throw new Error(`Failed to fetch Heymarket contact for ${digits} (${res.status}): ${await res.text()}`);
+}
+return res.json();
+}
+
+module.exports = { postPrivateNote, getContactByPhone };
+
