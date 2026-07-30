@@ -183,6 +183,7 @@
 const openaiClient = require('./openaiClient');
 const heymarketClient = require('./heymarketClient');
 const driveClient = require('./driveClient');
+const sheetsClient = require('./sheetsClient');
 
 const FINALIZE_QUIET_MS = 45 * 1000; // Anchored to the real call-ended signal as of the
 // 2026-07-21 fix (see BUG FIXED note above), so this only needs to cover GoTo's own
@@ -709,7 +710,27 @@ async function finalizeInteraction(groupKey) {
                                                 `Interaction ${groupKey} has no externalNumber - skipping Heymarket post. Summary was:\n${summaryText}`
                                               );
               }
-  } catch (err) {
+  
+
+// Best-effort index of every finalized call, added 2026-07-30 per Joshua - lets
+// feedbackMonitor.js match a team member's "@transcript" Contact Note flag back to
+// the right call (Contact Notes live on the Heymarket CONTACT, not on one specific
+// call - see that file's header comment for why). Never allowed to break the actual
+// summarize/Doc/Heymarket-post flow above, so it gets its own try/catch.
+try {
+const spreadsheetId = await sheetsClient.getOrCreateFeedbackSheet();
+await sheetsClient.appendRow(spreadsheetId, 'Calls', [
+groupKey,
+driveClient.formatPacific(callCreated),
+direction || 'unknown',
+externalNumber || 'unknown',
+csrPath.join(' -> ') || 'unknown',
+folderLink || '',
+]);
+} catch (err) {
+console.error(`Error logging interaction ${groupKey} to the Calls feedback sheet:`, err);
+}
+} catch (err) {
                 console.error(`Error summarizing/posting interaction ${groupKey}:`, err);
   }
 
