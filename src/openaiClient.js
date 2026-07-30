@@ -353,7 +353,7 @@ function inferChannelRoles(utterances, direction) {
 // as a last-resort name source (see extractSelfStatedTeamMemberName below) when Call
 // History never backfilled a confirmed name for this leg at all - if we already have a
 // name from Call History, that's always used instead and this never runs.
-const KNOWN_NAME_MISHEARINGS = { christine: 'Kristine' };
+const KNOWN_NAME_MISHEARINGS = { christine: 'Kristine', gaila: 'Gala', gayla: 'Gala' };
 
 // Looks for the team member's own self-introduction ("this is ___" / "my name is
 // ___") in their labeled channel's speech, as a last-resort name source when Call
@@ -386,24 +386,53 @@ function extractSelfStatedTeamMemberName(utterances, roles) {
 // "Channel N" when we can't infer roles at all (see inferChannelRoles). Shared by
 // buildConversationText (what gets sent to the model) and formatTranscriptForDoc (what
 // gets written into the Google Doc), so both always show the exact same labeling.
+// Picks the team member name active at one utterance's moment in time, using
+// leg.csrChain's ordered enteredAt timestamps - rather than assuming a WHOLE leg's
+// transcript belongs to whichever team member is LAST in the chain. This matters for a
+// warm transfer/park handoff that happens WITHIN a single leg (same conversationSpaceId
+// / same recording) - recordLegState() in interactions.js pushes a new csrChain entry
+// (instead of overwriting) specifically to preserve this kind of in-leg handoff, so a
+// leg's csrChain CAN have more than one entry, and picking only the last one mislabels
+// the earlier team member's own lines with the later team member's name. Utterance
+// startTimeMs is relative to the start of the leg's own recording (GoTo's documented
+// transcript schema), so this anchors that offset to the leg's callCreated timestamp to
+// compare against each csrChain entry's own (absolute) enteredAt time. Falls back to
+// the simple last-entry behavior when there's only one entry (the common case) or when
+// callCreated is missing and there's no reliable anchor to compare against.
+function teamMemberNameForUtterance(csrChain, leg, utterance) {
+  if (!csrChain.length) return null;
+  if (csrChain.length === 1) return csrChain[0].name;
+
+  const legStartMs = leg.callCreated ? new Date(leg.callCreated).getTime() : null;
+  if (legStartMs == null) return csrChain[csrChain.length - 1].name;
+
+  const utteranceAbsMs = legStartMs + (utterance.startTimeMs || 0);
+  let active = csrChain[0];
+  for (const entry of csrChain) {
+    const enteredMs = entry.enteredAt ? new Date(entry.enteredAt).getTime() : null;
+    if (enteredMs != null && enteredMs <= utteranceAbsMs) active = entry;
+  }
+  return active.name;
+}
+
 function formatLegTranscript(leg) {
-    const utterances = normalizeTranscript(leg.transcript);
-    if (!utterances.length) return [];
+  const utterances = normalizeTranscript(leg.transcript);
+  if (!utterances.length) return [];
 
   const roles = inferChannelRoles(utterances, leg.direction);
-    const teamMemberName = (leg.csrChain && leg.csrChain.length)
-      ? leg.csrChain[leg.csrChain.length - 1].name
-          : extractSelfStatedTeamMemberName(utterances, roles);
-    const startMs = utterances[0].startTimeMs || 0;
+  const csrChain = leg.csrChain || [];
+  const fallbackName = csrChain.length ? null : extractSelfStatedTeamMemberName(utterances, roles);
+  const startMs = utterances[0].startTimeMs || 0;
 
   return utterances.map((u) => {
-        const role = roles[u.channel];
-        let label;
-        if (role === 'TeamMember') label = teamMemberName || 'Team Member';
-        else if (role === 'Customer') label = 'Customer';
-        else label = `Channel ${u.channel}`;
-        const seconds = Math.max(0, Math.round((u.startTimeMs - startMs) / 1000));
-        return { seconds, label, text: u.text };
+    const role = roles[u.channel];
+    let label;
+    if (role === 'TeamMember') {
+      label = (csrChain.length ? teamMemberNameForUtterance(csrChain, leg, u) : fallbackName) || 'Team Member';
+    } else if (role === 'Customer') label = 'Customer';
+    else label = `Channel ${u.channel}`;
+    const seconds = Math.max(0, Math.round((u.startTimeMs - startMs) / 1000));
+    return { seconds, label, text: u.text };
   });
 }
 
