@@ -217,6 +217,8 @@
 
 const fetch = require('node-fetch');
 const driveClient = require('./driveClient');
+const callParties = require('./callParties');
+const roster = require('./roster');
 
 const OPENAI_URL = 'https://api.openai.com/v1/chat/completions';
 const MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
@@ -319,6 +321,8 @@ function hasTeamMemberSignal(text) {
 // channel matches any of them. Returns {} (no labels) if there's only one channel with
 // any speech at all, or if roles genuinely can't be inferred - callers should fall
 // back to generic "Channel N" labels in that case rather than guessing.
+// Labels no longer use this. Speaker roles come from GoTo channel and
+// participant data in callParties.channelRole. Talk order is not a role.
 function inferChannelRoles(utterances, direction) {
     const channelsInOrder = [];
     for (const u of utterances) {
@@ -419,23 +423,33 @@ function teamMemberNameForUtterance(csrChain, leg, utterance) {
   return active.name;
 }
 
+// Labels come from GoTo's channel and participant data (callParties.channelRole),
+// not from who spoke first and not from words in the transcript. A known greeting,
+// hold message, or voicemail greeting is "Recording" even when it says a name.
 function formatLegTranscript(leg) {
   const utterances = normalizeTranscript(leg.transcript);
   if (!utterances.length) return [];
 
-  const roles = inferChannelRoles(utterances, leg.direction);
+  const book = roster.getRoster();
   const csrChain = leg.csrChain || [];
-  const fallbackName = csrChain.length ? null : extractSelfStatedTeamMemberName(utterances, roles);
   const startMs = utterances[0].startTimeMs || 0;
 
   return utterances.map((u) => {
-    const role = roles[u.channel];
-    let label;
-    if (role === 'TeamMember') {
-      label = (csrChain.length ? teamMemberNameForUtterance(csrChain, leg, u) : fallbackName) || 'Team Member';
-    } else if (role === 'Customer') label = 'Customer';
-    else label = `Channel ${u.channel}`;
     const seconds = Math.max(0, Math.round((u.startTimeMs - startMs) / 1000));
+    if (callParties.isSystemRecordingUtterance(u.text, book)) {
+      return { seconds, label: 'Recording', text: u.text };
+    }
+    const role = callParties.channelRole(u.channel, leg);
+    let label;
+    if (role === 'team') {
+      label = teamMemberNameForUtterance(csrChain, leg, u) || 'Team Member';
+    } else if (role === 'customer') {
+      label = 'Customer';
+    } else if (role === 'system') {
+      label = 'Recording';
+    } else {
+      label = `Channel ${u.channel}`;
+    }
     return { seconds, label, text: u.text };
   });
 }
@@ -524,7 +538,11 @@ function formatHoldContextLine(holds) {
 // 2026-07-21). Replaced the earlier three-rigid-category design: rather than picking
 // between fixed templates, the model just describes what happened, as accurately and
 // completely as the call warrants.
-const SYSTEM_PROMPT = `You summarize customer phone calls for a Budget Blinds franchise CRM. You will be given call metadata and a speaker-labeled transcript (labels are "Team Member" and "Customer" where we could tell, or "Channel 0"/"Channel 1" where we couldn't - infer speaker identity from context in that case). Each transcript line is prefixed with "[Ns]" - the number of seconds into the call that line started.
+const SYSTEM_PROMPT = `You summarize customer phone calls for a Budget Blinds franchise CRM. You will be given call metadata and a speaker-labeled transcript. Speaker labels are already assigned from the phone system's channel and participant data: a team member's name or "Team Member", "Customer", "Recording" (a known system greeting, hold message, or voicemail greeting), or "Channel N" when the phone system did not identify that side. Do not swap labels based on who spoke first, and do not rename a speaker from a word in the transcript. A "Recording" line is never a live person, even if the recording says someone's name.
+
+The metadata includes fixed facts: direction, whether the call was answered, the team member names, and the customer phone number. Do not change those facts. If Answered is no, do not say the caller was connected to, reached, or spoke with a team member.
+
+Each transcript line is prefixed with "[Ns]" - the number of seconds into the call that line started.
 
 Write a plain-language summary of what actually happened on this call - not a fixed template, just an accurate account of the conversation. Use as many or as few sentences as the call actually needs (a single short sentence is fine for a quick callback; a fuller paragraph is fine for a detailed booking or a complicated issue). Do not force the call into a category, and do not add a header or label announcing what "type" of call this was - just describe it.
 
@@ -562,51 +580,70 @@ IMPORTANT - hold time: if the metadata includes a "Hold periods detected" line, 
 // guess at it (which produced two real bugs: describing an outbound call as something
 // the customer did, and restating a raw UTC timestamp as if it were the correct local
 // time).
-function buildNoTranscriptSummary({ csrPath, externalNumber, direction, callCreated }) {
+function buildNoTranscriptSummary({ csrPath, externalNumber, direction, callCreated, answered }) {
     const displayNumber = driveClient.formatPhoneForDisplay(externalNumber);
     const when = driveClient.formatPacific(callCreated);
     const lastTeamMember = (csrPath && csrPath.length)
       ? csrPath[csrPath.length - 1].replace(/\s*\([^)]*\)\s*$/, '').trim()
           : null;
-    const teamMemberPhrase = lastTeamMember || 'a Budget Blinds team member';
+    const wasAnswered = Boolean(answered);
 
   if (direction === 'OUTBOUND') {
-        return `No transcript was available for this call. ${teamMemberPhrase} placed an outbound call to ${displayNumber} on ${when}, but no conversation audio or transcript was captured for it (likely no answer, a voicemail with no message left, or a call too short to record).`;
+        const who = lastTeamMember || 'A Budget Blinds team member';
+        if (wasAnswered) {
+              return `No transcript was available for this call. ${who} placed an outbound call to ${displayNumber} on ${when}, and the phone system shows the call was answered, but no conversation audio or transcript was captured.`;
+        }
+        return `No transcript was available for this call. ${who} placed an outbound call to ${displayNumber} on ${when}. The phone system does not show that the call was answered (no answer, a greeting, or voicemail).`;
   }
     if (direction === 'INBOUND') {
-          return `No transcript was available for this call. ${displayNumber} called in to Budget Blinds and was connected to ${teamMemberPhrase} on ${when}, but no conversation audio or transcript was captured for it.`;
+          if (wasAnswered && lastTeamMember) {
+                return `No transcript was available for this call. ${displayNumber} called Budget Blinds on ${when} and the call was answered by ${lastTeamMember}, but no conversation audio or transcript was captured.`;
+          }
+          return `No transcript was available for this call. ${displayNumber} called Budget Blinds on ${when}. The phone system does not show that a team member answered (missed call, greeting, or voicemail).`;
     }
     return `No transcript was available for this call involving ${displayNumber} on ${when}.`;
+}
+
+function buildSummaryMessages({ legRecords, csrPath, externalName, externalNumber, direction, callCreated, callEnded, answered }) {
+    const rows = allTranscriptRows(legRecords || []);
+    const conversationText = buildConversationText(rows);
+    const contextLines = [
+          'Fixed facts (do not change these):',
+          `Call direction: ${direction || 'unknown'} (OUTBOUND = a Budget Blinds team member placed this call to the customer; INBOUND = the customer called Budget Blinds - never describe an outbound call as something the customer did)`,
+          `Answered: ${answered ? 'yes' : 'no'}`,
+          `Team member path (in order, if transferred/parked): ${(csrPath || []).join(' -> ') || 'unknown'}`,
+          `Customer phone number: ${driveClient.formatPhoneForDisplay(externalNumber)}`,
+          callParties.systemRecordingPromptLine(),
+          direction !== 'OUTBOUND' && externalName
+            ? `Caller ID on file for this number (a carrier/line label, not necessarily a person's name - see instructions above): ${externalName}`
+            : null,
+          `Call started: ${driveClient.formatPacific(callCreated)}`,
+          `Call ended: ${driveClient.formatPacific(callEnded)}`,
+          formatHoldContextLine(detectHoldPeriods(rows)),
+    ].filter(Boolean);
+    return {
+          system: SYSTEM_PROMPT,
+          user: `${contextLines.join('\n')}\n\nTranscript:\n${conversationText}`,
+          conversationText,
+    };
 }
 
 // Sends the assembled call context to OpenAI and returns the formatted summary.
 // Throws on failure - the caller (src/interactions.js) catches and logs so a
 // summarization failure never crashes the webhook handler.
-async function summarizeInteraction({ legRecords, csrPath, externalName, externalNumber, direction, callCreated, callEnded }) {
-    const rows = allTranscriptRows(legRecords);
-    const conversationText = buildConversationText(rows);
+async function summarizeInteraction({ legRecords, csrPath, externalName, externalNumber, direction, callCreated, callEnded, answered }) {
+    const built = buildSummaryMessages({
+          legRecords, csrPath, externalName, externalNumber, direction, callCreated, callEnded, answered,
+    });
 
   // A call with genuinely no transcript text has no real content for a model to
   // summarize - see buildNoTranscriptSummary above and header comment item 10 for why
   // this is built directly in code instead of asking OpenAI to describe it.
-  if (!conversationText) {
-        return buildNoTranscriptSummary({ csrPath, externalNumber, direction, callCreated });
+  if (!built.conversationText) {
+        return buildNoTranscriptSummary({ csrPath, externalNumber, direction, callCreated, answered });
   }
 
-  const contextLines = [
-        `Customer phone number: ${driveClient.formatPhoneForDisplay(externalNumber)}`,
-        `Call direction: ${direction || 'unknown'} (OUTBOUND = a Budget Blinds team member placed this call to the customer; INBOUND = the customer called Budget Blinds - never describe an outbound call as something the customer did)`,
-        direction !== 'OUTBOUND' && externalName
-          ? `Caller ID on file for this number (a carrier/line label, not necessarily a person's name - see instructions above): ${externalName}`
-          : null,
-        `Team member path (in order, if transferred/parked): ${(csrPath || []).join(' -> ') || 'unknown'}`,
-        `Call started: ${driveClient.formatPacific(callCreated)}`,
-        `Call ended: ${driveClient.formatPacific(callEnded)}`,
-        formatHoldContextLine(detectHoldPeriods(rows)),
-      ].filter(Boolean);
-    const context = contextLines.join('\n');
-
-  const userPrompt = `${context}\n\nTranscript:\n${conversationText}`;
+  const userPrompt = built.user;
 
   const res = await fetch(OPENAI_URL, {
         method: 'POST',
@@ -618,7 +655,7 @@ async function summarizeInteraction({ legRecords, csrPath, externalName, externa
                 model: MODEL,
                 temperature: 0.2,
                 messages: [
-                  { role: 'system', content: SYSTEM_PROMPT },
+                  { role: 'system', content: built.system },
                   { role: 'user', content: userPrompt },
                         ],
         }),
@@ -643,4 +680,10 @@ async function summarizeInteraction({ legRecords, csrPath, externalName, externa
   return summary;
 }
 
-module.exports = { summarizeInteraction, formatTranscriptForDoc };
+module.exports = {
+  summarizeInteraction,
+  formatTranscriptForDoc,
+  formatLegTranscript,
+  buildNoTranscriptSummary,
+  buildSummaryMessages,
+};

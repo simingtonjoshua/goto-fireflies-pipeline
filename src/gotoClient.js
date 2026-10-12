@@ -258,6 +258,29 @@ async function fetchRecordingContent(recordingId) {
   return { buffer, contentType };
 }
 
+// Users on the account, including each user's lines (extension number + line id).
+// Used to map a call-history userKey back to a configured extension. Paginates on
+// nextPageMarker. A 401/403 (missing scope) is the caller's problem to log; this
+// throws so the roster refresh can fall back to the config file.
+async function listAccountUsers(accountKey) {
+  const items = [];
+  let pageMarker = null;
+  for (let page = 0; page < 20; page++) {
+    const url = new URL(`${API_BASE}/users/v1/users`);
+    url.searchParams.set('accountKey', accountKey);
+    if (pageMarker) url.searchParams.set('pageMarker', pageMarker);
+    const res = await gotoFetch(url);
+    if (!res.ok) {
+      throw new Error(`Failed to list users (${res.status}): ${await res.text()}`);
+    }
+    const data = await res.json();
+    items.push(...(data.items || data.users || []));
+    pageMarker = data.nextPageMarker || null;
+    if (!pageMarker) break;
+  }
+  return items;
+}
+
 module.exports = {
   getAccountKey,
   createWebhookChannel,
@@ -268,4 +291,5 @@ module.exports = {
   subscribeCallParkingEvents,
   fetchTranscript,
   fetchRecordingContent,
+  listAccountUsers,
 };

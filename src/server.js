@@ -14,6 +14,9 @@ const interactions = require('./interactions');
 const openaiClient = require('./openaiClient');
 const heymarketClient = require('./heymarketClient');
 const feedbackMonitor = require('./feedbackMonitor');
+const callParties = require('./callParties');
+const roster = require('./roster');
+const { listAccountUsers } = require('./gotoClient');
 
 const app = express();
 app.use(express.json({ limit: '5mb' }));
@@ -181,48 +184,50 @@ function classifyNotification(payload) {
 // Tracks call-state events (STARTING/ACTIVE/ENDING) so that by the time a
 // RECORDING_UPLOADED notification arrives for a given recordingId, we already know
 // that call's direction, the outside phone number, and when it happened.
+//
+// Participant details are nested under `type` (confirmed 2026-07-18). Direction is
+// metadata.direction when GoTo sends it. The external number is the customer, not
+// our own DID, and is never copied from a different call that happened to reuse an id.
 function trackCallState(payload) {
         const content = payload.content || {};
         const metadata = content.metadata || {};
         const state = content.state || {};
         const conversationSpaceId = metadata.conversationSpaceId;
         if (!conversationSpaceId) return;
+        if (interactions.wasRecentlyFinalized(conversationSpaceId)) {
+                  console.log(`Call-state for ${conversationSpaceId} arrived after finalize — not keeping it or any earlier number.`);
+                  return;
+        }
 
-  const participants = state.participants || [];
-        const external = participants.find((p) => p?.type?.value === 'PHONE_NUMBER');
-        const internal = participants.find((p) => p?.type?.value === 'LINE');
-
-  // NOTE: GoTo nests the actual per-participant details (number, name, extensionNumber,
-  // caller) under `type`, not on the participant object itself - confirmed against a
-  // real inbound call payload on 2026-07-18. For PHONE_NUMBER participants, `type.number`
-  // is the DID that was dialed/answered (e.g. the office number on an inbound call), while
-  // `type.caller` holds the true originating party's name/number - prefer that when present
-  // since it's the more useful "who was this call with" value.
-  const externalType = external?.type || {};
-        const externalCaller = externalType.caller || {};
-        const externalCallee = externalType.callee || {};
-        const internalType = internal?.type || {};
-
-  const existing = conversationMetadata.get(conversationSpaceId) || {};
-        const callDirection = metadata.direction || existing.direction;
-        const resolvedExternalNumber = callDirection === 'OUTBOUND'
-          ? (externalCallee.number || externalCaller.number || externalType.number)
-                  : (externalCaller.number || externalCallee.number || externalType.number);
-        const resolvedExternalName = callDirection === 'OUTBOUND'
-          ? (externalCallee.name || externalCaller.name || externalType.name)
-                  : (externalCaller.name || externalCallee.name || externalType.name);
+        const analysis = callParties.analyzeCallState(payload, roster.getRoster());
+        const existing = conversationMetadata.get(conversationSpaceId) || {};
+        const callCreated = analysis.callCreated || existing.callCreated;
+        const sameCall = !existing.callCreated || !analysis.callCreated || existing.callCreated === analysis.callCreated;
+        const chosen = callParties.chooseExternalNumber({
+                  proposed: analysis.externalNumber,
+                  existingNumber: existing.externalNumber,
+                  existingCallCreated: existing.callCreated,
+                  callCreated: analysis.callCreated,
+                  direction: analysis.direction || existing.direction,
+                  dialString: analysis.dialString || (sameCall ? existing.dialString : null),
+                  roster: roster.getRoster(),
+        });
+        if (chosen.reusedPrevious) {
+                  console.log(`REVIEW: conversation ${conversationSpaceId} has a new callCreated and no customer number. Not reusing the previous call's number.`);
+        }
+        const callDirection = analysis.direction || (sameCall ? existing.direction : null);
         const merged = {
                   conversationSpaceId,
                   direction: callDirection,
-                  dialString: metadata.dialString || existing.dialString,
-                  callCreated: metadata.callCreated || existing.callCreated,
-                  accountKey: metadata.accountKey || existing.accountKey,
-                  externalNumber: resolvedExternalNumber || existing.externalNumber,
-                  externalName: resolvedExternalName || existing.externalName,
-                  internalName: internalType.name || existing.internalName,
-                  internalExtension: internalType.extensionNumber || existing.internalExtension,
+                  directionSource: analysis.direction ? 'metadata' : (sameCall ? existing.directionSource : null),
+                  dialString: analysis.dialString || (sameCall ? existing.dialString : null),
+                  callCreated,
+                  accountKey: analysis.accountKey || (sameCall ? existing.accountKey : null),
+                  externalNumber: chosen.number,
+                  externalName: analysis.externalName || (sameCall ? existing.externalName : null),
                   callState: state.type || existing.callState,
                   callEnded: state.type === 'ENDING' ? state.timestamp : existing.callEnded,
+                  callIdVersion: analysis.callIdVersion,
         };
         conversationMetadata.set(conversationSpaceId, merged);
 
@@ -237,33 +242,64 @@ function trackCallState(payload) {
 
   // Feeds the interaction-grouping/CSR-chain tracker (src/interactions.js) in parallel
   // with the conversationMetadata bookkeeping above.
-  interactions.recordLegState(conversationSpaceId, {
-            legId: internal?.legId || external?.legId,
-            internalName: internalType.name,
-            internalExtension: internalType.extensionNumber,
+  const primaryLeg = analysis.lines.find((line) => line.legId) || {};
+        interactions.recordLegState(conversationSpaceId, {
+            legId: primaryLeg.legId,
+            lines: analysis.lines,
+            recordingOwners: analysis.recordingOwners,
+            externalConnected: analysis.externalConnected,
             externalName: merged.externalName,
             externalNumber: merged.externalNumber,
             direction: merged.direction,
+            directionSource: merged.directionSource,
             dialString: merged.dialString,
             callCreated: merged.callCreated,
             callEnded: merged.callEnded,
             accountKey: merged.accountKey,
+            callIdVersion: analysis.callIdVersion,
             expectedTranscriptIds,
   });
 
   // Whenever a recording id shows up (on a participant or on the state itself),
   // remember which call it belongs to so handleRecording() can look it up later.
   const recordingIds = new Set();
-        for (const p of participants) {
+        for (const p of state.participants || []) {
                   for (const r of p.recordings || []) recordingIds.add(r.id);
+                  for (const r of (p.type && p.type.recordings) || []) recordingIds.add(r.id);
         }
         for (const r of state.recordings || []) recordingIds.add(r.id);
         for (const id of recordingIds) recordingMetadata.set(id, merged);
 
-  console.log(
-            `Call event: ${state.type} (conversationSpaceId=${conversationSpaceId}, direction=${merged.direction}, number=${merged.externalNumber})`
+  const answered = analysis.lines.filter((line) => line.connected && !line.isSystem).map((line) => line.extension || line.name);
+        console.log(
+            `Call event: ${state.type} (conversationSpaceId=${conversationSpaceId}, direction=${merged.direction || 'missing'}, number=${merged.externalNumber || 'missing'}, callIdVersion=${analysis.callIdVersion || 'n/a'}, answeredExtensions=${answered.join(',') || 'none'})`
           );
+        if (analysis.callIdVersion === '4' || !merged.direction) {
+                  console.log(
+                              `Call id note: version=${analysis.callIdVersion || 'non-uuid'} direction=${merged.direction || 'missing'} conversationSpaceId=${conversationSpaceId}. Version 4 ids were the unknown-direction rows; capture this STARTING payload to confirm which GoTo client sent it.`
+                            );
+        }
 }
+
+function refreshRoster() {
+        const accountKey = process.env.GOTO_ACCOUNT_KEY;
+        if (!accountKey) return;
+        listAccountUsers(accountKey).then((items) => {
+                  let linked = 0;
+                  for (const user of items) {
+                            if (roster.getRoster().indexApiUser(user)) linked += 1;
+                  }
+                  console.log(`Roster refresh: linked ${linked} GoTo user keys to configured extensions.`);
+        }).catch((err) => {
+                  console.error(`Roster refresh failed (extension config still in use): ${err.message}`);
+        });
+}
+refreshRoster();
+setInterval(refreshRoster, 15 * 60 * 1000).unref();
+
+interactions.setOnFinalized((ids) => {
+        for (const id of ids) conversationMetadata.delete(id);
+});
 
 // Fetches the actual transcript content from GoTo (Advanced Reporting & Analytics
 // add-on) and hands it to interactions.js to be grouped with the rest of its
@@ -435,6 +471,7 @@ app.post('/admin/reprocess-call', async (req, res) => {
                               callEnded,
                               csrChain,
                               folderId,
+                              answered,
                   } = req.body || {};
 
           if (!recordingId || !externalNumber || !direction) {
@@ -463,6 +500,7 @@ app.post('/admin/reprocess-call', async (req, res) => {
                       direction,
                       callCreated,
                       callEnded,
+                      answered: answered === true,
           });
 
           const topFolderId = process.env.GOOGLE_DRIVE_FOLDER_ID;

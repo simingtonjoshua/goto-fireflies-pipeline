@@ -1,0 +1,30 @@
+{
+  "people": [
+    { "extension": "00001", "name": "Amy Bullock" },
+    { "extension": "00002", "name": "James Bullock" },
+    {
+      "extension": "00003",
+      "name": "Joshua Simington",
+      "heymarketUserId": "68173",
+      "recordedGreeting": true
+    },
+    { "extension": "00004", "name": "Gala Wilbur", "heymarketUserId": "100349" },
+    { "extension": "00005", "name": "Amy Bullock", "note": "Home Office" },
+    { "extension": "00006", "name": "Emily Kingdon", "heymarketUserId": "130287" },
+    { "extension": "00007", "name": "Kristine Vandervort" }
+  ],
+  "systemLines": [
+    {
+      "id": "main-line",
+      "label": "Main line",
+      "kind": "system",
+      "note": "Not a person. Put its digits in SYSTEM_PHONE_NUMBERS, not in this file."
+    },
+    {
+      "id": "former-rep-cell-forward",
+      "label": "Forwarded former rep cell",
+      "kind": "system",
+      "note": "Not a person. Put its digits in SYSTEM_PHONE_NUMBERS, not in this file."
+    }
+  ]
+}
