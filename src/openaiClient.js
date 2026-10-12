@@ -494,17 +494,12 @@ function escapeHtml(text) {
 }
 
 // Re-runs masking so a path that did not go through recordTranscript (admin reprocess)
-// still cannot send or store raw card text. A REVIEW leg contributes no transcript body.
+// still cannot send or store raw card text. Nothing is ever withheld.
 function applyCardGuard(legRecords) {
     let review = false;
     const guarded = (legRecords || []).map((leg) => {
           const result = cardRedact.redactTranscript(leg && leg.transcript);
-          const legReview = Boolean(result.review || (leg && leg.cardReview));
           const legMasked = Boolean(result.masked || (leg && leg.cardMasked));
-          if (legReview) review = true;
-          if (legReview) {
-                return { ...leg, transcript: null, cardReview: true, cardMasked: legMasked, cardFlagged: true };
-          }
           return { ...leg, transcript: result.transcript, cardReview: false, cardMasked: legMasked, cardFlagged: legMasked };
     });
     return { legRecords: guarded, review };
@@ -512,7 +507,6 @@ function applyCardGuard(legRecords) {
 
 function formatTranscriptForDoc(legRecords) {
     const guard = applyCardGuard(legRecords);
-    if (guard.review) return '<p><i>Transcript withheld for card-data review.</i></p>';
     const rows = allTranscriptRows(guard.legRecords);
     if (!rows.length) return '<p><i>No transcript was available for this call.</i></p>';
 
@@ -667,7 +661,6 @@ function buildSummaryMessages({ legRecords, csrPath, externalName, externalNumbe
 // summarization failure never crashes the webhook handler.
 async function summarizeInteraction({ legRecords, csrPath, externalName, externalNumber, direction, callCreated, callEnded, answered }) {
     const guard = applyCardGuard(legRecords);
-    if (guard.review) return cardRedact.reviewHoldMessage();
 
     const built = buildSummaryMessages({
           legRecords: guard.legRecords, csrPath, externalName, externalNumber, direction, callCreated, callEnded, answered,
