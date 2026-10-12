@@ -612,6 +612,136 @@ describe('speaker labels and summary facts', () => {
     assert.match(text, /Emily Kingdon \(00006\)/);
     assert.match(text, /System recordings/);
     assert.match(text, /who spoke first/);
+    assert.match(text, /ground truth/i);
+    assert.match(text, /service order/i);
+    assert.match(text, /customer signs it and pays/i);
+    assert.match(text, /Never write that the customer will send a service order for a team member to sign or pay/);
+  });
+
+  // Live outbound return call, 2026-10-12: direction and the team-member credit were
+  // right, but channel 0 was the customer answering and channel 1 was the staff
+  // introduction. Synthetic names and no real phone numbers.
+  function outboundDeskSwap(extra = {}) {
+    return openaiClient.formatLegTranscript({
+      direction: 'OUTBOUND',
+      csrChain: [{ name: 'Joshua Simington', extension: '00003', enteredAt: '2026-10-12T16:19:00.000Z' }],
+      callCreated: '2026-10-12T16:19:00.000Z',
+      transcript: {
+        results: [
+          { transcript: 'Hello.', channel: 0, startTimeMs: 0 },
+          { transcript: 'Hi, Jordan, this is Joshua over at Budget Blinds.', channel: 1, startTimeMs: 1000 },
+          { transcript: 'Yeah, this shade is no longer working on one of my windows.', channel: 0, startTimeMs: 18000 },
+          { transcript: 'I will email you a service order. Once you get that, you will sign it online and pay.', channel: 1, startTimeMs: 486000 },
+        ],
+      },
+      ...extra,
+    });
+  }
+
+  it('corrects an outbound desk call when channel 0 is the customer answering', () => {
+    const rows = outboundDeskSwap();
+    assert.deepEqual(rows.map((row) => row.label), [
+      'Customer',
+      'Joshua Simington',
+      'Customer',
+      'Joshua Simington',
+    ]);
+  });
+
+  it('corrects the same swap when the recording owner was marked as the team member', () => {
+    const rows = outboundDeskSwap({
+      recordingId: 'rec-desk',
+      recordingOwners: { 'rec-desk': { role: 'team', name: 'Joshua Simington', extension: '00003' } },
+    });
+    assert.deepEqual(rows.map((row) => row.label), [
+      'Customer',
+      'Joshua Simington',
+      'Customer',
+      'Joshua Simington',
+    ]);
+  });
+
+  it('corrects channel labels from a roster-name introduction without the business name', () => {
+    const rows = openaiClient.formatLegTranscript({
+      direction: 'OUTBOUND',
+      csrChain: [{ name: 'Joshua Simington', extension: '00003' }],
+      transcript: {
+        results: [
+          { transcript: 'Hello?', channel: 0, startTimeMs: 0 },
+          { transcript: 'Hey, this is Josh. I am returning your call about the shade.', channel: 1, startTimeMs: 1000 },
+        ],
+      },
+    });
+    assert.deepEqual(rows.map((row) => row.label), ['Customer', 'Joshua Simington']);
+  });
+
+  it('still corrects the swap when speech-to-text mishears Budget Blinds', () => {
+    const rows = openaiClient.formatLegTranscript({
+      direction: 'OUTBOUND',
+      csrChain: [{ name: 'Emily Kingdon', extension: '00006' }],
+      transcript: {
+        results: [
+          { transcript: 'Hello.', channel: 0, startTimeMs: 0 },
+          { transcript: 'Hi, this is Emily over at Budget Minds.', channel: 1, startTimeMs: 1000 },
+        ],
+      },
+    });
+    assert.deepEqual(rows.map((row) => row.label), ['Customer', 'Emily Kingdon']);
+  });
+
+  it('does not relabel an outbound call from talk order when nobody introduces themselves', () => {
+    const rows = openaiClient.formatLegTranscript({
+      direction: 'OUTBOUND',
+      csrChain: [{ name: 'Joshua Simington', extension: '00003' }],
+      transcript: {
+        results: [
+          { transcript: 'Hello?', channel: 0, startTimeMs: 0 },
+          { transcript: 'The shade in my living room stopped working.', channel: 1, startTimeMs: 1000 },
+        ],
+      },
+    });
+    assert.deepEqual(rows.map((row) => row.label), ['Joshua Simington', 'Customer']);
+  });
+
+  it('does not treat a customer introducing themselves as the team member', () => {
+    const rows = openaiClient.formatLegTranscript({
+      direction: 'OUTBOUND',
+      csrChain: [{ name: 'Joshua Simington', extension: '00003' }],
+      transcript: {
+        results: [
+          { transcript: 'Hi, this is Joshua over at Budget Blinds.', channel: 0, startTimeMs: 0 },
+          { transcript: 'Hi, this is Jordan.', channel: 1, startTimeMs: 2000 },
+        ],
+      },
+    });
+    assert.deepEqual(rows.map((row) => row.label), ['Joshua Simington', 'Customer']);
+  });
+
+  it('does not let the after-hours greeting flip an inbound call', () => {
+    const rows = openaiClient.formatLegTranscript({
+      direction: 'INBOUND',
+      csrChain: [{ name: 'Emily Kingdon', extension: '00006' }],
+      transcript: {
+        results: [
+          { transcript: 'Hi there, this is Josh. Please leave your name after the tone.', channel: 0, startTimeMs: 0 },
+          { transcript: 'Hi, I need a shade repaired.', channel: 1, startTimeMs: 8000 },
+        ],
+      },
+    });
+    assert.deepEqual(rows.map((row) => row.label), ['Recording', 'Emily Kingdon']);
+  });
+
+  it('labels speakers from a team introduction when direction is missing', () => {
+    const rows = openaiClient.formatLegTranscript({
+      csrChain: [{ name: 'Joshua Simington', extension: '00003' }],
+      transcript: {
+        results: [
+          { transcript: 'Hello.', channel: 0, startTimeMs: 0 },
+          { transcript: 'Hi, this is Joshua over at Budget Blinds.', channel: 1, startTimeMs: 1000 },
+        ],
+      },
+    });
+    assert.deepEqual(rows.map((row) => row.label), ['Customer', 'Joshua Simington']);
   });
 });
 

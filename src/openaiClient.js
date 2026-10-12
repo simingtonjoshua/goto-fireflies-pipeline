@@ -424,8 +424,9 @@ function teamMemberNameForUtterance(csrChain, leg, utterance) {
   return active.name;
 }
 
-// Labels come from GoTo's channel and participant data (callParties.channelRole),
-// not from who spoke first and not from words in the transcript. A known greeting,
+// Labels start from GoTo's channel and participant data (callParties.channelRole).
+// A team self-introduction that contradicts that map corrects the whole channel
+// (callParties.channelRolesForLeg). Talk order is not a role. A known greeting,
 // hold message, or voicemail greeting is "Recording" even when it says a name.
 function formatLegTranscript(leg) {
   const utterances = normalizeTranscript(leg.transcript);
@@ -434,13 +435,22 @@ function formatLegTranscript(leg) {
   const book = roster.getRoster();
   const csrChain = leg.csrChain || [];
   const startMs = utterances[0].startTimeMs || 0;
+  const assignment = callParties.channelRolesForLeg(utterances, leg, book);
+  if (assignment.corrected) {
+    console.log(
+      `Speaker channels corrected from a team self-introduction on channel ${assignment.teamChannel}`
+      + ` (direction ${leg.direction || 'unknown'}, recording ${leg.recordingId || 'n/a'}).`,
+    );
+  }
 
   return utterances.map((u) => {
     const seconds = Math.max(0, Math.round((u.startTimeMs - startMs) / 1000));
     if (callParties.isSystemRecordingUtterance(u.text, book)) {
       return { seconds, label: 'Recording', text: u.text };
     }
-    const role = callParties.channelRole(u.channel, leg);
+    const role = Object.prototype.hasOwnProperty.call(assignment.roles, Number(u.channel))
+      ? assignment.roles[Number(u.channel)]
+      : callParties.channelRole(u.channel, leg);
     let label;
     if (role === 'team') {
       label = teamMemberNameForUtterance(csrChain, leg, u) || 'Team Member';
@@ -562,6 +572,8 @@ const SYSTEM_PROMPT = `You summarize customer phone calls for a Budget Blinds fr
 
 The metadata includes fixed facts: direction, whether the call was answered, the team member names, and the customer phone number. Do not change those facts. If Answered is no, do not say the caller was connected to, reached, or spoke with a team member.
 
+Treat the speaker labels as ground truth. Do not swap who did something because of who talked first, or because a line sounds like the other role, and do not rename a labeled speaker from a word in the transcript. Attribute each action to the labeled speaker who said they would do it. Do not invent a role-reversed commercial relationship: the labeled team member (Budget Blinds) sends the service order and warranty paperwork, and the customer signs it and pays. Never write that the customer will send a service order for a team member to sign or pay. Never describe the team member as the person whose product failed when the Customer lines are the ones describing that problem.
+
 Each transcript line is prefixed with "[Ns]" - the number of seconds into the call that line started.
 
 Write a plain-language summary of what actually happened on this call - not a fixed template, just an accurate account of the conversation. Use as many or as few sentences as the call actually needs (a single short sentence is fine for a quick callback; a fuller paragraph is fine for a detailed booking or a complicated issue). Do not force the call into a category, and do not add a header or label announcing what "type" of call this was - just describe it.
@@ -633,6 +645,7 @@ function buildSummaryMessages({ legRecords, csrPath, externalName, externalNumbe
           `Call direction: ${direction || 'unknown'} (OUTBOUND = a Budget Blinds team member placed this call to the customer; INBOUND = the customer called Budget Blinds - never describe an outbound call as something the customer did)`,
           `Answered: ${answered ? 'yes' : 'no'}`,
           `Team member path (in order, if transferred/parked): ${(csrPath || []).join(' -> ') || 'unknown'}`,
+          'Commercial roles (do not reverse): the team member sends any service order or warranty paperwork; the customer signs it and pays.',
           `Customer phone number: ${driveClient.formatPhoneForDisplay(externalNumber)}`,
           callParties.systemRecordingPromptLine(),
           direction !== 'OUTBOUND' && externalName
