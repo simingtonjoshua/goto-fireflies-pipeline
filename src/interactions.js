@@ -186,6 +186,7 @@ const driveClient = require('./driveClient');
 const sheetsClient = require('./sheetsClient');
 const callParties = require('./callParties');
 const roster = require('./roster');
+const cardRedact = require('./cardRedact');
 
 const FINALIZE_QUIET_MS = 45 * 1000; // Anchored to the real call-ended signal as of the
 // 2026-07-21 fix (see BUG FIXED note above), so this only needs to cover GoTo's own
@@ -249,6 +250,7 @@ const pendingHistory = [];
 const PENDING_HISTORY_TTL_MS = 10 * 60 * 1000;
 
 let onFinalized = () => {};
+let audioUploader = null;
 
 function setOnFinalized(fn) {
             onFinalized = typeof fn === 'function' ? fn : () => {};
@@ -607,11 +609,28 @@ function recordTranscript(conversationSpaceId, recordingId, transcript) {
                                         );
                           return;
             }
+            const redacted = cardRedact.redactTranscript(transcript);
             const leg = getOrCreateLeg(conversationSpaceId);
             leg.recordingId = recordingId;
-            leg.transcript = transcript;
+            leg.transcriptReceived = true;
+            leg.cardMasked = redacted.masked;
+            leg.cardReview = redacted.review;
+            leg.cardFlagged = redacted.flagged;
+            if (redacted.review) {
+                          console.log(`REVIEW: card wording was present but nothing was masked for conversation ${conversationSpaceId}. Transcript body will be withheld.`);
+                          leg.transcript = cardRedact.withheldTranscript();
+            } else {
+                          leg.transcript = redacted.transcript;
+                          if (redacted.masked) console.log(`Card data masked on conversation ${conversationSpaceId}.`);
+            }
             leg.pendingTranscriptIds.delete(recordingId);
-            scheduleFinalize(groupKeyFor(conversationSpaceId));
+            const groupKey = groupKeyFor(conversationSpaceId);
+            scheduleFinalize(groupKey);
+            const flagged = groupIsCardFlagged(conversationSpaceId);
+            const releaseIds = flagged ? [...conversationSpaceIdsFor(groupKey)] : [conversationSpaceId];
+            releaseHeldAudio(releaseIds, flagged).catch((err) =>
+                          console.error(`Error releasing held audio for ${conversationSpaceId}:`, err)
+                        );
 }
 
 // Attaches a Google Drive archival link (and per-call subfolder info, added 2026-07-21)
@@ -622,7 +641,7 @@ function recordTranscript(conversationSpaceId, recordingId, transcript) {
 // finish in either order.
 //
 // Same late-arrival guard as recordTranscript() (see SLOW-TRANSCRIPT FIX above).
-function recordRecordingLink(conversationSpaceId, recordingId, driveLink, folder) {
+function recordRecordingLink(conversationSpaceId, recordingId, driveLink, folder, options) {
             if (!conversationSpaceId) return;
             if (!legs.has(conversationSpaceId) && wasRecentlyFinalized(conversationSpaceId)) {
                           console.log(
@@ -637,7 +656,69 @@ function recordRecordingLink(conversationSpaceId, recordingId, driveLink, folder
                           leg.folderId = folder.id;
                           leg.folderLink = folder.webViewLink;
             }
+            if (!options || options.schedule !== false) scheduleFinalize(groupKeyFor(conversationSpaceId));
+}
+
+function setAudioUploader(fn) {
+            audioUploader = typeof fn === 'function' ? fn : null;
+}
+
+function groupIsCardFlagged(conversationSpaceId) {
+            if (!conversationSpaceId) return false;
+            for (const id of conversationSpaceIdsFor(groupKeyFor(conversationSpaceId))) {
+                          const leg = legs.get(id);
+                          if (leg && leg.cardFlagged) return true;
+            }
+            return false;
+}
+
+function isCardFlagged(conversationSpaceId) {
+            return groupIsCardFlagged(conversationSpaceId);
+}
+
+// 'archive' uploads now. 'hold' keeps the bytes until the transcript has been checked.
+// 'skip' means this call was flagged (masked or REVIEW) and the audio must not be stored.
+function audioArchiveDecision(conversationSpaceId) {
+            if (!conversationSpaceId) return 'archive';
+            if (groupIsCardFlagged(conversationSpaceId)) return 'skip';
+            const leg = legs.get(conversationSpaceId);
+            if (!leg || !leg.transcriptReceived) return 'hold';
+            return 'archive';
+}
+
+function holdRecordingAudio(conversationSpaceId, pending) {
+            if (!conversationSpaceId || !pending) return;
+            if (!legs.has(conversationSpaceId) && wasRecentlyFinalized(conversationSpaceId)) {
+                          console.log(
+                                          `Recording ${pending.recordingId} arrived for conversationSpaceId=${conversationSpaceId} after it was already finalized - dropping instead of creating a duplicate interaction.`
+                                        );
+                          return;
+            }
+            const leg = getOrCreateLeg(conversationSpaceId);
+            if (!leg.pendingAudio) leg.pendingAudio = [];
+            leg.pendingAudio.push(pending);
+            leg.recordingId = leg.recordingId || pending.recordingId;
             scheduleFinalize(groupKeyFor(conversationSpaceId));
+}
+
+async function releaseHeldAudio(conversationSpaceIds, flagged) {
+            const pending = [];
+            for (const id of conversationSpaceIds || []) {
+                          const leg = legs.get(id);
+                          if (!leg || !leg.pendingAudio) continue;
+                          const held = Array.isArray(leg.pendingAudio) ? leg.pendingAudio : [leg.pendingAudio];
+                          leg.pendingAudio = null;
+                          if (flagged || leg.cardFlagged) {
+                                          for (const audio of held) {
+                                                          console.log(`Skipping Drive audio archive for recording ${audio.recordingId}: call flagged for card data.`);
+                                          }
+                          } else {
+                                          pending.push(...held);
+                          }
+            }
+            for (const audio of pending) {
+                          if (audioUploader) await audioUploader(audio);
+            }
 }
 
 function groupKeyFor(conversationSpaceId) {
@@ -668,6 +749,7 @@ function stillWaitingOnTranscript(groupKey) {
 }
 
 function legIsSubstantive(leg) {
+            if (leg && leg.cardFlagged) return true;
             return callParties.transcriptIsSubstantive(leg && leg.transcript, roster.getRoster());
 }
 
@@ -680,7 +762,11 @@ function clearLegIndex(leg) {
 function describeGroup(groupKey) {
             const conversationSpaceIds = [...conversationSpaceIdsFor(groupKey)];
             const legRecords = conversationSpaceIds
-              .map((id) => ({ conversationSpaceId: id, ...(legs.get(id) || {}) }))
+              .map((id) => {
+                            const leg = { ...(legs.get(id) || {}) };
+                            delete leg.pendingAudio;
+                            return { conversationSpaceId: id, ...leg };
+              })
               .filter((leg) => leg.legId || leg.transcript || leg.externalNumber || (leg.csrChain && leg.csrChain.length));
 
             const csrChain = [];
@@ -886,6 +972,7 @@ async function finalizeInteraction(groupKey) {
             } = described;
 
             if (!legRecords.length) {
+                          await releaseHeldAudio(conversationSpaceIds, false);
                           console.log(`Interaction ${groupKey} closed with no leg data recorded - nothing to summarize.`);
                           return;
             }
@@ -919,6 +1006,8 @@ async function finalizeInteraction(groupKey) {
             }, null, 2));
 
             try {
+                          const cardFlagged = legRecords.some((leg) => leg.cardFlagged);
+                          await releaseHeldAudio(conversationSpaceIds, cardFlagged);
                           const summaryText = await openaiClient.summarizeInteraction({
                                           legRecords,
                                           csrPath,
@@ -1004,6 +1093,7 @@ async function finalizeInteraction(groupKey) {
 function resetForTests() {
             for (const timer of closeTimers.values()) clearTimeout(timer);
             closeTimers.clear();
+            audioUploader = null;
             legs.clear();
             legIdToConversation.clear();
             originatorForConversation.clear();
@@ -1016,12 +1106,14 @@ function resetForTests() {
 function peekLeg(conversationSpaceId) {
             const leg = legs.get(conversationSpaceId);
             if (!leg) return null;
-            return {
+            const copy = {
                           ...leg,
                           csrChain: (leg.csrChain || []).map((entry) => ({ ...entry })),
                           extraLegIds: leg.extraLegIds ? [...leg.extraLegIds] : [],
                           pendingTranscriptIds: leg.pendingTranscriptIds ? [...leg.pendingTranscriptIds] : [],
             };
+            delete copy.pendingAudio;
+            return copy;
 }
 
 module.exports = {
@@ -1030,6 +1122,11 @@ module.exports = {
             recordCallParkingEvent,
             recordTranscript,
             recordRecordingLink,
+            audioArchiveDecision,
+            holdRecordingAudio,
+            releaseHeldAudio,
+            setAudioUploader,
+            isCardFlagged,
             legIdToConversation,
             wasRecentlyFinalized,
             setOnFinalized,
