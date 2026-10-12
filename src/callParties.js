@@ -18,7 +18,15 @@
 // (https://developer.goto.com/GoToConnect/#tag/Transcriptions). When the recording
 // id is nested on a participant, that participant is channel 0. When it isn't, channel
 // 0 is treated as the call originator (the external caller on an inbound call, the
-// extension that dialed on an outbound call) and channel 1 as the other side. Talk
+// extension that dialed on an outbound call) and channel 1 as the other side.
+//
+// That originator fallback was confirmed wrong on a live outbound return call from
+// Joshua's line on 2026-10-12: direction and the team-member credit were already
+// correct, but channel 0 was the customer answering ("Hello") and channel 1 was
+// Joshua ("this is Joshua over at Budget Blinds"). A missing recording owner, or a
+// recording owner marked as the team line, therefore swapped every speaker.
+// channelRolesForLeg() keeps the GoTo map and flips it only when one channel has a
+// content-safe team self-introduction that the map labeled as the customer. Talk
 // order is not used. See callIdVersion() for why some of Joshua's rows look different.
 
 const rosterApi = require('./roster');
@@ -370,6 +378,106 @@ function channelRole(channel, leg) {
   return null;
 }
 
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// First names the leg already credits as staff. "Josh" counts for Joshua because
+// that is how the after-hours greeting and live intros refer to him. Customer
+// first names are not included.
+function teamIntroNames(leg) {
+  const names = [];
+  const push = (name) => {
+    const cleaned = String(name || '').trim();
+    if (!cleaned) return;
+    if (names.some((existing) => existing.toLowerCase() === cleaned.toLowerCase())) return;
+    names.push(cleaned);
+  };
+  for (const entry of (leg && leg.csrChain) || []) {
+    const first = String(entry.name || '').trim().split(/\s+/)[0];
+    if (!first) continue;
+    push(first);
+    if (/^joshua$/i.test(first)) push('Josh');
+  }
+  return names;
+}
+
+// "Budget Blinds" plus the mishearings already seen in live transcripts.
+const BUSINESS_NAME = 'budget\\s*(blinds|lines|minds|binds)';
+const NOT_A_PERSON_NAME = '(?:the|a|an|my|your|our|that|it|just)\\b';
+// "this is Joshua over at Budget Blinds" / "this is Marie with Budget Blinds".
+const TEAM_SELF_ID_AT_BUSINESS = new RegExp(
+  `\\bthis is\\s+(?!${NOT_A_PERSON_NAME}\\b)[A-Za-z][A-Za-z']+(?:\\s+[A-Za-z][A-Za-z']+){0,2}\\s+(?:over\\s+at|at|with|from)\\s+${BUSINESS_NAME}\\b`,
+  'i',
+);
+const TEAM_I_AM_AT_BUSINESS = new RegExp(
+  `\\b(?:i'm|i am)\\s+(?!${NOT_A_PERSON_NAME}\\b)[A-Za-z][A-Za-z']+\\s+(?:over\\s+at|at|with|from)\\s+${BUSINESS_NAME}\\b`,
+  'i',
+);
+const TEAM_ON_BEHALF = new RegExp(`\\bcalling on behalf of\\s+${BUSINESS_NAME}\\b`, 'i');
+// A played open greeting can name a person without proving which stereo channel
+// is the live team member. The after-hours greeting is already system audio.
+const GREETING_NOT_CHANNEL_PROOF = /\b(?:it'?s a (?:great|good) day here at|thank you for calling)\b/i;
+
+function utteranceCanProveTeamChannel(text, roster) {
+  const value = String(text || '');
+  if (!value.trim()) return false;
+  if (isSystemRecordingUtterance(value, roster)) return false;
+  if (GREETING_NOT_CHANNEL_PROOF.test(value)) return false;
+  return true;
+}
+
+function textHasTeamSelfIdentification(text, leg) {
+  const value = String(text || '');
+  if (!value.trim()) return false;
+  if (TEAM_SELF_ID_AT_BUSINESS.test(value)) return true;
+  if (TEAM_I_AM_AT_BUSINESS.test(value)) return true;
+  if (TEAM_ON_BEHALF.test(value)) return true;
+  return teamIntroNames(leg).some((name) => {
+    const pattern = new RegExp(
+      `\\b(?:this is|i'm|i am|my name is)\\s+${escapeRegExp(name)}\\b(?!['’])`,
+      'i',
+    );
+    return pattern.test(value);
+  });
+}
+
+// GoTo's channel map, corrected when a single channel's own introduction
+// contradicts it. Does not look at which channel spoke first.
+function channelRolesForLeg(utterances, leg, roster = rosterApi.getRoster()) {
+  const present = [];
+  for (const utterance of utterances || []) {
+    const channel = Number(utterance && utterance.channel);
+    if (!Number.isFinite(channel) || present.includes(channel)) continue;
+    present.push(channel);
+  }
+  const roles = {};
+  for (const channel of present) roles[channel] = channelRole(channel, leg || {});
+
+  const signalChannels = present.filter((channel) => {
+    const text = (utterances || [])
+      .filter((utterance) => Number(utterance.channel) === channel && utteranceCanProveTeamChannel(utterance.text, roster))
+      .map((utterance) => utterance.text)
+      .join(' ');
+    return textHasTeamSelfIdentification(text, leg || {});
+  });
+  if (signalChannels.length !== 1) return { roles, corrected: false };
+
+  const teamChannel = signalChannels[0];
+  const current = roles[teamChannel];
+  if (current === 'team') return { roles, corrected: false };
+  // Only override a customer label, or fill in a side GoTo did not label.
+  // A system-owned channel is left alone.
+  if (current !== 'customer' && current != null) return { roles, corrected: false };
+
+  roles[teamChannel] = 'team';
+  for (const channel of present) {
+    if (channel === teamChannel) continue;
+    if (roles[channel] === 'team' || roles[channel] == null) roles[channel] = 'customer';
+  }
+  return { roles, corrected: true, teamChannel };
+}
+
 function simpleUtterances(raw) {
   if (!raw) return [];
   const items = Array.isArray(raw) ? raw : raw.results || raw.items || raw.transcriptions || [];
@@ -478,6 +586,7 @@ module.exports = {
   analyzeCallHistory,
   chooseExternalNumber,
   channelRole,
+  channelRolesForLeg,
   isSystemRecordingUtterance,
   systemRecordingPromptLine,
   transcriptIsSubstantive,
