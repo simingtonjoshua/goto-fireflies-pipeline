@@ -219,6 +219,7 @@ const fetch = require('node-fetch');
 const driveClient = require('./driveClient');
 const callParties = require('./callParties');
 const roster = require('./roster');
+const cardRedact = require('./cardRedact');
 
 const OPENAI_URL = 'https://api.openai.com/v1/chat/completions';
 const MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
@@ -482,8 +483,27 @@ function escapeHtml(text) {
       .replace(/>/g, '&gt;');
 }
 
+// Re-runs masking so a path that did not go through recordTranscript (admin reprocess)
+// still cannot send or store raw card text. A REVIEW leg contributes no transcript body.
+function applyCardGuard(legRecords) {
+    let review = false;
+    const guarded = (legRecords || []).map((leg) => {
+          const result = cardRedact.redactTranscript(leg && leg.transcript);
+          const legReview = Boolean(result.review || (leg && leg.cardReview));
+          const legMasked = Boolean(result.masked || (leg && leg.cardMasked));
+          if (legReview) review = true;
+          if (legReview) {
+                return { ...leg, transcript: null, cardReview: true, cardMasked: legMasked, cardFlagged: true };
+          }
+          return { ...leg, transcript: result.transcript, cardReview: false, cardMasked: legMasked, cardFlagged: legMasked };
+    });
+    return { legRecords: guarded, review };
+}
+
 function formatTranscriptForDoc(legRecords) {
-    const rows = allTranscriptRows(legRecords);
+    const guard = applyCardGuard(legRecords);
+    if (guard.review) return '<p><i>Transcript withheld for card-data review.</i></p>';
+    const rows = allTranscriptRows(guard.legRecords);
     if (!rows.length) return '<p><i>No transcript was available for this call.</i></p>';
 
   return rows
@@ -605,7 +625,8 @@ function buildNoTranscriptSummary({ csrPath, externalNumber, direction, callCrea
 }
 
 function buildSummaryMessages({ legRecords, csrPath, externalName, externalNumber, direction, callCreated, callEnded, answered }) {
-    const rows = allTranscriptRows(legRecords || []);
+    const guard = applyCardGuard(legRecords);
+    const rows = allTranscriptRows(guard.legRecords);
     const conversationText = buildConversationText(rows);
     const contextLines = [
           'Fixed facts (do not change these):',
@@ -632,8 +653,11 @@ function buildSummaryMessages({ legRecords, csrPath, externalName, externalNumbe
 // Throws on failure - the caller (src/interactions.js) catches and logs so a
 // summarization failure never crashes the webhook handler.
 async function summarizeInteraction({ legRecords, csrPath, externalName, externalNumber, direction, callCreated, callEnded, answered }) {
+    const guard = applyCardGuard(legRecords);
+    if (guard.review) return cardRedact.reviewHoldMessage();
+
     const built = buildSummaryMessages({
-          legRecords, csrPath, externalName, externalNumber, direction, callCreated, callEnded, answered,
+          legRecords: guard.legRecords, csrPath, externalName, externalNumber, direction, callCreated, callEnded, answered,
     });
 
   // A call with genuinely no transcript text has no real content for a model to

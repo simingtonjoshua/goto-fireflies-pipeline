@@ -11,6 +11,7 @@ const {
 } = require('./gotoClient');
 const driveClient = require('./driveClient');
 const interactions = require('./interactions');
+const cardRedact = require('./cardRedact');
 const openaiClient = require('./openaiClient');
 const heymarketClient = require('./heymarketClient');
 const feedbackMonitor = require('./feedbackMonitor');
@@ -338,6 +339,16 @@ async function handleRecording(recordingId) {
         recentUploadSizes.set(buffer.length, now);
 
   const meta = recordingMetadata.get(recordingId) || {};
+        const decision = interactions.audioArchiveDecision(meta.conversationSpaceId);
+        if (decision === 'skip') {
+                  console.log(`Skipping Drive audio archive for recording ${recordingId}: call flagged for card data.`);
+                  return;
+        }
+        if (decision === 'hold') {
+                  interactions.holdRecordingAudio(meta.conversationSpaceId, { recordingId, buffer, contentType, meta });
+                  console.log(`Holding recording ${recordingId} until card-data check finishes.`);
+                  return;
+        }
         await archiveToDrive(recordingId, buffer, contentType, meta);
 }
 
@@ -346,7 +357,7 @@ async function handleRecording(recordingId) {
 // against this call's interaction so it can be included in the Heymarket note. The
 // filename itself carries the folder's own name as a prefix (per Joshua, 2026-07-21) so
 // the file still shows its date/direction/phone context if it's ever viewed on its own.
-async function archiveToDrive(recordingId, buffer, contentType, meta) {
+async function archiveToDrive(recordingId, buffer, contentType, meta, options) {
         try {
                   const ext = driveClient.extForContentType(contentType);
                   const folderName = driveClient.buildCallFolderName({
@@ -362,7 +373,7 @@ async function archiveToDrive(recordingId, buffer, contentType, meta) {
                   console.log(`Archived recording ${recordingId} to Google Drive folder "${folderName}": ${webViewLink}`);
 
           if (meta.conversationSpaceId) {
-                      interactions.recordRecordingLink(meta.conversationSpaceId, recordingId, webViewLink, folder);
+                      interactions.recordRecordingLink(meta.conversationSpaceId, recordingId, webViewLink, folder, options);
           } else {
                       console.log(
                                     `Recording ${recordingId} archived to Drive but has no known conversationSpaceId yet - the link won't be attached to an interaction (same "orphan recording" case handleTranscriptReady logs).`
@@ -372,6 +383,10 @@ async function archiveToDrive(recordingId, buffer, contentType, meta) {
                   console.error(`Error archiving recording ${recordingId} to Google Drive:`, err);
         }
 }
+
+interactions.setAudioUploader(async (pending) => {
+        await archiveToDrive(pending.recordingId, pending.buffer, pending.contentType, pending.meta || {}, { schedule: false });
+});
 
 // One-off admin route (added 2026-07-20): registers the new Call History + Call Parking
 // subscriptions on the SAME notification channel setup.js already created, WITHOUT
@@ -420,8 +435,14 @@ app.get('/admin/register-new-subscriptions', async (req, res) => {
 // short-lived debug aid, but should be deleted before this is left running long-term.
 app.get('/admin/debug-transcript/:recordingId', async (req, res) => {
         try {
-                  const transcript = await fetchTranscript(req.params.recordingId);
-                  res.json(transcript);
+                  const fetched = await fetchTranscript(req.params.recordingId);
+                  const redacted = cardRedact.redactTranscript(fetched);
+                  if (redacted.review) {
+                              console.log(`REVIEW: card wording was present but nothing was masked for recording ${req.params.recordingId}. Transcript body will be withheld.`);
+                              return res.json(cardRedact.withheldTranscript());
+                  }
+                  if (redacted.masked) console.log(`Card data masked on recording ${req.params.recordingId}.`);
+                  res.json(redacted.transcript);
         } catch (err) {
                   res.status(500).json({ error: err.message });
         }
