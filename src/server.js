@@ -617,4 +617,4 @@ res.status(500).json({ error: err.message });
 app.get('/healthz', (req, res) => res.json({ ok: true }));
 
 const port = process.env.PORT || 3001;
-app.listen(port, () => console.log(`goto-fireflies-pipeline listening on :${port}`));
+app.listen(port, () => console.log(`GoTo Call Notes listening on :${port}`));

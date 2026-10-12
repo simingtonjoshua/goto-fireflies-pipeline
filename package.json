@@ -1,5 +1,5 @@
 {
-    "name": "goto-fireflies-pipeline",
+    "name": "goto-call-notes",
     "version": "1.0.0",
     "private": true,
     "description": "Receives GoTo Connect call recording notifications, fetches transcripts directly from GoTo's Advanced Reporting & Analytics add-on, groups multi-leg calls into interactions, and archives recordings to Google Drive.",
