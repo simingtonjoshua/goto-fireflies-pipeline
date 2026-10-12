@@ -104,25 +104,30 @@ describe('card redaction', () => {
     assert.equal(plainDate.flagged, false);
   });
 
-  it('does not treat a window count as a security code, and holds when only card words match', () => {
-    const windows = cardRedact.redactTranscript(utterance('15 windows'));
-    assert.equal(textOf(windows), '15 windows');
-    assert.equal(windows.flagged, false);
-
-    const credit = cardRedact.redactTranscript(utterance('credit for 15 windows'));
-    assert.equal(textOf(credit), 'credit for 15 windows');
-    assert.equal(credit.masked, false);
-    assert.equal(credit.review, true);
-    assert.equal(credit.flagged, true);
-
-    const question = cardRedact.redactTranscript(utterance('Can I pay by credit card?'));
-    assert.equal(question.review, true);
-    assert.equal(question.masked, false);
-    assert.equal(question.flagged, true);
-
-    const year = cardRedact.redactTranscript(utterance('the cvv is 2026'));
-    assert.equal(year.review, true);
-    assert.equal(textOf(year).includes('[REDACTED-CVV]'), false);
+  it('never holds or flags payment talk without card digits (false positives)', () => {
+    const cases = [
+      '15 windows',
+      'credit for 15 windows',
+      'Can I pay by credit card?',
+      'the cvv is 2026',
+      'I will put the deposit on my card, the total is $4,250.00',
+      'my card number? I will call back with it',
+      'call me at 916-555-0123 or (707) 718-1909',
+      'call me at 1 916 555 0123',
+      'order number 202610120045 for the shutters',
+      'PO 4400123, invoice 88231',
+      'we live at 12345 Fair Oaks Blvd, Sacramento CA 95628',
+      'payment is due 10/15 and the credit card fee is 3 percent',
+      'the price is 1,299 and the card on file was charged 350 dollars',
+      'debit or credit, either works, we take payment at install',
+    ];
+    for (const text of cases) {
+      const result = cardRedact.redactTranscript(utterance(text));
+      assert.equal(textOf(result), text, text);
+      assert.equal(result.review, false, text);
+      assert.equal(result.masked, false, text);
+      assert.equal(result.flagged, false, text);
+    }
   });
 
   it('stays masked on a second pass when card wording remains beside the token', () => {
@@ -161,32 +166,17 @@ describe('card redaction before summary and docs', () => {
     assert.equal(doc.includes('12/26'), false);
   });
 
-  it('withholds the transcript body when card wording was not masked', async () => {
+  it('always includes the transcript when payment is discussed without a card number', async () => {
     const legRecords = [{ transcript: utterance('Can I pay by credit card? zebra') }];
     const doc = openaiClient.formatTranscriptForDoc(legRecords);
-    assert.equal(doc.includes('zebra'), false);
-    assert.match(doc, /Transcript withheld for card-data review/);
-
+    assert.match(doc, /zebra/);
+    assert.equal(/withheld/i.test(doc), false);
     const built = openaiClient.buildSummaryMessages({
-      legRecords,
-      csrPath: [],
-      direction: 'INBOUND',
-      externalNumber: PHONE,
-      answered: false,
+      legRecords, csrPath: [], direction: 'INBOUND', externalNumber: PHONE, answered: false,
     });
-    assert.equal(built.conversationText.includes('zebra'), false);
-    assert.equal(built.user.includes('zebra'), false);
-    assert.equal(built.user.includes('credit card'), false);
-
-    const summary = await openaiClient.summarizeInteraction({
-      legRecords,
-      csrPath: [],
-      direction: 'INBOUND',
-      externalNumber: PHONE,
-      answered: false,
-    });
-    assert.equal(summary, cardRedact.reviewHoldMessage());
-    assert.equal(summary.includes('zebra'), false);
+    assert.match(built.conversationText, /zebra/);
+    assert.equal(typeof cardRedact.reviewHoldMessage, 'undefined');
+    assert.equal(typeof cardRedact.withheldTranscript, 'undefined');
   });
 
   it('still includes an ordinary transcript', () => {
@@ -230,25 +220,22 @@ describe('card flags on a call', () => {
     assert.equal(Object.hasOwn(interactions.peekLeg('conv-pan'), 'pendingAudio'), false);
   });
 
-  it('withholds a REVIEW transcript and does not upload held audio', async () => {
+  it('keeps and archives a call with payment talk but no card number', async () => {
     const uploaded = [];
     interactions.setAudioUploader(async (pending) => uploaded.push(pending.recordingId));
-    interactions.holdRecordingAudio('conv-review', {
-      recordingId: 'rec-review',
+    interactions.holdRecordingAudio('conv-talk', {
+      recordingId: 'rec-talk',
       buffer: Buffer.from('synthetic-audio'),
       contentType: 'audio/mpeg',
-      meta: { conversationSpaceId: 'conv-review' },
+      meta: { conversationSpaceId: 'conv-talk' },
     });
-    interactions.recordTranscript('conv-review', 'rec-review', utterance('Can I pay by credit card? zebra'));
+    interactions.recordTranscript('conv-talk', 'rec-talk', utterance('Can I pay by credit card? zebra'));
     await new Promise((resolve) => setImmediate(resolve));
-
-    const stored = JSON.stringify(interactions.peekLeg('conv-review'));
-    assert.equal(stored.includes('zebra'), false);
-    assert.equal(stored.includes('credit'), false);
-    assert.match(stored, /withheld/i);
-    assert.equal(interactions.isCardFlagged('conv-review'), true);
-    assert.equal(interactions.audioArchiveDecision('conv-review'), 'skip');
-    assert.deepEqual(uploaded, []);
+    const stored = JSON.stringify(interactions.peekLeg('conv-talk'));
+    assert.match(stored, /zebra/);
+    assert.equal(/withheld/i.test(stored), false);
+    assert.equal(interactions.isCardFlagged('conv-talk'), false);
+    assert.deepEqual(uploaded, ['rec-talk']);
   });
 
   it('archives a clean call and uploads audio that was held for the check', async () => {

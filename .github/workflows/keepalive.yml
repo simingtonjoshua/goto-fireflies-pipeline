@@ -1,0 +1,10 @@
+name: keep-alive
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -fsS --max-time 60 --retry 3 https://goto-fireflies-pipeline.onrender.com/healthz

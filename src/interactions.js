@@ -614,15 +614,10 @@ function recordTranscript(conversationSpaceId, recordingId, transcript) {
             leg.recordingId = recordingId;
             leg.transcriptReceived = true;
             leg.cardMasked = redacted.masked;
-            leg.cardReview = redacted.review;
-            leg.cardFlagged = redacted.flagged;
-            if (redacted.review) {
-                          console.log(`REVIEW: card wording was present but nothing was masked for conversation ${conversationSpaceId}. Transcript body will be withheld.`);
-                          leg.transcript = cardRedact.withheldTranscript();
-            } else {
-                          leg.transcript = redacted.transcript;
-                          if (redacted.masked) console.log(`Card data masked on conversation ${conversationSpaceId}.`);
-            }
+            leg.cardReview = false;
+            leg.cardFlagged = redacted.masked;
+            leg.transcript = redacted.transcript;
+            if (redacted.masked) console.log(`Card data masked on conversation ${conversationSpaceId}.`);
             leg.pendingTranscriptIds.delete(recordingId);
             const groupKey = groupKeyFor(conversationSpaceId);
             scheduleFinalize(groupKey);
@@ -677,7 +672,7 @@ function isCardFlagged(conversationSpaceId) {
 }
 
 // 'archive' uploads now. 'hold' keeps the bytes until the transcript has been checked.
-// 'skip' means this call was flagged (masked or REVIEW) and the audio must not be stored.
+// 'skip' means this call was flagged (real card data was masked) and the audio must not be stored.
 function audioArchiveDecision(conversationSpaceId) {
             if (!conversationSpaceId) return 'archive';
             if (groupIsCardFlagged(conversationSpaceId)) return 'skip';

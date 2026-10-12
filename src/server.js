@@ -437,10 +437,6 @@ app.get('/admin/debug-transcript/:recordingId', async (req, res) => {
         try {
                   const fetched = await fetchTranscript(req.params.recordingId);
                   const redacted = cardRedact.redactTranscript(fetched);
-                  if (redacted.review) {
-                              console.log(`REVIEW: card wording was present but nothing was masked for recording ${req.params.recordingId}. Transcript body will be withheld.`);
-                              return res.json(cardRedact.withheldTranscript());
-                  }
                   if (redacted.masked) console.log(`Card data masked on recording ${req.params.recordingId}.`);
                   res.json(redacted.transcript);
         } catch (err) {

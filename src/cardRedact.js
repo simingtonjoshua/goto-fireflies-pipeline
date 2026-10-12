@@ -3,8 +3,9 @@
 // A long digit run is masked only when it is 13–19 digits and passes the Luhn check,
 // so phone numbers and ordinary order numbers stay visible.
 //
-// When card-context words are present but nothing was masked, callers withhold the
-// transcript body and skip the audio archive. Raw matching text is not logged here.
+// LOCKED RULE (Joshua, 2026-10-12): the transcript and summary are ALWAYS posted.
+// Payment wording alone ("card", "credit", "payment") never withholds or holds anything.
+// Only real card numbers, expiration dates and security codes in a card context are masked.
 
 const DIGIT_WORD = {
   zero: '0',
@@ -21,10 +22,9 @@ const DIGIT_WORD = {
 };
 
 const TOKEN_RE = /\b(?:zero|oh|one|two|three|four|five|six|seven|eight|nine|\d+)\b/gi;
-const CONTEXT_RE = /\b(cards?|credit|debit|expiration|cvv|cvc|security code|card number)\b/i;
-const CONTEXT_RE_G = /\b(cards?|credit|debit|expiration|cvv|cvc|security code|card number)\b/gi;
+const CONTEXT_RE_G = /\b(expiration|expires|expiry|exp date|cvv|cvc|security code)\b/gi;
 const EXP_RE = /\b(?:0?[1-9]|1[0-2])\s*[/\-]\s*(?:\d{4}|\d{2})\b/g;
-const CVV_ANCHOR_RE = /\b(?:cvv|cvc|cid|security code|card number)\b/gi;
+const CVV_ANCHOR_RE = /\b(?:cvv|cvc|cid|security code)\b/gi;
 const CVV_RE = /\b\d{3,4}\b/g;
 const ALREADY_RE = /\[REDACTED-(?:CARD|EXP|CVV)\]/;
 
@@ -110,7 +110,7 @@ function findExtraSpans(text, blocked) {
   let match = EXP_RE.exec(text);
   while (match) {
     const span = { start: match.index, end: match.index + match[0].length, token: '[REDACTED-EXP]' };
-    if (nearAny(match.index, contexts, 80) && !overlaps(span, blocked) && !overlaps(span, spans)) spans.push(span);
+    if ((nearAny(match.index, contexts, 80) || nearAny(match.index, blocked.map((b) => b.end), 80)) && !overlaps(span, blocked) && !overlaps(span, spans)) spans.push(span);
     match = EXP_RE.exec(text);
   }
   const anchors = [];
@@ -206,14 +206,13 @@ function writeBack(raw, texts) {
 function redactTranscript(raw) {
   const texts = utteranceTexts(raw);
   const { joined } = joinTexts(texts);
-  const hasContext = CONTEXT_RE.test(joined);
   const already = ALREADY_RE.test(joined);
   const cardSpans = findCardSpans(joined);
   const extraSpans = findExtraSpans(joined, cardSpans);
   const spans = cardSpans.concat(extraSpans);
   const masked = spans.length > 0 || already;
-  const review = hasContext && !masked;
-  const flagged = masked || review;
+  const review = false; // never hold or withhold on wording
+  const flagged = masked;
   const nextTexts = spans.length ? applySpans(texts, spans) : texts;
   return {
     transcript: spans.length ? writeBack(raw, nextTexts) : raw,
@@ -223,17 +222,7 @@ function redactTranscript(raw) {
   };
 }
 
-function reviewHoldMessage() {
-  return 'Payment-card wording was detected on this call and could not be masked automatically. The transcript was withheld for review.';
-}
-
-function withheldTranscript() {
-  return { results: [{ transcript: 'Transcript withheld for payment-data review.', channel: 0, startTimeMs: 0 }] };
-}
-
 module.exports = {
   redactTranscript,
-  reviewHoldMessage,
-  withheldTranscript,
   luhnOk,
 };
