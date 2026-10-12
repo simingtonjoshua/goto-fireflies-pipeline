@@ -184,6 +184,8 @@ const openaiClient = require('./openaiClient');
 const heymarketClient = require('./heymarketClient');
 const driveClient = require('./driveClient');
 const sheetsClient = require('./sheetsClient');
+const callParties = require('./callParties');
+const roster = require('./roster');
 
 const FINALIZE_QUIET_MS = 45 * 1000; // Anchored to the real call-ended signal as of the
 // 2026-07-21 fix (see BUG FIXED note above), so this only needs to cover GoTo's own
@@ -233,11 +235,24 @@ const closeTimers = new Map();
 const recentlyFinalizedConversationSpaceIds = new Map();
 
 // normalized external phone number (digits only) -> { finalizedAtMs, groupKey,
-// callCreated, callEnded } (see DUPLICATE-LEG FIX above; callCreated/callEnded added
+// callCreated, callEnded, direction } (see DUPLICATE-LEG FIX above; callCreated/callEnded added
 // per the DUPLICATE-LEG DEDUP FALSE POSITIVE FIX above, so a later call can check
 // whether its own time range actually overlaps this one before treating it as a
-// duplicate leg)
+// duplicate leg). direction is compared too: an inbound call and an outbound call
+// to the same number are not the same leg.
 const recentlyFinalizedByExternalNumber = new Map();
+
+// Call-history events that arrived before any call-state leg was known. Replayed
+// once the leg id or originator id shows up. Dropped after 10 minutes so a stale
+// event cannot attach to a later, different call.
+const pendingHistory = [];
+const PENDING_HISTORY_TTL_MS = 10 * 60 * 1000;
+
+let onFinalized = () => {};
+
+function setOnFinalized(fn) {
+            onFinalized = typeof fn === 'function' ? fn : () => {};
+}
 
 function getOrCreateLeg(conversationSpaceId) {
             let leg = legs.get(conversationSpaceId);
@@ -246,6 +261,138 @@ function getOrCreateLeg(conversationSpaceId) {
                           legs.set(conversationSpaceId, leg);
             }
             return leg;
+}
+
+function orderedChain(chain) {
+            return [...(chain || [])].sort((a, b) => String(a.enteredAt || '').localeCompare(String(b.enteredAt || '')));
+}
+
+// Inbound: only someone GoTo shows as answered (CONNECTED / answerTime). Outbound:
+// the person who placed the call, even if the far end never picked up.
+function considerTeamMember(leg, member, { requireAnswered }) {
+            if (!member || member.isSystem) return;
+            if (requireAnswered && !member.answered && !member.connected) return;
+            const extension = member.extension || null;
+            const name = member.name || null;
+            if (!name && !extension) return;
+            const existing = (leg.csrChain || []).find((entry) => (
+                          (member.userKey && entry.userKey === member.userKey)
+                          || (extension && entry.extension === extension)
+            ));
+            const answered = Boolean(member.answered || member.connected);
+            if (existing) {
+                          if (name && (!existing.name || existing.name === 'unknown')) existing.name = name;
+                          if (answered) existing.answered = true;
+                          if (member.answerTime && !existing.enteredAt) existing.enteredAt = member.answerTime;
+                          return;
+            }
+            leg.csrChain.push({
+                          name,
+                          extension,
+                          userKey: member.userKey || null,
+                          answered,
+                          enteredAt: member.answerTime || new Date().toISOString(),
+            });
+}
+
+function applyLines(leg, lines, direction) {
+            for (const line of lines || []) {
+                          const inbound = direction !== 'OUTBOUND';
+                          considerTeamMember(leg, line, { requireAnswered: inbound ? true : !(line.isOriginator || line.connected) });
+                          // Outbound originator counts even while their line is still RINGING.
+                          if (!inbound && (line.isOriginator || line.connected)) {
+                                          considerTeamMember(leg, line, { requireAnswered: false });
+                          }
+                          if (line.legId) {
+                                          leg.extraLegIds = leg.extraLegIds || new Set();
+                                          leg.extraLegIds.add(line.legId);
+                                          legIdToConversation.set(line.legId, leg.conversationSpaceId);
+                          }
+            }
+}
+
+function setDirection(leg, direction, source) {
+            if (direction !== 'INBOUND' && direction !== 'OUTBOUND') return;
+            // metadata.direction is authoritative when GoTo sent it. A later history
+            // leg must not flip it. History can only fill a missing direction.
+            if (source === 'metadata') {
+                          leg.direction = direction;
+                          leg.directionSource = 'metadata';
+                          return;
+            }
+            if (!leg.direction) {
+                          leg.direction = direction;
+                          leg.directionSource = source;
+            }
+}
+
+function setExternalNumber(leg, number) {
+            if (!number) return;
+            const book = roster.getRoster();
+            if (book.isSystemNumber(number) || book.extensionFrom(number)) return;
+            const next = callParties.sameCustomer(leg.externalNumber, number);
+            if (leg.externalNumber && !next) {
+                          leg.externalConflict = true;
+                          console.log(`REVIEW: conversation ${leg.conversationSpaceId} reported a second customer number. Keeping the first and not posting to the other one.`);
+                          return;
+            }
+            if (!leg.externalNumber) leg.externalNumber = number;
+}
+
+function applyHistory(leg, analysis) {
+            const direction = leg.direction || analysis.legDirection;
+            if (analysis.teamMember) {
+                          considerTeamMember(leg, {
+                                          name: analysis.teamMember.name,
+                                          extension: analysis.teamMember.extension,
+                                          userKey: analysis.teamMember.userKey,
+                                          answered: analysis.answered,
+                                          connected: analysis.answered,
+                                          answerTime: analysis.answerTime,
+                          }, { requireAnswered: direction !== 'OUTBOUND' });
+            }
+            setDirection(leg, analysis.legDirection, 'history');
+            setExternalNumber(leg, analysis.externalNumber);
+            if (!leg.externalName && analysis.externalName) leg.externalName = analysis.externalName;
+            if (analysis.answered && (leg.direction === 'OUTBOUND' || analysis.legDirection === 'OUTBOUND')) {
+                          leg.customerAnswered = true;
+            }
+            if (analysis.legId) {
+                          leg.extraLegIds = leg.extraLegIds || new Set();
+                          leg.extraLegIds.add(analysis.legId);
+                          legIdToConversation.set(analysis.legId, leg.conversationSpaceId);
+            }
+}
+
+function parkHistory(content) {
+            const cutoff = Date.now() - PENDING_HISTORY_TTL_MS;
+            while (pendingHistory.length && pendingHistory[0].receivedAt < cutoff) pendingHistory.shift();
+            pendingHistory.push({ content, receivedAt: Date.now() });
+}
+
+function flushPendingHistory(conversationSpaceId) {
+            const leg = legs.get(conversationSpaceId);
+            if (!leg) return;
+            const kept = [];
+            for (const item of pendingHistory) {
+                          if (Date.now() - item.receivedAt > PENDING_HISTORY_TTL_MS) continue;
+                          const analysis = callParties.analyzeCallHistory(item.content, roster.getRoster());
+                          const legMatch = analysis.legId && (analysis.legId === leg.legId || (leg.extraLegIds && leg.extraLegIds.has(analysis.legId)));
+                          const originator = originatorForConversation.get(conversationSpaceId);
+                          const originMatch = analysis.originatorId && originator && analysis.originatorId === originator;
+                          if (!legMatch && !originMatch) {
+                                          kept.push(item);
+                                          continue;
+                          }
+                          if (analysis.externalNumber && leg.externalNumber && !callParties.sameCustomer(leg.externalNumber, analysis.externalNumber)) {
+                                          console.log(`REVIEW: parked call history does not match conversation ${conversationSpaceId}. Leaving it unmatched.`);
+                                          kept.push(item);
+                                          continue;
+                          }
+                          applyHistory(leg, analysis);
+            }
+            pendingHistory.length = 0;
+            pendingHistory.push(...kept);
 }
 
 function wasRecentlyFinalized(conversationSpaceId) {
@@ -296,7 +443,11 @@ function timeRangesOverlap(a, b) {
 // conversationSpaceId (see DUPLICATE-LEG FIX above) the same way recordTranscript/
 // recordRecordingLink already do - without this, a stray event arriving after cleanup
 // would silently spin up a brand-new, mostly-empty leg and finalize it a second time.
-function recordLegState(conversationSpaceId, { legId, internalName, internalExtension, externalName, externalNumber, direction, dialString, callCreated, callEnded, accountKey, expectedTranscriptIds }) {
+function recordLegState(conversationSpaceId, {
+            legId, lines, recordingOwners, externalConnected, externalName, externalNumber,
+            direction, directionSource, dialString, callCreated, callEnded, accountKey,
+            callIdVersion, expectedTranscriptIds,
+}) {
             if (!legs.has(conversationSpaceId) && wasRecentlyFinalized(conversationSpaceId)) {
                           console.log(
                                           `Call-state event for conversationSpaceId=${conversationSpaceId} arrived after it was already finalized - dropping instead of creating a duplicate interaction.`
@@ -304,24 +455,43 @@ function recordLegState(conversationSpaceId, { legId, internalName, internalExte
                           return;
             }
             const leg = getOrCreateLeg(conversationSpaceId);
+            leg.conversationSpaceId = conversationSpaceId;
+            // A reused conversation id with a different callCreated is a new call.
+            // Drop the previous number and team member instead of posting this call
+            // onto the earlier customer's thread.
+            if (callCreated && leg.callCreated && callCreated !== leg.callCreated) {
+                          console.log(`REVIEW: conversation ${conversationSpaceId} started a new call. Not keeping the previous call's number or team member.`);
+                          if (leg.legId) legIdToConversation.delete(leg.legId);
+                          for (const extra of leg.extraLegIds || []) legIdToConversation.delete(extra);
+                          leg.legId = null;
+                          leg.extraLegIds = new Set();
+                          leg.externalNumber = null;
+                          leg.externalName = null;
+                          leg.externalConflict = false;
+                          leg.csrChain = [];
+                          leg.customerAnswered = false;
+                          leg.dialString = null;
+                          leg.direction = null;
+                          leg.directionSource = null;
+                          leg.suppressPost = false;
+            }
             if (legId) {
                           leg.legId = legId;
                           legIdToConversation.set(legId, conversationSpaceId);
             }
-            if (externalName) leg.externalName = externalName;
-            if (externalNumber) leg.externalNumber = externalNumber;
-            if (direction) leg.direction = direction;
+            setDirection(leg, direction, directionSource || 'metadata');
+            setExternalNumber(leg, externalNumber);
+            if (externalName && !leg.externalName) leg.externalName = externalName;
             if (dialString) leg.dialString = dialString;
             if (callCreated) leg.callCreated = callCreated;
             if (accountKey) leg.accountKey = accountKey;
-
-  if (internalName || internalExtension) {
-                const last = leg.csrChain[leg.csrChain.length - 1];
-                const isSame = last && last.name === internalName && last.extension === internalExtension;
-                if (!isSame) {
-                                leg.csrChain.push({ name: internalName, extension: internalExtension, enteredAt: new Date().toISOString() });
-                }
-  }
+            if (callIdVersion) leg.callIdVersion = callIdVersion;
+            if (recordingOwners) {
+                          leg.recordingOwners = { ...(leg.recordingOwners || {}), ...recordingOwners };
+            }
+            if (externalConnected && leg.direction === 'OUTBOUND') leg.customerAnswered = true;
+            applyLines(leg, lines, leg.direction);
+            flushPendingHistory(conversationSpaceId);
 
   // This is the real "the call is over" signal (GoTo's call-state ENDING event, passed
   // through from server.js's trackCallState as callEnded) - start the finalize countdown
@@ -350,44 +520,47 @@ function recordLegState(conversationSpaceId, { legId, internalName, internalExte
 // one (see the "TEAM MEMBER NAME FROM CALL HISTORY" header note above) - Call History
 // always carries both parties' name+number, even for the internal participant GoTo's
 // call-events stream sometimes omits entirely.
+let loggedHistoryShape = false;
+
 function recordCallHistoryEvent(payload) {
             const content = payload?.content || {};
-            const { originatorId, legId, caller, callee } = content;
+            const { originatorId, legId } = content;
             if (!originatorId) return;
-
-  let conversationSpaceId = legId ? legIdToConversation.get(legId) : undefined;
-            if (!conversationSpaceId) {
-                          // Even when THIS event's own legId was never seen in a call-state event (the exact
-              // gap the csrChain backfill below exists to patch), fall back to the originatorId
-              // if it's already been linked to a conversationSpaceId by an earlier Call History
-              // event for the same call (e.g. the other party's own leg, which usually
-              // correlates fine via call-state).
-              const known = conversationsForOriginator.get(originatorId);
-                          if (known && known.size) conversationSpaceId = [...known][0];
+            if (!loggedHistoryShape) {
+                          loggedHistoryShape = true;
+                          console.log(`Call history content fields: ${Object.keys(content).join(',')}`);
             }
 
-  console.log(
-                `Call History event: legId=${legId} originatorId=${originatorId}` +
-                (conversationSpaceId ? ` -> conversationSpaceId=${conversationSpaceId}` : ' (no matching conversationSpaceId seen yet)')
-              );
+            const analysis = callParties.analyzeCallHistory(content, roster.getRoster());
+            let conversationSpaceId = legId ? legIdToConversation.get(legId) : undefined;
+            if (!conversationSpaceId) {
+                          // Fall back only to an OPEN conversation already linked to this originator.
+                          // A finalized or number-mismatched conversation is not reused.
+                          const known = conversationsForOriginator.get(originatorId);
+                          if (known) {
+                                          conversationSpaceId = [...known].find((id) => legs.has(id));
+                          }
+            }
 
-  if (conversationSpaceId) {
-                // Whichever side has a short, extension-style number (e.g. "00003") rather than a
-              // full phone number is our own internal team member.
-              const internalParty = [caller, callee].find((p) => p && p.name && p.number && String(p.number).length <= 6);
-                if (internalParty) {
-                                const leg = getOrCreateLeg(conversationSpaceId);
-                                const last = leg.csrChain[leg.csrChain.length - 1];
-                                const isSame = last && last.name === internalParty.name && last.extension === internalParty.number;
-                                if (!isSame) {
-                                                  leg.csrChain.push({ name: internalParty.name, extension: internalParty.number, enteredAt: new Date().toISOString() });
-                                }
-                }
-  }
+            console.log(
+                          `Call History event: legId=${legId} originatorId=${originatorId} answered=${analysis.answered} extension=${analysis.teamMember?.extension || 'none'}` +
+                          (conversationSpaceId ? ` -> conversationSpaceId=${conversationSpaceId}` : ' (no matching conversationSpaceId seen yet)')
+                        );
 
-  if (!conversationSpaceId) return;
+            if (!conversationSpaceId) {
+                          parkHistory(content);
+                          return;
+            }
 
-  linkConversationToOriginator(conversationSpaceId, originatorId);
+            const leg = getOrCreateLeg(conversationSpaceId);
+            leg.conversationSpaceId = conversationSpaceId;
+            if (analysis.externalNumber && leg.externalNumber && !callParties.sameCustomer(leg.externalNumber, analysis.externalNumber)) {
+                          console.log(`REVIEW: call history for originator ${originatorId} does not match conversation ${conversationSpaceId}. Not attaching it and not reusing that number.`);
+                          return;
+            }
+            applyHistory(leg, analysis);
+            linkConversationToOriginator(conversationSpaceId, originatorId);
+            flushPendingHistory(conversationSpaceId);
 }
 
 function linkConversationToOriginator(conversationSpaceId, originatorId) {
@@ -494,6 +667,128 @@ function stillWaitingOnTranscript(groupKey) {
             return false;
 }
 
+function legIsSubstantive(leg) {
+            return callParties.transcriptIsSubstantive(leg && leg.transcript, roster.getRoster());
+}
+
+function clearLegIndex(leg) {
+            if (!leg) return;
+            if (leg.legId) legIdToConversation.delete(leg.legId);
+            for (const extra of leg.extraLegIds || []) legIdToConversation.delete(extra);
+}
+
+function describeGroup(groupKey) {
+            const conversationSpaceIds = [...conversationSpaceIdsFor(groupKey)];
+            const legRecords = conversationSpaceIds
+              .map((id) => ({ conversationSpaceId: id, ...(legs.get(id) || {}) }))
+              .filter((leg) => leg.legId || leg.transcript || leg.externalNumber || (leg.csrChain && leg.csrChain.length));
+
+            const csrChain = [];
+            for (const entry of orderedChain(legRecords.flatMap((leg) => leg.csrChain || []))) {
+                          const last = csrChain[csrChain.length - 1];
+                          const sameExtension = last && entry.extension && last.extension === entry.extension;
+                          const sameUnnumbered = last && !entry.extension && !last.extension && entry.name && entry.name === last.name;
+                          if (!sameExtension && !sameUnnumbered) csrChain.push(entry);
+            }
+
+            const numbers = callParties.uniqueExternalNumbers(legRecords.map((leg) => leg.externalNumber));
+            const externalConflict = legRecords.some((leg) => leg.externalConflict) || numbers.length > 1;
+            const direction = legRecords.find((leg) => leg.direction)?.direction || null;
+            const callCreated = legRecords.map((leg) => leg.callCreated).filter(Boolean).sort()[0];
+            const callEnded = legRecords.map((leg) => leg.callEnded).filter(Boolean).sort().slice(-1)[0];
+            const customerAnswered = legRecords.some((leg) => leg.customerAnswered);
+            const inboundAnswered = csrChain.some((entry) => entry.answered && entry.name);
+            const answered = direction === 'OUTBOUND' ? customerAnswered : Boolean(direction === 'INBOUND' && inboundAnswered);
+
+            return {
+                          conversationSpaceIds,
+                          legRecords,
+                          csrChain,
+                          csrPath: csrChain.map((entry) => `${entry.name || 'unknown'} (${entry.extension || 'unknown ext'})`),
+                          externalNumber: externalConflict ? null : (numbers[0] || null),
+                          externalConflict,
+                          externalName: legRecords.find((leg) => leg.externalName)?.externalName,
+                          direction,
+                          callCreated,
+                          callEnded,
+                          substantive: legRecords.some((leg) => legIsSubstantive(leg)),
+                          suppressPost: legRecords.some((leg) => leg.suppressPost),
+                          answered,
+            };
+}
+
+function siblingSnapshots(groupKey) {
+            const byGroup = new Map();
+            for (const [id, leg] of legs) {
+                          const key = groupKeyFor(id);
+                          if (key === groupKey) continue;
+                          if (!byGroup.has(key)) byGroup.set(key, { groupKey: key, substantive: false });
+                          const snap = byGroup.get(key);
+                          if (!snap.externalNumber && leg.externalNumber) snap.externalNumber = leg.externalNumber;
+                          if (!snap.direction && leg.direction) snap.direction = leg.direction;
+                          if (!snap.callCreated && leg.callCreated) snap.callCreated = leg.callCreated;
+                          if (leg.callEnded) snap.callEnded = leg.callEnded;
+                          if (legIsSubstantive(leg)) snap.substantive = true;
+            }
+            return [...byGroup.values()];
+}
+
+function planForGroup(groupKey, described) {
+            if (described.suppressPost) return { action: 'suppress', reason: 'folded into another leg' };
+            const normalized = normalizeNumberForDedup(described.externalNumber);
+            const prior = normalized ? recentlyFinalizedByExternalNumber.get(normalized) : null;
+            const recent = prior
+              && prior.groupKey !== groupKey
+              && Date.now() - prior.finalizedAtMs < DUPLICATE_CALL_SUPPRESS_MS
+              ? prior
+              : null;
+            return callParties.postingPlan({
+                          externalNumber: described.externalNumber,
+                          externalConflict: described.externalConflict,
+                          direction: described.direction,
+                          callCreated: described.callCreated,
+                          callEnded: described.callEnded,
+                          substantive: described.substantive,
+                          openSiblings: siblingSnapshots(groupKey),
+                          recent,
+            });
+}
+
+function markSuppressed(groupKey) {
+            for (const id of conversationSpaceIdsFor(groupKey)) {
+                          const leg = legs.get(id);
+                          if (leg) leg.suppressPost = true;
+            }
+}
+
+function rememberFinalizedNumber(groupKey, described) {
+            const normalized = normalizeNumberForDedup(described.externalNumber);
+            if (!normalized || described.externalConflict) return;
+            recentlyFinalizedByExternalNumber.set(normalized, {
+                          finalizedAtMs: Date.now(),
+                          groupKey,
+                          callCreated: described.callCreated,
+                          callEnded: described.callEnded,
+                          direction: described.direction,
+                          externalNumber: described.externalNumber,
+            });
+}
+
+function cleanupGroup(groupKey, conversationSpaceIds) {
+            try {
+                          onFinalized(conversationSpaceIds);
+            } catch (err) {
+                          console.error(`Error running finalize callback for ${groupKey}:`, err);
+            }
+            for (const id of conversationSpaceIds) {
+                          clearLegIndex(legs.get(id));
+                          legs.delete(id);
+                          originatorForConversation.delete(id);
+                          recentlyFinalizedConversationSpaceIds.set(id, Date.now());
+            }
+            conversationsForOriginator.delete(groupKey);
+}
+
 function scheduleFinalize(groupKey) {
             cancelTimer(groupKey);
             const timer = setTimeout(() => {
@@ -502,6 +797,15 @@ function scheduleFinalize(groupKey) {
                                           console.log(`Interaction ${groupKey} quiet period elapsed but a transcript is still pending (within the backstop window) - extending the wait.`);
                                           scheduleFinalize(groupKey);
                                           return;
+                          }
+                          const described = describeGroup(groupKey);
+                          if (described.legRecords.length) {
+                                          const plan = planForGroup(groupKey, described);
+                                          if (plan.action === 'hold') {
+                                                          console.log(`Interaction held ${groupKey}: ${plan.reason}`);
+                                                          scheduleFinalize(groupKey);
+                                                          return;
+                                          }
                           }
                           finalizeInteraction(groupKey).catch((err) =>
                                           console.error(`Error finalizing interaction ${groupKey}:`, err)
@@ -575,88 +879,56 @@ function buildTranscriptDocHtml({ externalName, externalNumber, direction, csrPa
 // summarization, Drive, or Heymarket outage should never crash the webhook handler or
 // block cleanup of this interaction's in-memory state below.
 async function finalizeInteraction(groupKey) {
-            const conversationSpaceIds = [...conversationSpaceIdsFor(groupKey)];
-            const legRecords = conversationSpaceIds.map((id) => ({ conversationSpaceId: id, ...legs.get(id) })).filter((l) => l.legId || l.transcript || l.externalNumber);
+            const described = describeGroup(groupKey);
+            const {
+                          conversationSpaceIds, legRecords, csrPath, externalNumber, externalName,
+                          direction, callCreated, callEnded, answered,
+            } = described;
 
-  if (!legRecords.length) {
-                console.log(`Interaction ${groupKey} closed with no leg data recorded - nothing to summarize.`);
-                return;
-  }
-
-  const csrChain = [];
-            for (const leg of legRecords) {
-                          for (const entry of leg.csrChain || []) {
-                                          const last = csrChain[csrChain.length - 1];
-                                          if (!last || last.name !== entry.name || last.extension !== entry.extension) {
-                                                            csrChain.push(entry);
-                                          }
-                          }
+            if (!legRecords.length) {
+                          console.log(`Interaction ${groupKey} closed with no leg data recorded - nothing to summarize.`);
+                          return;
             }
 
-  const csrPath = csrChain.map((c) => `${c.name || 'unknown'} (${c.extension || 'unknown ext'})`);
-            const externalNumber = legRecords.find((l) => l.externalNumber)?.externalNumber;
-            const externalName = legRecords.find((l) => l.externalName)?.externalName;
-            const direction = legRecords.find((l) => l.direction)?.direction;
-            const callCreated = legRecords.map((l) => l.callCreated).filter(Boolean).sort()[0];
-            const callEnded = legRecords.map((l) => l.callEnded).filter(Boolean).sort().slice(-1)[0];
-            const existingFolderLeg = legRecords.find((l) => l.folderId);
-
-  // Duplicate-leg check (see DUPLICATE-LEG FIX above): if another interaction for this
-  // SAME external number already finalized very recently, this is very likely a second
-  // conversationSpaceId GoTo opened for the same physical call rather than a genuine new
-  // call. Recorded (and refreshed) below regardless of the outcome, so a third fragment
-  // of the same call still sees the most recent finalize.
-  const normalizedExternalNumber = normalizeNumberForDedup(externalNumber);
-            let suppressHeymarketAsDuplicate = false;
-            if (normalizedExternalNumber) {
-                          const prior = recentlyFinalizedByExternalNumber.get(normalizedExternalNumber);
-                          if (prior && prior.groupKey !== groupKey && Date.now() - prior.finalizedAtMs < DUPLICATE_CALL_SUPPRESS_MS) {
-                                          // Recently-finalized timing proximity alone isn't enough (see the
-                            // DUPLICATE-LEG DEDUP FALSE POSITIVE FIX header comment above, found on a real
-                            // call, 916-216-5726: a genuine dropped-call-then-immediate-redial finalized
-                            // within this same window but was a completely separate, real call) - only
-                            // actually suppress when the two calls' own time ranges overlap, which is the
-                            // real signature of GoTo splitting one physical call into two
-                            // conversationSpaceIds.
-                            if (timeRangesOverlap(prior, { callCreated, callEnded })) {
-                                              suppressHeymarketAsDuplicate = true;
-                                              console.log(
-                                                                  `Interaction ${groupKey} (${externalNumber}) finalized ${Date.now() - prior.finalizedAtMs}ms after interaction ${prior.groupKey} for the same number, and their call time ranges overlap - treating this as a duplicate leg of the same real call (see DUPLICATE-LEG FIX) and skipping a second Heymarket post. The transcript Doc is still being created below.`
-                                                                );
-                            } else {
-                                              console.log(
-                                                                  `Interaction ${groupKey} (${externalNumber}) finalized ${Date.now() - prior.finalizedAtMs}ms after interaction ${prior.groupKey} for the same number, but their call time ranges don't overlap - treating this as a genuine separate call (e.g. an immediate callback after a dropped/unanswered attempt) rather than a duplicate leg, and posting normally.`
-                                                                );
-                            }
-                          }
-                          recentlyFinalizedByExternalNumber.set(normalizedExternalNumber, { finalizedAtMs: Date.now(), groupKey, callCreated, callEnded });
+            const plan = planForGroup(groupKey, described);
+            if (plan.action === 'hold') {
+                          console.log(`Interaction held ${groupKey}: ${plan.reason}`);
+                          scheduleFinalize(groupKey);
+                          return;
+            }
+            if (plan.suppressSibling) markSuppressed(plan.suppressSibling);
+            if (plan.action === 'post' || (plan.action === 'suppress' && /duplicate|overlapping/i.test(plan.reason))) {
+                          rememberFinalizedNumber(groupKey, described);
             }
 
-  const summary = {
-                groupKey,
-                legCount: legRecords.length,
-                externalNumber,
-                externalName,
-                direction,
-                csrPath,
-                callCreated,
-                callEnded,
-                transcriptsAttached: legRecords.filter((l) => l.transcript).length,
-                hasRecording: legRecords.some((l) => l.driveLink),
-  };
+            const existingFolderLeg = legRecords.find((leg) => leg.folderId);
+            const sheetPhone = plan.action === 'post' ? (externalNumber || 'unknown') : 'unknown';
 
-  console.log('INTERACTION READY FOR SUMMARY:', JSON.stringify(summary, null, 2));
+            console.log('INTERACTION READY FOR SUMMARY:', JSON.stringify({
+                          groupKey,
+                          legCount: legRecords.length,
+                          direction,
+                          csrPath,
+                          callCreated,
+                          callEnded,
+                          answered,
+                          post: plan.action,
+                          reason: plan.reason,
+                          transcriptsAttached: legRecords.filter((leg) => leg.transcript).length,
+                          hasRecording: legRecords.some((leg) => leg.driveLink),
+            }, null, 2));
 
-  try {
-                const summaryText = await openaiClient.summarizeInteraction({
-                                legRecords,
-                                csrPath,
-                                externalName,
-                                externalNumber,
-                                direction,
-                                callCreated,
-                                callEnded,
-                });
+            try {
+                          const summaryText = await openaiClient.summarizeInteraction({
+                                          legRecords,
+                                          csrPath,
+                                          externalName,
+                                          externalNumber,
+                                          direction,
+                                          callCreated,
+                                          callEnded,
+                                          answered,
+                          });
 
               // Find-or-create the same per-call subfolder server.js's archiveToDrive already
               // created (or will create) for this call's recording - both sides compute the
@@ -695,56 +967,61 @@ async function finalizeInteraction(groupKey) {
                 }
                 const noteText = noteLines.join('\n');
 
-              if (suppressHeymarketAsDuplicate) {
-                              console.log(
-                                                `Interaction ${groupKey} looked like a duplicate leg for ${externalNumber} - Heymarket post skipped. Summary was:\n${summaryText}`
-                                              );
-              } else if (externalNumber) {
-                              // `direction` is threaded through here (see header comment "HEYMARKET AUTHOR
-                  // NAME") so the note posts as "Inbound Call Summary" / "Outbound Call Summary"
-                  // rather than a generic author.
-                  await heymarketClient.postPrivateNote(externalNumber, noteText, direction);
-                              console.log(`Posted Heymarket private note for interaction ${groupKey} (${externalNumber}).`);
-              } else {
-                              console.log(
-                                                `Interaction ${groupKey} has no externalNumber - skipping Heymarket post. Summary was:\n${summaryText}`
-                                              );
-              }
-  
+                          if (plan.action === 'post' && externalNumber) {
+                                          await heymarketClient.postPrivateNote(externalNumber, noteText, direction);
+                                          console.log(`Posted Heymarket private note for interaction ${groupKey}.`);
+                          } else if (plan.action === 'review') {
+                                          console.log(`REVIEW: interaction ${groupKey} not posted (${plan.reason}).`);
+                          } else {
+                                          console.log(`Interaction ${groupKey} not posted (${plan.reason}).`);
+                          }
 
-// Best-effort index of every finalized call, added 2026-07-30 per Joshua - lets
-// feedbackMonitor.js match a team member's "@transcript" Contact Note flag back to
-// the right call (Contact Notes live on the Heymarket CONTACT, not on one specific
-// call - see that file's header comment for why). Never allowed to break the actual
-// summarize/Doc/Heymarket-post flow above, so it gets its own try/catch.
-try {
-const spreadsheetId = await sheetsClient.getOrCreateFeedbackSheet();
-await sheetsClient.appendRow(spreadsheetId, 'Calls', [
-groupKey,
-driveClient.formatPacific(callCreated),
-direction || 'unknown',
-externalNumber || 'unknown',
-csrPath.join(' -> ') || 'unknown',
-folderLink || '',
-]);
-} catch (err) {
-console.error(`Error logging interaction ${groupKey} to the Calls feedback sheet:`, err);
-}
-} catch (err) {
-                console.error(`Error summarizing/posting interaction ${groupKey}:`, err);
-  }
-
-  // Clean up now that this interaction is closed. Remember each conversationSpaceId
-  // briefly (see recentlyFinalizedConversationSpaceIds above) so a late-arriving
-  // transcript/recording past the backstop window can be recognized and dropped
-  // instead of silently building a duplicate phantom interaction.
-  const finalizedAt = Date.now();
-            for (const id of conversationSpaceIds) {
-                          legs.delete(id);
-                          originatorForConversation.delete(id);
-                          recentlyFinalizedConversationSpaceIds.set(id, finalizedAt);
+                          // Sheet row is the Calls index. A suppressed duplicate does not get a
+                          // second row. A call with no number, or two different numbers, is logged
+                          // with phone "unknown" so it can be reviewed without landing on a thread.
+                          if (plan.action !== 'suppress') {
+                                          try {
+                                                          const spreadsheetId = await sheetsClient.getOrCreateFeedbackSheet();
+                                                          await sheetsClient.appendRow(spreadsheetId, 'Calls', [
+                                                                          groupKey,
+                                                                          driveClient.formatPacific(callCreated),
+                                                                          direction || 'unknown',
+                                                                          sheetPhone,
+                                                                          csrPath.join(' -> ') || 'unknown',
+                                                                          folderLink || '',
+                                                          ]);
+                                          } catch (err) {
+                                                          console.error(`Error logging interaction ${groupKey} to the Calls feedback sheet:`, err);
+                                          }
+                          }
+            } catch (err) {
+                          console.error(`Error summarizing/posting interaction ${groupKey}:`, err);
             }
-            conversationsForOriginator.delete(groupKey);
+
+            cleanupGroup(groupKey, conversationSpaceIds);
+}
+
+function resetForTests() {
+            for (const timer of closeTimers.values()) clearTimeout(timer);
+            closeTimers.clear();
+            legs.clear();
+            legIdToConversation.clear();
+            originatorForConversation.clear();
+            conversationsForOriginator.clear();
+            recentlyFinalizedConversationSpaceIds.clear();
+            recentlyFinalizedByExternalNumber.clear();
+            pendingHistory.length = 0;
+}
+
+function peekLeg(conversationSpaceId) {
+            const leg = legs.get(conversationSpaceId);
+            if (!leg) return null;
+            return {
+                          ...leg,
+                          csrChain: (leg.csrChain || []).map((entry) => ({ ...entry })),
+                          extraLegIds: leg.extraLegIds ? [...leg.extraLegIds] : [],
+                          pendingTranscriptIds: leg.pendingTranscriptIds ? [...leg.pendingTranscriptIds] : [],
+            };
 }
 
 module.exports = {
@@ -754,4 +1031,8 @@ module.exports = {
             recordTranscript,
             recordRecordingLink,
             legIdToConversation,
+            wasRecentlyFinalized,
+            setOnFinalized,
+            resetForTests,
+            peekLeg,
 };
