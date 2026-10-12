@@ -1,4 +1,4 @@
-# GoTo Connect call recording + transcription pipeline
+# GoTo Call Notes
 
 Listens for GoTo Connect call recording notifications, fetches each call's transcript
 directly from GoTo (via the Advanced Reporting & Analytics add-on - no third-party
@@ -38,8 +38,7 @@ GoTo webhook notification  ──►  this service
 
 - Done: GoTo webhook receiving call-state, recording, transcript, Call History, and
 -   Call Parking events.
--   - Done: transcripts fetched directly from GoTo - this pipeline does not use Fireflies
-    -   or any other third-party transcription service.
+-   - Done: transcripts fetched directly from GoTo, with no third-party transcription service.
     -   - Done: recordings archived to Google Drive (`src/driveClient.js`), with the resulting
         -   link attached to the interaction.
         -   - Done: multi-leg call grouping (parks/transfers) via Call History `originatorId`.

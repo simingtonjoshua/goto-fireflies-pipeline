@@ -81,7 +81,7 @@ async function getChannelId(nickname) {
   return data.channelId;
 }
 
-async function createWebhookChannel(webhookUrl, nickname = 'fireflies-pipeline') {
+async function createWebhookChannel(webhookUrl, nickname = 'goto-call-notes') {
   const res = await gotoFetch(
     `${API_BASE}/notification-channel/v1/channels/${encodeURIComponent(nickname)}`,
     {
