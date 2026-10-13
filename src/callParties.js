@@ -42,6 +42,10 @@ const ALWAYS_SYSTEM = [
   /please leave (your )?name/i,
   /please leave a (message|voicemail)/i,
   /hi there,\s+this is josh\b/i,
+  /your call has been forwarded to voicemail/i,
+  /forwarded to an automatic voice message system/i,
+  /the person you(?:['’]re| are) trying to reach is not available/i,
+  /at the tone, please record your message/i,
   /\bour (normal )?business hours\b/i,
   /\bwe are (currently )?closed\b/i,
   /\bpress [0-9]\b/i,
@@ -123,7 +127,7 @@ function isSystemRecordingUtterance(text, roster) {
 }
 
 function systemRecordingPromptLine() {
-  return 'System recordings (never a live person, even if a name is spoken): the "this call may be recorded" announcement, the "thank you for calling" greeting, the "we are currently assisting other callers" queue message, the after-hours greeting in Joshua\'s voice that asks the caller to leave their name, business-hours messages, and IVR "press 1" menus.';
+  return 'System recordings (never a live person, even if a name is spoken): the "this call may be recorded" announcement, the "thank you for calling" greeting, the "we are currently assisting other callers" queue message, the after-hours greeting in Joshua\'s voice that asks the caller to leave their name, carrier voicemail prompts ("your call has been forwarded to voicemail", "at the tone, please record your message"), business-hours messages, and IVR "press 1" menus.';
 }
 
 function customerDialString(dialString, roster) {
@@ -402,8 +406,10 @@ function teamIntroNames(leg) {
   return names;
 }
 
-// "Budget Blinds" plus the mishearings already seen in live transcripts.
-const BUSINESS_NAME = 'budget\\s*(blinds|lines|minds|binds)';
+// "Budget Blinds" plus mishearings seen in live transcripts, including
+// "Lions", "Blends", and singular "Blind".
+const BUSINESS_NAME_ALT = 'blinds|lines|minds|binds|lions|blends|blind';
+const BUSINESS_NAME = `budget\\s*(?:${BUSINESS_NAME_ALT})`;
 const NOT_A_PERSON_NAME = '(?:the|a|an|my|your|our|that|it|just)\\b';
 // "this is Joshua over at Budget Blinds" / "this is Marie with Budget Blinds".
 const TEAM_SELF_ID_AT_BUSINESS = new RegExp(
@@ -414,7 +420,13 @@ const TEAM_I_AM_AT_BUSINESS = new RegExp(
   `\\b(?:i'm|i am)\\s+(?!${NOT_A_PERSON_NAME}\\b)[A-Za-z][A-Za-z']+\\s+(?:over\\s+at|at|with|from)\\s+${BUSINESS_NAME}\\b`,
   'i',
 );
-const TEAM_ON_BEHALF = new RegExp(`\\bcalling on behalf of\\s+${BUSINESS_NAME}\\b`, 'i');
+const TEAM_I_AM_WITH_BUSINESS = new RegExp(`\\b(?:i'm|i am)\\s+with\\s+${BUSINESS_NAME}\\b`, 'i');
+// "calling on behalf of", "giving a call on behalf of", "giving you a call from",
+// "reaching out on behalf of", "calling from", and the same frames with the business name.
+const TEAM_ON_BEHALF = new RegExp(
+  `\\b(?:calling on behalf of|giving(?: you)? a call on behalf of|giving(?: you)? a call from|reaching out on behalf of|calling from|on behalf of)\\s+${BUSINESS_NAME}\\b`,
+  'i',
+);
 // A played open greeting can name a person without proving which stereo channel
 // is the live team member. The after-hours greeting is already system audio.
 const GREETING_NOT_CHANNEL_PROOF = /\b(?:it'?s a (?:great|good) day here at|thank you for calling)\b/i;
@@ -427,19 +439,53 @@ function utteranceCanProveTeamChannel(text, roster) {
   return true;
 }
 
-function textHasTeamSelfIdentification(text, leg) {
+// First names on the active roster. Josh counts for Joshua. Used only when the
+// leg does not already name a team member — a bare "this is Emily" is not enough.
+function rosterIntroNames(roster) {
+  const names = [];
+  const push = (name) => {
+    const cleaned = String(name || '').trim();
+    if (!cleaned) return;
+    if (names.some((existing) => existing.toLowerCase() === cleaned.toLowerCase())) return;
+    names.push(cleaned);
+  };
+  for (const name of (roster && roster.firstNames) || []) push(name);
+  if (names.some((name) => /^joshua$/i.test(name))) push('Josh');
+  return names;
+}
+
+// "my name is Emily ... Budget Lions" / "this is Joshua ... on behalf of".
+// A few words, punctuation included. Not "I'm calling for Emily" or "is Emily available".
+function rosterIntroNearBusiness(text, roster) {
+  return rosterIntroNames(roster).some((name) => {
+    const pattern = new RegExp(
+      `\\b(?:this is|i'm|i am|my name is)\\s+${escapeRegExp(name)}\\b(?!['’])` +
+      `(?:[\\s,.;:!?]+\\S+){0,8}[\\s,.;:!?]+(?:on behalf of\\b|${BUSINESS_NAME}\\b)`,
+      'i',
+    );
+    return pattern.test(text);
+  });
+}
+
+function textHasTeamSelfIdentification(text, leg, roster) {
   const value = String(text || '');
   if (!value.trim()) return false;
   if (TEAM_SELF_ID_AT_BUSINESS.test(value)) return true;
   if (TEAM_I_AM_AT_BUSINESS.test(value)) return true;
+  if (TEAM_I_AM_WITH_BUSINESS.test(value)) return true;
   if (TEAM_ON_BEHALF.test(value)) return true;
-  return teamIntroNames(leg).some((name) => {
+  const credited = teamIntroNames(leg);
+  if (credited.some((name) => {
     const pattern = new RegExp(
       `\\b(?:this is|i'm|i am|my name is)\\s+${escapeRegExp(name)}\\b(?!['’])`,
       'i',
     );
     return pattern.test(value);
-  });
+  })) return true;
+  // No name on the leg: any roster first name still counts when the business
+  // (or "on behalf of") follows within a few words.
+  if (!credited.length && rosterIntroNearBusiness(value, roster)) return true;
+  return false;
 }
 
 // GoTo's channel map, corrected when a single channel's own introduction
@@ -459,7 +505,7 @@ function channelRolesForLeg(utterances, leg, roster = rosterApi.getRoster()) {
       .filter((utterance) => Number(utterance.channel) === channel && utteranceCanProveTeamChannel(utterance.text, roster))
       .map((utterance) => utterance.text)
       .join(' ');
-    return textHasTeamSelfIdentification(text, leg || {});
+    return textHasTeamSelfIdentification(text, leg || {}, roster);
   });
   if (signalChannels.length !== 1) return { roles, corrected: false };
 
@@ -598,4 +644,5 @@ module.exports = {
   SIBLING_WINDOW_MS,
   ANNOUNCEMENT_HOLD_MS,
   CONNECTED_STATUSES,
+  BUSINESS_NAME_ALT,
 };

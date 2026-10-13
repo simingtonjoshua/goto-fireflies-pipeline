@@ -743,6 +743,96 @@ describe('speaker labels and summary facts', () => {
     });
     assert.deepEqual(rows.map((row) => row.label), ['Customer', 'Joshua Simington']);
   });
+
+  function outboundUnknown(teamLine) {
+    return openaiClient.formatLegTranscript({
+      direction: 'OUTBOUND',
+      csrChain: [],
+      transcript: {
+        results: [
+          { transcript: 'Hello?', channel: 0, startTimeMs: 0 },
+          { transcript: teamLine, channel: 1, startTimeMs: 1000 },
+        ],
+      },
+    });
+  }
+
+  it('corrects an outbound intro when the team member is unknown and the business name is misheard', () => {
+    assert.match(callParties.BUSINESS_NAME_ALT, /lions/);
+    assert.match(callParties.BUSINESS_NAME_ALT, /blends/);
+    assert.match(callParties.BUSINESS_NAME_ALT, /blind/);
+    const phrases = [
+      "Hi there, my name is Emily, I'm calling on behalf of Budget Lions.",
+      "I'm giving a call on behalf of Budget Blinds.",
+      "I'm giving you a call on behalf of Budget Blends.",
+      "I'm giving you a call from Budget Blind.",
+      "I'm reaching out on behalf of Budget Minds.",
+      "I'm calling from Budget Lines.",
+      "I'm with Budget Lions.",
+      'Hi, this is Emily with Budget Lions.',
+      'Hi there, my name is Emily. Budget Lions.',
+      'Hi, this is for Jordan. Jordan, this is Joshua. Budget Blinds can come measure.',
+    ];
+    for (const phrase of phrases) {
+      const rows = outboundUnknown(phrase);
+      assert.deepEqual(rows.map((row) => row.label), ['Customer', 'Team Member'], phrase);
+    }
+  });
+
+  it('labels a carrier voicemail as Recording and the unknown team member from the outbound script', () => {
+    const rows = openaiClient.formatLegTranscript({
+      direction: 'OUTBOUND',
+      csrChain: [],
+      transcript: {
+        results: [
+          { transcript: 'Your call has been forwarded to voicemail.', channel: 0, startTimeMs: 0 },
+          { transcript: "The person you're trying to reach is not available.", channel: 0, startTimeMs: 1500 },
+          { transcript: 'The person you are trying to reach is not available.', channel: 0, startTimeMs: 1800 },
+          { transcript: 'At the tone, please record your message.', channel: 0, startTimeMs: 3000 },
+          { transcript: 'Your call has been forwarded to an automatic voice message system.', channel: 0, startTimeMs: 3600 },
+          {
+            transcript: "Hi, this is for Jordan. Jordan, this is Joshua. I'm giving a call on behalf of Budget Blinds.",
+            channel: 1,
+            startTimeMs: 5000,
+          },
+        ],
+      },
+    });
+    assert.deepEqual(rows.map((row) => row.label), [
+      'Recording',
+      'Recording',
+      'Recording',
+      'Recording',
+      'Recording',
+      'Team Member',
+    ]);
+  });
+
+  it('does not treat a customer asking for staff, a bare first name, or an open greeting as the team intro', () => {
+    const asking = outboundUnknown("I'm calling for Emily. Is Emily available?");
+    assert.deepEqual(asking.map((row) => row.label), ['Team Member', 'Customer']);
+
+    const bare = outboundUnknown('Hey, this is Joshua. I am returning your call about the shade.');
+    assert.deepEqual(bare.map((row) => row.label), ['Team Member', 'Customer']);
+
+    const greeting = outboundUnknown("It's a great day here at Budget Blinds, this is Emily.");
+    assert.deepEqual(greeting.map((row) => row.label), ['Team Member', 'Customer']);
+
+    const thanks = outboundUnknown('Thank you for calling Budget Blinds.');
+    assert.deepEqual(thanks.map((row) => row.label), ['Team Member', 'Recording']);
+
+    const afterHours = openaiClient.formatLegTranscript({
+      direction: 'OUTBOUND',
+      csrChain: [],
+      transcript: {
+        results: [
+          { transcript: 'I was calling back about the shade.', channel: 0, startTimeMs: 0 },
+          { transcript: 'Hi there, this is Josh. Please leave your name after the tone.', channel: 1, startTimeMs: 1000 },
+        ],
+      },
+    });
+    assert.deepEqual(afterHours.map((row) => row.label), ['Team Member', 'Recording']);
+  });
 });
 
 describe('call id version', () => {
