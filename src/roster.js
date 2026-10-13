@@ -60,12 +60,21 @@ class Roster {
 
   // Link a GoTo users-API record to a configured extension. Does not invent people
   // the config doesn't list — an unknown line stays unresolved until it's added.
+  // A 403 from GET /users/v1/users leaves this empty. Call history and call-state
+  // can still name the person by extension without a userKey.
   indexApiUser(user) {
     const userKey = user && (user.userKey || user.key);
-    if (!userKey) return false;
+    if (!userKey || !user) return false;
+    const lines = [];
+    if (Array.isArray(user.lines)) lines.push(...user.lines);
+    if (Array.isArray(user.extensions)) lines.push(...user.extensions);
+    if (user.extensionNumber || user.extension) lines.push(user);
     let linked = false;
-    for (const line of user.lines || []) {
-      const extension = normalizeExtension(line.number || line.extensionNumber);
+    for (const line of lines) {
+      const raw = line && typeof line === 'object'
+        ? (line.number || line.extensionNumber || line.extension)
+        : line;
+      const extension = normalizeExtension(raw);
       const known = extension && this.byExtension.get(extension);
       if (!known) continue;
       known.userKey = String(userKey);
@@ -73,6 +82,19 @@ class Roster {
       linked = true;
     }
     return linked;
+  }
+
+  // Full-name match. Two extensions for one name (Amy's desk and home office)
+  // stay unresolved until an extension is present.
+  personByName(name) {
+    const target = String(name || '').trim().toLowerCase();
+    if (!target) return null;
+    const matches = [];
+    for (const entry of this.byExtension.values()) {
+      if (String(entry.name || '').trim().toLowerCase() === target) matches.push(entry);
+    }
+    if (matches.length === 1) return matches[0];
+    return null;
   }
 
   personByExtension(value) {

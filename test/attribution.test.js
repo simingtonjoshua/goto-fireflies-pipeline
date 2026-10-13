@@ -835,6 +835,348 @@ describe('speaker labels and summary facts', () => {
   });
 });
 
+describe('desk phone attribution and answer signals', () => {
+  const book = roster.createRoster(ROSTER_CONFIG, [OFFICE]);
+
+  it('credits the sole outbound desk line when the originator id is not the participant, and takes the callee from history', () => {
+    const analysis = callParties.analyzeCallState(callState({
+      conversationSpaceId: '33333333-3333-3333-8333-333333333333',
+      direction: 'OUTBOUND',
+      callCreated: '2026-10-12T18:41:00.000Z',
+      participants: [
+        line({ id: 'device', extension: '00006', name: 'Emily Kingdon', status: 'RINGING', originator: 'session-not-the-device' }),
+      ],
+    }), book);
+    assert.equal(analysis.callIdVersion, '3');
+    assert.equal(analysis.lines[0].isOriginator, true);
+    assert.equal(analysis.lines[0].connected, false);
+    assert.equal(analysis.externalNumber, null);
+
+    interactions.resetForTests();
+    interactions.recordLegState('conv-desk-emily', {
+      legId: analysis.lines[0].legId,
+      lines: analysis.lines,
+      participantLegIds: ['leg-device', 'leg-pstn'],
+      direction: 'OUTBOUND',
+      directionSource: 'metadata',
+      externalNumber: null,
+      callCreated: '2026-10-12T18:41:00.000Z',
+    });
+    interactions.recordCallHistoryEvent({
+      content: {
+        originatorId: 'orig-desk-emily',
+        legId: 'leg-pstn',
+        direction: 'OUTBOUND',
+        caller: { name: 'Emily Kingdon', number: '00006' },
+        callee: { name: 'Jordan', number: CUSTOMER },
+        answered: '2026-10-12T18:41:08.000Z',
+      },
+    });
+    const leg = interactions.peekLeg('conv-desk-emily');
+    assert.deepEqual(names(leg), ['Emily Kingdon (00006)']);
+    assert.equal(roster.last10(leg.externalNumber), CUSTOMER);
+    assert.equal(leg.teamMemberSource, 'STARTING originator');
+    assert.equal(leg.customerAnswered, true);
+  });
+
+  it('names the inbound answerer from call history when the answer field is not answerTime', () => {
+    interactions.resetForTests();
+    interactions.recordLegState('conv-in-emily', {
+      legId: 'leg-ring',
+      lines: [
+        { legId: 'leg-emily', extension: '00006', name: 'Emily Kingdon', connected: false },
+        { legId: 'leg-kristine', extension: '00007', name: 'Kristine Vandervort', connected: false },
+      ],
+      participantLegIds: ['leg-emily', 'leg-kristine'],
+      direction: 'INBOUND',
+      directionSource: 'metadata',
+      externalNumber: CUSTOMER,
+      callCreated: '2026-10-12T17:00:00.000Z',
+    });
+    interactions.recordCallHistoryEvent({
+      content: {
+        originatorId: 'orig-in',
+        legId: 'leg-kristine',
+        direction: 'INBOUND',
+        caller: { number: CUSTOMER, name: 'Jordan' },
+        callee: { number: '00007', name: 'Kristine Vandervort' },
+        answered: false,
+      },
+    });
+    interactions.recordCallHistoryEvent({
+      content: {
+        originatorId: 'orig-in',
+        legId: 'leg-emily',
+        direction: 'INBOUND',
+        caller: { number: CUSTOMER, name: 'Jordan' },
+        callee: { extensionNumber: '00006', number: OFFICE, name: 'Emily Kingdon' },
+        answered: '2026-10-12T17:00:06.000Z',
+      },
+    });
+    const leg = interactions.peekLeg('conv-in-emily');
+    assert.equal(leg.direction, 'INBOUND');
+    assert.deepEqual(names(leg), ['Emily Kingdon (00006)']);
+    assert.equal(leg.teamMemberSource, 'call history');
+    assert.equal(roster.last10(leg.externalNumber), CUSTOMER);
+  });
+
+  it('credits an outbound extension from history when the user directory was not refreshed', () => {
+    const analysis = callParties.analyzeCallHistory({
+      direction: 'OUTBOUND',
+      userKey: 'user-not-indexed',
+      caller: { name: 'Emily Kingdon', number: '5550101777', extensionNumber: '00006' },
+      callee: { number: CUSTOMER },
+    }, book);
+    assert.equal(analysis.teamMember.name, 'Emily Kingdon');
+    assert.equal(analysis.teamMember.extension, '00006');
+    assert.notEqual(analysis.teamMember.matchedBy, 'userKey');
+    assert.equal(roster.last10(analysis.externalNumber), CUSTOMER);
+    assert.equal(analysis.answered, false);
+    assert.equal(analysis.explicitlyUnanswered, false);
+  });
+
+  it('does not credit extra ringing devices or the main line on an outbound call', () => {
+    const analysis = callParties.analyzeCallState(callState({
+      conversationSpaceId: '44444444-4444-3444-8444-444444444444',
+      direction: 'OUTBOUND',
+      callCreated: '2026-10-12T18:00:00.000Z',
+      participants: [
+        line({ id: 'emily', extension: '00006', name: 'Emily Kingdon', status: 'RINGING', originator: 'emily' }),
+        line({ id: 'kristine', extension: '00007', name: 'Kristine Vandervort', status: 'RINGING', originator: 'emily' }),
+        line({ id: 'main', name: 'Main', status: 'RINGING', originator: 'emily' }),
+      ],
+    }), book);
+    assert.equal(analysis.lines.find((entry) => entry.participantId === 'main').isSystem, true);
+    interactions.resetForTests();
+    interactions.recordLegState('conv-multi', {
+      lines: analysis.lines,
+      direction: 'OUTBOUND',
+      directionSource: 'metadata',
+      externalNumber: CUSTOMER,
+      callCreated: '2026-10-12T18:00:00.000Z',
+    });
+    assert.deepEqual(names(interactions.peekLeg('conv-multi')), ['Emily Kingdon (00006)']);
+  });
+
+  it('keeps an office number off the customer and still reads a history callee', () => {
+    const analysis = callParties.analyzeCallState(callState({
+      conversationSpaceId: '55555555-5555-3555-8555-555555555555',
+      direction: 'OUTBOUND',
+      callCreated: '2026-10-12T19:00:00.000Z',
+      dialString: OFFICE,
+      participants: [
+        line({ id: 'josh', extension: '00003', name: 'Joshua Simington', status: 'RINGING', originator: 'other-session' }),
+        phone({ id: 'pstn', originator: 'josh', caller: OFFICE, callee: OFFICE }),
+      ],
+    }), book);
+    assert.equal(analysis.externalNumber, null);
+    assert.equal(analysis.lines[0].isOriginator, true);
+
+    interactions.resetForTests();
+    interactions.recordLegState('conv-desk-josh', {
+      lines: analysis.lines,
+      participantLegIds: analysis.participantLegIds,
+      direction: 'OUTBOUND',
+      directionSource: 'metadata',
+      externalNumber: analysis.externalNumber,
+      callCreated: '2026-10-12T19:00:00.000Z',
+    });
+    interactions.recordCallHistoryEvent({
+      content: {
+        originatorId: 'orig-desk-josh',
+        legId: 'leg-pstn',
+        direction: 'OUTBOUND',
+        userKey: 'not-in-the-roster',
+        caller: { name: 'Joshua Simington', number: OFFICE },
+        callee: { number: DIALED, name: 'Jordan' },
+        disposition: 'ANSWERED',
+      },
+    });
+    const leg = interactions.peekLeg('conv-desk-josh');
+    assert.deepEqual(names(leg), ['Joshua Simington (00003)']);
+    assert.equal(roster.last10(leg.externalNumber), DIALED);
+    assert.equal(leg.teamMemberSource, 'STARTING originator');
+  });
+});
+
+describe('answered is unknown unless GoTo says so', () => {
+  it('does not call a two-sided transcript unanswered when GoTo has no answer', () => {
+    const built = openaiClient.buildSummaryMessages({
+      legRecords: [{
+        direction: 'OUTBOUND',
+        csrChain: [{ name: 'Emily Kingdon', extension: '00006' }],
+        callCreated: '2026-10-12T17:11:00.000Z',
+        transcript: {
+          results: [
+            { transcript: 'Hi, this is Emily with Budget Blinds. I have you down for Thursday.', channel: 0, startTimeMs: 0 },
+            { transcript: 'Yes, that time works for me.', channel: 1, startTimeMs: 4000 },
+          ],
+        },
+      }],
+      csrPath: ['Emily Kingdon (00006)'],
+      externalNumber: CUSTOMER,
+      direction: 'OUTBOUND',
+      callCreated: '2026-10-12T17:11:00.000Z',
+      callEnded: '2026-10-12T17:16:00.000Z',
+      answered: null,
+    });
+    assert.match(built.user, /two-sided conversation/);
+    assert.doesNotMatch(built.user, /Answered: no/);
+    assert.doesNotMatch(built.user, /Answered: unknown/);
+  });
+
+  it('still describes the conversation when GoTo explicitly says the call was not answered', () => {
+    const built = openaiClient.buildSummaryMessages({
+      legRecords: [{
+        direction: 'INBOUND',
+        csrChain: [{ name: 'Emily Kingdon', extension: '00006' }],
+        callCreated: '2026-10-12T17:20:00.000Z',
+        transcript: {
+          results: [
+            { transcript: 'Hi, I need a shade measured.', channel: 0, startTimeMs: 0 },
+            { transcript: 'This is Emily with Budget Blinds, I can help with that.', channel: 1, startTimeMs: 1500 },
+          ],
+        },
+      }],
+      csrPath: ['Emily Kingdon (00006)'],
+      externalNumber: CUSTOMER,
+      direction: 'INBOUND',
+      callCreated: '2026-10-12T17:20:00.000Z',
+      callEnded: '2026-10-12T17:21:00.000Z',
+      answered: false,
+    });
+    assert.match(built.user, /two-sided conversation/);
+    assert.doesNotMatch(built.user, /Answered: no/);
+  });
+
+  it('leaves a no-transcript call unknown when GoTo did not say it was missed', () => {
+    const text = openaiClient.buildNoTranscriptSummary({
+      csrPath: ['Emily Kingdon (00006)'],
+      externalNumber: CUSTOMER,
+      direction: 'OUTBOUND',
+      callCreated: '2026-10-12T17:11:00.000Z',
+      answered: null,
+    });
+    assert.match(text, /did not say whether the call was answered/);
+    assert.doesNotMatch(text, /does not show that the call was answered/);
+  });
+});
+
+describe('same-minute empty duplicates', () => {
+  const now = new Date('2026-10-12T23:33:00.000Z').getTime();
+
+  it('posts one of two non-substantive legs that start within two minutes and do not overlap', () => {
+    const loser = callParties.postingPlan({
+      externalNumber: CUSTOMER,
+      direction: 'OUTBOUND',
+      now,
+      callCreated: '2026-10-12T23:29:05.000Z',
+      callEnded: '2026-10-12T23:29:06.000Z',
+      substantive: false,
+      answered: false,
+      openSiblings: [{
+        groupKey: 'first',
+        externalNumber: CUSTOMER,
+        direction: 'OUTBOUND',
+        callCreated: '2026-10-12T23:29:00.000Z',
+        callEnded: '2026-10-12T23:29:01.000Z',
+        substantive: false,
+        answered: true,
+      }],
+    });
+    assert.equal(loser.action, 'suppress');
+    assert.equal(loser.skipArtifacts, true);
+
+    const winner = callParties.postingPlan({
+      externalNumber: CUSTOMER,
+      direction: 'OUTBOUND',
+      now,
+      callCreated: '2026-10-12T23:29:00.000Z',
+      callEnded: '2026-10-12T23:29:01.000Z',
+      substantive: false,
+      answered: true,
+      openSiblings: [{
+        groupKey: 'second',
+        externalNumber: CUSTOMER,
+        direction: 'OUTBOUND',
+        callCreated: '2026-10-12T23:29:05.000Z',
+        callEnded: '2026-10-12T23:29:06.000Z',
+        substantive: false,
+        answered: false,
+      }],
+    });
+    assert.equal(winner.action, 'post');
+    assert.equal(winner.suppressSibling, 'second');
+    assert.equal(winner.skipSiblingArtifacts, true);
+  });
+
+  it('prefers the leg that has a transcript over a more specific status', () => {
+    const plan = callParties.postingPlan({
+      externalNumber: CUSTOMER,
+      direction: 'OUTBOUND',
+      now,
+      callCreated: '2026-10-12T23:29:05.000Z',
+      callEnded: '2026-10-12T23:29:06.000Z',
+      substantive: false,
+      hasTranscript: true,
+      answered: false,
+      openSiblings: [{
+        groupKey: 'status-only',
+        externalNumber: CUSTOMER,
+        direction: 'OUTBOUND',
+        callCreated: '2026-10-12T23:29:00.000Z',
+        callEnded: '2026-10-12T23:29:01.000Z',
+        substantive: false,
+        answered: true,
+      }],
+    });
+    assert.equal(plan.action, 'post');
+    assert.equal(plan.suppressSibling, 'status-only');
+  });
+
+  it('suppresses a second empty leg after the first empty leg already finalized', () => {
+    const plan = callParties.postingPlan({
+      externalNumber: CUSTOMER,
+      direction: 'OUTBOUND',
+      now,
+      callCreated: '2026-10-12T23:30:00.000Z',
+      callEnded: '2026-10-12T23:30:01.000Z',
+      substantive: false,
+      recent: {
+        groupKey: 'first',
+        externalNumber: CUSTOMER,
+        direction: 'OUTBOUND',
+        callCreated: '2026-10-12T23:29:00.000Z',
+        callEnded: '2026-10-12T23:29:01.000Z',
+        substantive: false,
+      },
+    });
+    assert.equal(plan.action, 'suppress');
+    assert.equal(plan.skipArtifacts, true);
+  });
+
+  it('still posts two substantive calls that start a minute apart', () => {
+    const second = callParties.postingPlan({
+      externalNumber: CUSTOMER,
+      direction: 'OUTBOUND',
+      now,
+      callCreated: '2026-10-12T23:30:00.000Z',
+      callEnded: '2026-10-12T23:32:00.000Z',
+      substantive: true,
+      openSiblings: [{
+        groupKey: 'first-real',
+        externalNumber: CUSTOMER,
+        direction: 'OUTBOUND',
+        callCreated: '2026-10-12T23:29:00.000Z',
+        callEnded: '2026-10-12T23:29:40.000Z',
+        substantive: true,
+      }],
+    });
+    assert.equal(second.action, 'post');
+    assert.equal(second.suppressSibling, undefined);
+  });
+});
+
 describe('call id version', () => {
   it('reads the UUID version nibble', () => {
     assert.equal(callParties.callIdVersion('11111111-1111-3111-8111-111111111111'), '3');

@@ -565,7 +565,7 @@ function formatHoldContextLine(holds) {
 // completely as the call warrants.
 const SYSTEM_PROMPT = `You summarize customer phone calls for a Budget Blinds franchise CRM. You will be given call metadata and a speaker-labeled transcript. Speaker labels are already assigned from the phone system's channel and participant data: a team member's name or "Team Member", "Customer", "Recording" (a known system greeting, hold message, or voicemail greeting), or "Channel N" when the phone system did not identify that side. Do not swap labels based on who spoke first, and do not rename a speaker from a word in the transcript. A "Recording" line is never a live person, even if the recording says someone's name.
 
-The metadata includes fixed facts: direction, whether the call was answered, the team member names, and the customer phone number. Do not change those facts. If Answered is no, do not say the caller was connected to, reached, or spoke with a team member.
+The metadata includes fixed facts: direction, whether the call was answered, the team member names, and the customer phone number. Do not change those facts. If the Answered fact says the call was not answered, do not say the caller was connected to, reached, or spoke with a team member. If the Answered fact says the transcript is a two-sided conversation, describe that conversation and do not write that the call was not answered. If Answered is unknown, do not claim that the call was not answered.
 
 Treat the speaker labels as ground truth. Do not swap who did something because of who talked first, or because a line sounds like the other role, and do not rename a labeled speaker from a word in the transcript. Attribute each action to the labeled speaker who said they would do it. Do not invent a role-reversed commercial relationship: the labeled team member (Budget Blinds) sends the service order and warranty paperwork, and the customer signs it and pays. Never write that the customer will send a service order for a team member to sign or pay. Never describe the team member as the person whose product failed when the Customer lines are the ones describing that problem.
 
@@ -607,24 +607,52 @@ IMPORTANT - hold time: if the metadata includes a "Hold periods detected" line, 
 // guess at it (which produced two real bugs: describing an outbound call as something
 // the customer did, and restating a raw UTC timestamp as if it were the correct local
 // time).
+function rowsAreTwoSidedConversation(rows) {
+    const substantive = (rows || []).filter((row) => (
+          row && row.label && row.label !== 'Recording' && String(row.text || '').trim()
+          && !String(row.label).startsWith('Channel ')
+    ));
+    const customer = substantive.some((row) => row.label === 'Customer');
+    const team = substantive.some((row) => row.label !== 'Customer');
+    return customer && team;
+}
+
+function answeredFactLine(answered, twoSided) {
+    if (twoSided) {
+          return 'Answered: the transcript is a two-sided conversation. Describe what was said. Do not write that the call was not answered.';
+    }
+    if (answered === true) return 'Answered: yes';
+    if (answered === false) {
+          return 'Answered: no. The phone system shows the call was not answered, and there is no two-sided conversation. Do not say the caller was connected to, reached, or spoke with a team member.';
+    }
+    return 'Answered: unknown. The phone system did not say whether the call was answered. Do not claim that the call was not answered.';
+}
+
 function buildNoTranscriptSummary({ csrPath, externalNumber, direction, callCreated, answered }) {
     const displayNumber = driveClient.formatPhoneForDisplay(externalNumber);
     const when = driveClient.formatPacific(callCreated);
     const lastTeamMember = (csrPath && csrPath.length)
       ? csrPath[csrPath.length - 1].replace(/\s*\([^)]*\)\s*$/, '').trim()
           : null;
-    const wasAnswered = Boolean(answered);
+    const wasAnswered = answered === true;
+    const answerUnknown = answered !== true && answered !== false;
 
   if (direction === 'OUTBOUND') {
         const who = lastTeamMember || 'A Budget Blinds team member';
         if (wasAnswered) {
               return `No transcript was available for this call. ${who} placed an outbound call to ${displayNumber} on ${when}, and the phone system shows the call was answered, but no conversation audio or transcript was captured.`;
         }
+        if (answerUnknown) {
+              return `No transcript was available for this call. ${who} placed an outbound call to ${displayNumber} on ${when}. The phone system did not say whether the call was answered.`;
+        }
         return `No transcript was available for this call. ${who} placed an outbound call to ${displayNumber} on ${when}. The phone system does not show that the call was answered (no answer, a greeting, or voicemail).`;
   }
     if (direction === 'INBOUND') {
           if (wasAnswered && lastTeamMember) {
                 return `No transcript was available for this call. ${displayNumber} called Budget Blinds on ${when} and the call was answered by ${lastTeamMember}, but no conversation audio or transcript was captured.`;
+          }
+          if (answerUnknown) {
+                return `No transcript was available for this call. ${displayNumber} called Budget Blinds on ${when}. The phone system did not say whether a team member answered.`;
           }
           return `No transcript was available for this call. ${displayNumber} called Budget Blinds on ${when}. The phone system does not show that a team member answered (missed call, greeting, or voicemail).`;
     }
@@ -635,10 +663,11 @@ function buildSummaryMessages({ legRecords, csrPath, externalName, externalNumbe
     const guard = applyCardGuard(legRecords);
     const rows = allTranscriptRows(guard.legRecords);
     const conversationText = buildConversationText(rows);
+    const twoSided = rowsAreTwoSidedConversation(rows);
     const contextLines = [
           'Fixed facts (do not change these):',
           `Call direction: ${direction || 'unknown'} (OUTBOUND = a Budget Blinds team member placed this call to the customer; INBOUND = the customer called Budget Blinds - never describe an outbound call as something the customer did)`,
-          `Answered: ${answered ? 'yes' : 'no'}`,
+          answeredFactLine(answered, twoSided),
           `Team member path (in order, if transferred/parked): ${(csrPath || []).join(' -> ') || 'unknown'}`,
           'Commercial roles (do not reverse): the team member sends any service order or warranty paperwork; the customer signs it and pays.',
           `Customer phone number: ${driveClient.formatPhoneForDisplay(externalNumber)}`,

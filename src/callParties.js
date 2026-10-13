@@ -8,10 +8,13 @@
 // can look OUTBOUND even though the customer called in.
 //
 // Who answered: a LINE participant counts only when their status is CONNECTED (or
-// on hold), or when their call-history leg has answerTime. RINGING devices, the
+// on hold), or when their call-history leg shows an answer. RINGING devices, the
 // main line, and the forwarded cell are not the answering person. Outbound calls
 // still credit the originator LINE (the person who placed the call) even before
-// the far end answers.
+// the far end answers. Desk/cloud STARTING often has one non-system LINE whose
+// originator id is a session id, not that participant — that line placed the call.
+// Call history may put the answer time in `answered` (or another alias) rather
+// than `answerTime`. No explicit signal means answered is unknown, not "no".
 //
 // Speakers: GoTo's transcription schema numbers channels from the recorded party —
 // channel 0 is what that party said, channel 1 is what they heard
@@ -189,25 +192,46 @@ function pickExternalFromParticipants({ direction, participants, dialString, ros
   return { number: null, name: null };
 }
 
+function extensionFromType(type, roster) {
+  if (!type) return null;
+  return roster.extensionFrom(type.extensionNumber)
+    || roster.extensionFrom(type.extension)
+    || roster.extensionFrom(type.lineNumber)
+    || roster.extensionFrom(type.number);
+}
+
+// Desk phones often set originator to the user session while participantId is the
+// device. Accept either id, plus a leg id, so the placing line is not dropped.
+function participantIsOriginator(participant) {
+  if (!participant || !participant.originator) return false;
+  const id = participant.participantId || participant.id || null;
+  if (id && id === participant.originator) return true;
+  if (participant.legId && participant.legId === participant.originator) return true;
+  return false;
+}
+
 function lineFromParticipant(participant, roster) {
   const type = typeOf(participant);
-  const extension = roster.extensionFrom(type.extensionNumber) || roster.extensionFrom(type.number);
-  const userKey = type.userKey || participant.userKey || null;
-  const known = roster.personByUserKey(userKey) || roster.personByExtension(extension);
+  const extension = extensionFromType(type, roster);
+  const userKey = type.userKey || type.userId || participant.userKey || participant.userId || null;
+  const byKey = userKey ? roster.personByUserKey(userKey) : null;
+  const byExtension = roster.personByExtension(extension);
+  const known = byKey || byExtension;
   const payloadName = payloadPersonName(type);
-  const generic = isGenericLineName(payloadName);
+  const generic = isGenericLineName(payloadName) || isGenericLineName(type.name);
   const isSystem = Boolean(!known && (roster.isSystemNumber(type.number) || generic));
   const status = statusOf(participant);
   return {
-    participantId: participant.participantId || null,
+    participantId: participant.participantId || participant.id || null,
     legId: participant.legId || null,
     extension: known?.extension || extension || null,
     userKey: userKey || known?.userKey || null,
     name: known?.name || (isSystem ? null : payloadName),
     status,
-    isOriginator: Boolean(participant.participantId && participant.originator && participant.participantId === participant.originator),
+    isOriginator: participantIsOriginator(participant),
     isSystem,
     connected: CONNECTED_STATUSES.has(status),
+    matchedBy: byKey ? 'userKey' : (byExtension ? 'extension' : null),
   };
 }
 
@@ -270,6 +294,21 @@ function analyzeCallState(payload, roster = rosterApi.getRoster()) {
     roster,
   });
 
+  // One non-system LINE on an outbound STARTING event is the person who dialed,
+  // even when GoTo's originator id is the session rather than that device, and
+  // even while the line is still RINGING. Extra ringing devices stay excluded.
+  if (direction === 'OUTBOUND') {
+    const human = lines.filter((line) => !line.isSystem && (line.name || line.extension));
+    if (human.length === 1 && !human[0].isOriginator) human[0].isOriginator = true;
+  }
+
+  const participantLegIds = [];
+  for (const participant of participants) {
+    if (participant && participant.legId && !participantLegIds.includes(participant.legId)) {
+      participantLegIds.push(participant.legId);
+    }
+  }
+
   return {
     direction,
     directionSource: direction ? 'metadata' : null,
@@ -279,6 +318,7 @@ function analyzeCallState(payload, roster = rosterApi.getRoster()) {
     externalNumber: external.number,
     externalName: external.name,
     lines,
+    participantLegIds,
     recordingOwners,
     externalConnected,
     participantsEmpty: participants.length === 0,
@@ -286,71 +326,203 @@ function analyzeCallState(payload, roster = rosterApi.getRoster()) {
   };
 }
 
+const HISTORY_ANSWER_FIELDS = [
+  'answerTime',
+  'answerTimestamp',
+  'answeredAt',
+  'answeredTime',
+  'connectTime',
+  'connectedTime',
+  'pickupTime',
+  'callAnswered',
+];
+
+const EXPLICIT_ANSWERED = new Set(['ANSWERED', 'CONNECTED']);
+const EXPLICIT_UNANSWERED = new Set([
+  'NO_ANSWER',
+  'NOANSWER',
+  'NOT_ANSWERED',
+  'UNANSWERED',
+  'MISSED',
+  'BUSY',
+  'USER_BUSY',
+  'ORIGINATOR_CANCEL',
+  'CANCEL',
+  'CANCELLED',
+  'CANCELED',
+  'CALL_REJECTED',
+  'NO_USER_RESPONSE',
+]);
+
+function historyDisposition(content) {
+  return String(
+    content.disposition || content.callDisposition || content.result || content.callResult || '',
+  ).trim().toUpperCase();
+}
+
 function historyAnswerTime(content) {
-  return content.answerTime || content.answerTimestamp || content.answeredAt || null;
+  if (!content || typeof content !== 'object') return null;
+  for (const key of HISTORY_ANSWER_FIELDS) {
+    if (content[key]) return content[key];
+  }
+  if (content.answered === true) return content.startTime || true;
+  if (typeof content.answered === 'string') {
+    const text = content.answered.trim();
+    if (text && !/^(false|no)$/i.test(text)) return text;
+  }
+  if (EXPLICIT_ANSWERED.has(historyDisposition(content))) return content.startTime || true;
+  return null;
+}
+
+function historyExplicitlyUnanswered(content) {
+  if (!content || typeof content !== 'object') return false;
+  if (historyAnswerTime(content)) return false;
+  if (content.answered === false) return true;
+  if (typeof content.answered === 'string' && /^(false|no)$/i.test(content.answered.trim())) return true;
+  if (EXPLICIT_UNANSWERED.has(historyDisposition(content))) return true;
+  const cause = String(content.hangupCause || '').trim().toUpperCase();
+  return EXPLICIT_UNANSWERED.has(cause);
+}
+
+function partyExtension(party, roster) {
+  if (!party || typeof party !== 'object') return null;
+  return roster.extensionFrom(party.extensionNumber)
+    || roster.extensionFrom(party.extension)
+    || roster.extensionFrom(party.number);
+}
+
+function partyLooksInternal(party, extension) {
+  if (extension) return true;
+  if (!party || typeof party !== 'object') return false;
+  const kind = String(party.type || party.participantType || '').toUpperCase();
+  if (kind === 'LINE') return true;
+  return Boolean(party.userKey || party.userId || party.extensionNumber || party.extension);
+}
+
+function partyPerson(party, roster) {
+  const extension = partyExtension(party, roster);
+  const byExtension = roster.personByExtension(extension);
+  if (byExtension) {
+    return { person: byExtension, extension: byExtension.extension || extension, matchedBy: 'extension' };
+  }
+  if (partyLooksInternal(party, extension)) {
+    const byName = roster.personByName(party && party.name);
+    if (byName) return { person: byName, extension: byName.extension, matchedBy: 'name' };
+  }
+  if (extension) return { person: null, extension, matchedBy: 'extension' };
+  return { person: null, extension: null, matchedBy: null };
+}
+
+function firstCustomerNumber(candidates, roster) {
+  for (const candidate of candidates) {
+    if (usableCustomerNumber(candidate, roster)) return candidate;
+  }
+  return null;
 }
 
 function analyzeCallHistory(content = {}, roster = rosterApi.getRoster()) {
   const caller = content.caller || {};
   const callee = content.callee || {};
   const legDirection = normalizeDirection(content.direction);
-  const callerExt = roster.extensionFrom(caller.number);
-  const calleeExt = roster.extensionFrom(callee.number);
-  const callerPerson = roster.personByExtension(caller.number);
-  const calleePerson = roster.personByExtension(callee.number);
-  const userPerson = roster.personByUserKey(content.userKey);
-  const callerIsInternal = Boolean(callerExt || callerPerson);
-  const calleeIsInternal = Boolean(calleeExt || calleePerson);
-  const answered = Boolean(historyAnswerTime(content));
+  const callerInfo = partyPerson(caller, roster);
+  const calleeInfo = partyPerson(callee, roster);
+  const userKey = content.userKey || content.userId || caller.userKey || callee.userKey || caller.userId || callee.userId || null;
+  const userPerson = roster.personByUserKey(userKey);
+  const callerIsInternal = Boolean(callerInfo.extension || callerInfo.person);
+  const calleeIsInternal = Boolean(calleeInfo.extension || calleeInfo.person);
+  const answerTime = historyAnswerTime(content);
+  const answered = Boolean(answerTime);
+  const explicitlyUnanswered = historyExplicitlyUnanswered(content);
 
-  let person = userPerson;
-  let extension = userPerson?.extension || null;
+  let person = null;
+  let extension = null;
+  let matchedBy = null;
   let externalNumber = null;
   let externalName = null;
 
+  const calleeNumber = firstCustomerNumber([
+    callee.number,
+    callee.phoneNumber,
+    content.dialString,
+    content.dialedNumber,
+    content.dialed,
+  ], roster);
+  const callerNumber = firstCustomerNumber([caller.number, caller.phoneNumber], roster);
+
   if (callerIsInternal && !calleeIsInternal) {
-    person = callerPerson || person || (callerExt ? { name: caller.name || null, extension: callerExt } : null);
-    extension = extension || person?.extension || callerExt;
-    if (usableCustomerNumber(callee.number, roster)) {
-      externalNumber = callee.number;
+    person = callerInfo.person || (callerInfo.extension ? { name: caller.name || null, extension: callerInfo.extension } : null);
+    extension = person?.extension || callerInfo.extension;
+    matchedBy = callerInfo.matchedBy;
+    if (calleeNumber) {
+      externalNumber = calleeNumber;
       externalName = callee.name || null;
     }
   } else if (calleeIsInternal && !callerIsInternal) {
-    person = calleePerson || person || (calleeExt ? { name: callee.name || null, extension: calleeExt } : null);
-    extension = extension || person?.extension || calleeExt;
-    if (usableCustomerNumber(caller.number, roster)) {
-      externalNumber = caller.number;
+    person = calleeInfo.person || (calleeInfo.extension ? { name: callee.name || null, extension: calleeInfo.extension } : null);
+    extension = person?.extension || calleeInfo.extension;
+    matchedBy = calleeInfo.matchedBy;
+    if (callerNumber) {
+      externalNumber = callerNumber;
       externalName = caller.name || null;
     }
-  } else if (userPerson && legDirection === 'OUTBOUND' && usableCustomerNumber(callee.number, roster)) {
+  } else if (userPerson && legDirection === 'OUTBOUND' && calleeNumber) {
     person = userPerson;
     extension = userPerson.extension;
-    externalNumber = callee.number;
+    matchedBy = 'userKey';
+    externalNumber = calleeNumber;
     externalName = callee.name || null;
-  } else if (userPerson && legDirection === 'INBOUND' && usableCustomerNumber(caller.number, roster)) {
+  } else if (userPerson && legDirection === 'INBOUND' && callerNumber) {
     person = userPerson;
     extension = userPerson.extension;
-    externalNumber = caller.number;
+    matchedBy = 'userKey';
+    externalNumber = callerNumber;
     externalName = caller.name || null;
+  } else if (userPerson && legDirection === 'OUTBOUND') {
+    person = userPerson;
+    extension = userPerson.extension;
+    matchedBy = 'userKey';
+  } else if (legDirection === 'OUTBOUND') {
+    // Desk history often shows the person's name with a caller-id DID, and the
+    // users API may 403 before userKey can be linked. A unique roster name is enough.
+    const byName = roster.personByName(caller.name);
+    if (byName) {
+      person = byName;
+      extension = byName.extension;
+      matchedBy = 'name';
+    }
+  }
+
+  // STARTING on a desk phone often has no callee. The dialed number is on history.
+  if (!externalNumber && legDirection === 'OUTBOUND' && calleeNumber) {
+    externalNumber = calleeNumber;
+    externalName = externalName || callee.name || null;
+  }
+  if (!externalNumber && legDirection === 'INBOUND' && callerNumber) {
+    externalNumber = callerNumber;
+    externalName = externalName || caller.name || null;
   }
 
   const canonical = roster.personByExtension(extension) || person;
+  const resolvedBy = matchedBy === 'userKey' ? 'userKey' : (matchedBy || null);
   const teamMember = (canonical && (canonical.name || canonical.extension || extension))
     ? {
       name: canonical.name || null,
       extension: canonical.extension || extension || null,
-      userKey: content.userKey || canonical.userKey || null,
+      userKey: userKey || canonical.userKey || null,
       answered,
-      answerTime: historyAnswerTime(content),
+      answerTime: answerTime && answerTime !== true ? answerTime : null,
+      matchedBy: resolvedBy,
     }
     : null;
 
   return {
     legId: content.legId || null,
     originatorId: content.originatorId || null,
+    conversationSpaceId: content.conversationSpaceId || null,
     legDirection,
     answered,
-    answerTime: historyAnswerTime(content),
+    explicitlyUnanswered,
+    answerTime: answerTime && answerTime !== true ? answerTime : null,
     teamMember,
     externalNumber,
     externalName,
@@ -566,9 +738,22 @@ function withinWindow(aIso, bIso, windowMs) {
   return Math.abs(new Date(aIso).getTime() - new Date(bIso).getTime()) <= windowMs;
 }
 
+// Prefer a leg that actually has audio, then an explicit answered/not-answered
+// status. A tie keeps the earlier start.
+function detailScore(info = {}) {
+  let score = 0;
+  if (info.hasTranscript) score += 8;
+  if (info.hasRecording) score += 4;
+  if (info.answered === true) score += 2;
+  else if (info.answered === false) score += 1;
+  return score;
+}
+
 // How to post one interaction given other open/recent calls. Never invents a phone
 // number. Same-direction split legs (greeting, then the answered call) collapse.
 // Opposite-direction calls and two real back-to-back conversations stay separate.
+// Two same-direction legs for one number that both lack a conversation, and that
+// start within SIBLING_WINDOW_MS, post once — overlap was missing the ~1s twins.
 function postingPlan({
   externalNumber,
   externalConflict,
@@ -576,6 +761,9 @@ function postingPlan({
   callCreated,
   callEnded,
   substantive,
+  hasTranscript = false,
+  hasRecording = false,
+  answered = null,
   now = Date.now(),
   openSiblings = [],
   recent = null,
@@ -588,7 +776,20 @@ function postingPlan({
     && sameCustomer(other.externalNumber, externalNumber);
 
   if (recent && recent.groupKey && sameCall(recent) && timeRangesOverlap(recent, { callCreated, callEnded })) {
+    if (!substantive && recent.substantive === false) {
+      return { action: 'suppress', reason: 'same-minute duplicate with no conversation', skipArtifacts: true };
+    }
     return { action: 'suppress', reason: 'overlapping duplicate leg' };
+  }
+  if (
+    recent
+    && recent.groupKey
+    && sameCall(recent)
+    && !substantive
+    && recent.substantive === false
+    && withinWindow(recent.callCreated, callCreated, SIBLING_WINDOW_MS)
+  ) {
+    return { action: 'suppress', reason: 'same-minute duplicate with no conversation', skipArtifacts: true };
   }
 
   const sibling = openSiblings.find((other) => sameCall(other) && withinWindow(other.callCreated, callCreated, SIBLING_WINDOW_MS));
@@ -601,8 +802,27 @@ function postingPlan({
     }
     if (!substantive && !sibling.substantive) {
       const age = callEnded ? now - new Date(callEnded).getTime() : 0;
-      if (!callEnded || age < ANNOUNCEMENT_HOLD_MS) {
+      const siblingEnded = Boolean(sibling.callEnded);
+      const siblingAge = siblingEnded ? now - new Date(sibling.callEnded).getTime() : 0;
+      const waitingOnUs = !callEnded || age < ANNOUNCEMENT_HOLD_MS;
+      const waitingOnSibling = siblingEnded && siblingAge < ANNOUNCEMENT_HOLD_MS;
+      if (waitingOnUs || waitingOnSibling) {
         return { action: 'hold', reason: 'waiting to see which leg has the conversation' };
+      }
+      if (siblingEnded) {
+        const currentScore = detailScore({ hasTranscript, hasRecording, answered });
+        const siblingScore = detailScore(sibling);
+        const currentEarlier = !sibling.callCreated || (callCreated && String(callCreated) <= String(sibling.callCreated));
+        const currentWins = currentScore > siblingScore || (currentScore === siblingScore && currentEarlier);
+        if (currentWins) {
+          return {
+            action: 'post',
+            reason: 'preferred same-minute leg',
+            suppressSibling: sibling.groupKey,
+            skipSiblingArtifacts: true,
+          };
+        }
+        return { action: 'suppress', reason: 'same-minute duplicate with no conversation', skipArtifacts: true };
       }
     }
     if (timeRangesOverlap({ callCreated, callEnded }, sibling)) {
