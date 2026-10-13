@@ -104,6 +104,90 @@ describe('card redaction', () => {
     assert.equal(plainDate.flagged, false);
   });
 
+  it('masks spoken expirations and security codes in a card context', () => {
+    const sample = cardRedact.redactTranscript(utterance(
+      'The expiration is 128 and the security is 123.',
+    ));
+    const sampleText = textOf(sample);
+    assert.match(sampleText, /\[REDACTED-EXP\]/);
+    assert.match(sampleText, /\[REDACTED-CVV\]/);
+    assert.equal(sampleText.includes('128'), false);
+    assert.equal(sampleText.includes('123'), false);
+    assert.equal(sample.masked, true);
+    assert.equal(sample.review, false);
+    assert.equal(sample.flagged, true);
+
+    const variants = [
+      ['The expiration is 0128.', '0128', null],
+      ['expiration 1 28', '1 28', null],
+      ['the exp is 01 28', '01 28', null],
+      ['the expiration is 1/28', '1/28', null],
+      ['expiration is one twenty eight', 'twenty', null],
+      ['the expiration is January 2028', 'January', null],
+      ['exp Jan 28', 'Jan', null],
+      ['it expires 12/2026', '12/2026', null],
+      ['security number is 441', null, '441'],
+      ['the three digits on the back are 123', null, '123'],
+      ['the code on the back is 1234', null, '1234'],
+      ['three-digit code is 123', null, '123'],
+      ['verification code is 999', null, '999'],
+      ['the cid is 1234', null, '1234'],
+      ['the security is one two three', null, 'one two three'],
+    ];
+    for (const [text, hiddenExp, hiddenCvv] of variants) {
+      const result = cardRedact.redactTranscript(utterance(text));
+      const masked = textOf(result);
+      assert.equal(result.review, false, text);
+      assert.equal(result.masked, true, text);
+      if (hiddenExp) {
+        assert.match(masked, /\[REDACTED-EXP\]/, text);
+        assert.equal(masked.includes(hiddenExp), false, text);
+      }
+      if (hiddenCvv) {
+        assert.match(masked, /\[REDACTED-CVV\]/, text);
+        assert.equal(masked.includes(hiddenCvv), false, text);
+      }
+    }
+
+    const across = cardRedact.redactTranscript({
+      results: [
+        { transcript: `My card number is ${PAN}`, channel: 0 },
+        { transcript: '0128', channel: 0 },
+        { transcript: 'and the security is 123', channel: 1 },
+      ],
+    });
+    const acrossText = textOf(across);
+    assert.match(acrossText, /\[REDACTED-CARD\]/);
+    assert.match(acrossText, /\[REDACTED-EXP\]/);
+    assert.match(acrossText, /\[REDACTED-CVV\]/);
+    assert.equal(acrossText.includes(PAN), false);
+    assert.equal(acrossText.includes('0128'), false);
+    assert.equal(acrossText.includes('123'), false);
+
+    const again = cardRedact.redactTranscript(sample.transcript);
+    assert.equal(again.masked, true);
+    assert.equal(textOf(again).includes('128'), false);
+    assert.equal(textOf(again).includes('123'), false);
+  });
+
+  it('leaves zip codes, prices, appointment times, and phone numbers visible', () => {
+    const cases = [
+      'zip code 95670',
+      'the price is $198',
+      'arrival between 11:30 and 12',
+      'call me at 5550101001',
+      'call me at 555-010-1001',
+      'security deposit is 500',
+      'social security number is 123-45-6789',
+    ];
+    for (const text of cases) {
+      const result = cardRedact.redactTranscript(utterance(text));
+      assert.equal(textOf(result), text, text);
+      assert.equal(result.masked, false, text);
+      assert.equal(result.flagged, false, text);
+    }
+  });
+
   it('never holds or flags payment talk without card digits (false positives)', () => {
     const cases = [
       '15 windows',
@@ -164,6 +248,27 @@ describe('card redaction before summary and docs', () => {
     assert.match(doc, /\[REDACTED-CARD\]/);
     assert.equal(doc.includes(PAN), false);
     assert.equal(doc.includes('12/26'), false);
+
+    const spokenRecords = [{
+      transcript: utterance('The expiration is 128 and the security is 123.'),
+      callCreated: '2026-01-01T00:00:00.000Z',
+    }];
+    const spoken = openaiClient.buildSummaryMessages({
+      legRecords: spokenRecords,
+      csrPath: [],
+      direction: 'INBOUND',
+      externalNumber: PHONE,
+      answered: true,
+    });
+    assert.match(spoken.conversationText, /\[REDACTED-EXP\]/);
+    assert.match(spoken.conversationText, /\[REDACTED-CVV\]/);
+    assert.equal(spoken.user.includes('128'), false);
+    assert.equal(spoken.user.includes('123'), false);
+    const spokenDoc = openaiClient.formatTranscriptForDoc(spokenRecords);
+    assert.match(spokenDoc, /\[REDACTED-EXP\]/);
+    assert.match(spokenDoc, /\[REDACTED-CVV\]/);
+    assert.equal(spokenDoc.includes('128'), false);
+    assert.equal(spokenDoc.includes('123'), false);
   });
 
   it('always includes the transcript when payment is discussed without a card number', async () => {
@@ -218,6 +323,31 @@ describe('card flags on a call', () => {
     assert.equal(interactions.audioArchiveDecision('conv-pan'), 'skip');
     assert.deepEqual(uploaded, []);
     assert.equal(Object.hasOwn(interactions.peekLeg('conv-pan'), 'pendingAudio'), false);
+  });
+
+  it('skips audio when a spoken expiration and security code were masked', async () => {
+    const uploaded = [];
+    interactions.setAudioUploader(async (pending) => uploaded.push(pending.recordingId));
+    interactions.holdRecordingAudio('conv-exp', {
+      recordingId: 'rec-exp',
+      buffer: Buffer.from('synthetic-audio'),
+      contentType: 'audio/mpeg',
+      meta: { conversationSpaceId: 'conv-exp' },
+    });
+    interactions.recordTranscript(
+      'conv-exp',
+      'rec-exp',
+      utterance('The expiration is 128 and the security is 123.'),
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    const stored = JSON.stringify(interactions.peekLeg('conv-exp'));
+    assert.equal(stored.includes('128'), false);
+    assert.equal(stored.includes('123'), false);
+    assert.match(stored, /\[REDACTED-EXP\]/);
+    assert.match(stored, /\[REDACTED-CVV\]/);
+    assert.equal(interactions.isCardFlagged('conv-exp'), true);
+    assert.equal(interactions.audioArchiveDecision('conv-exp'), 'skip');
+    assert.deepEqual(uploaded, []);
   });
 
   it('keeps and archives a call with payment talk but no card number', async () => {

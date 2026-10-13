@@ -245,16 +245,17 @@ function normalizeTranscript(raw) {
 // Blinds"), and a real customer never does. Speech-to-text mishears "Blinds" in several
 // different ways - "Lines" (confirmed live 2026-07-21), and "Minds" / "Binds" (confirmed
 // 2026-07-30 on real calls from Gala Wilbur, e.g. "Budget Minds" and "Legit Blinds"/
-// "Budget Binds") - so all of those variants are matched. The pattern also tolerates
-// zero spaces between "Budget" and the second word (e.g. "BudgetLines" transcribed as
-// one token on a real call), not just one-or-more.
-const SELF_ID_PATTERN = /budget\s*(blinds|lines|minds|binds)\b/i;
+// "Budget Binds"). Later calls also produced "Lions", "Blends", and singular "Blind".
+// The alternation is shared with callParties.BUSINESS_NAME_ALT. The pattern also
+// tolerates zero spaces between "Budget" and the second word (e.g. "BudgetLines"
+// transcribed as one token on a real call), not just one-or-more.
+const SELF_ID_PATTERN = new RegExp(`budget\\s*(?:${callParties.BUSINESS_NAME_ALT})\\b`, 'i');
 
 // First-person self-introduction cues that make a nearby "Budget Blinds" mention
 // trustworthy as a team member self-ID (see header comment item 11 - a plain mention
 // of the business name on its own isn't enough, since an automated third-party IVR can
 // say it too, e.g. "you have reached the budget blinds dedicated support line").
-const SELF_ID_CUE = /\b(this is|i'm|i am|my name is|calling on behalf of|speaking with)\b/i;
+const SELF_ID_CUE = /\b(this is|i'm|i am|my name is|calling on behalf of|giving(?: you)? a call on behalf of|giving(?: you)? a call from|reaching out on behalf of|calling from|speaking with|on behalf of)\b/i;
 
 // True if `text` contains a "Budget Blinds"/"Budget Lines" mention that reads as the
 // speaker's OWN introduction rather than a third party merely referencing the business
@@ -268,7 +269,7 @@ const SELF_ID_CUE = /\b(this is|i'm|i am|my name is|calling on behalf of|speakin
 // right up against the mention rather than anywhere in the wider window.
 function hasSelfIntroduction(text) {
     if (!text) return false;
-    const mentionPattern = /budget\s*(blinds|lines|minds|binds)\b/gi;
+    const mentionPattern = new RegExp(SELF_ID_PATTERN.source, 'gi');
     let match;
     while ((match = mentionPattern.exec(text))) {
           const windowStart = Math.max(0, match.index - 60);
