@@ -247,6 +247,7 @@ function trackCallState(payload) {
         interactions.recordLegState(conversationSpaceId, {
             legId: primaryLeg.legId,
             lines: analysis.lines,
+            participantLegIds: analysis.participantLegIds,
             recordingOwners: analysis.recordingOwners,
             externalConnected: analysis.externalConnected,
             externalName: merged.externalName,
@@ -517,7 +518,7 @@ app.post('/admin/reprocess-call', async (req, res) => {
                       direction,
                       callCreated,
                       callEnded,
-                      answered: answered === true,
+                      answered: answered === true ? true : answered === false ? false : null,
           });
 
           const topFolderId = process.env.GOOGLE_DRIVE_FOLDER_ID;

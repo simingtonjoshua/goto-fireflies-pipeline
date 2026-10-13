@@ -271,7 +271,12 @@ function orderedChain(chain) {
 
 // Inbound: only someone GoTo shows as answered (CONNECTED / answerTime). Outbound:
 // the person who placed the call, even if the far end never picked up.
-function considerTeamMember(leg, member, { requireAnswered }) {
+function noteTeamSource(leg, source) {
+            if (!source || leg.teamMemberSource) return;
+            leg.teamMemberSource = source;
+}
+
+function considerTeamMember(leg, member, { requireAnswered, source }) {
             if (!member || member.isSystem) return;
             if (requireAnswered && !member.answered && !member.connected) return;
             const extension = member.extension || null;
@@ -286,6 +291,7 @@ function considerTeamMember(leg, member, { requireAnswered }) {
                           if (name && (!existing.name || existing.name === 'unknown')) existing.name = name;
                           if (answered) existing.answered = true;
                           if (member.answerTime && !existing.enteredAt) existing.enteredAt = member.answerTime;
+                          noteTeamSource(leg, source);
                           return;
             }
             leg.csrChain.push({
@@ -295,15 +301,24 @@ function considerTeamMember(leg, member, { requireAnswered }) {
                           answered,
                           enteredAt: member.answerTime || new Date().toISOString(),
             });
+            noteTeamSource(leg, source);
+}
+
+function lineSource(line) {
+            if (!line) return null;
+            if (line.matchedBy === 'userKey') return 'roster userKey';
+            if (line.isOriginator) return 'STARTING originator';
+            return null;
 }
 
 function applyLines(leg, lines, direction) {
             for (const line of lines || []) {
                           const inbound = direction !== 'OUTBOUND';
-                          considerTeamMember(leg, line, { requireAnswered: inbound ? true : !(line.isOriginator || line.connected) });
+                          const source = lineSource(line);
+                          considerTeamMember(leg, line, { requireAnswered: inbound ? true : !(line.isOriginator || line.connected), source });
                           // Outbound originator counts even while their line is still RINGING.
                           if (!inbound && (line.isOriginator || line.connected)) {
-                                          considerTeamMember(leg, line, { requireAnswered: false });
+                                          considerTeamMember(leg, line, { requireAnswered: false, source });
                           }
                           if (line.legId) {
                                           leg.extraLegIds = leg.extraLegIds || new Set();
@@ -341,6 +356,12 @@ function setExternalNumber(leg, number) {
             if (!leg.externalNumber) leg.externalNumber = number;
 }
 
+function historySource(teamMember) {
+            if (!teamMember) return null;
+            if (teamMember.matchedBy === 'userKey') return 'roster userKey';
+            return 'call history';
+}
+
 function applyHistory(leg, analysis) {
             const direction = leg.direction || analysis.legDirection;
             if (analysis.teamMember) {
@@ -351,13 +372,17 @@ function applyHistory(leg, analysis) {
                                           answered: analysis.answered,
                                           connected: analysis.answered,
                                           answerTime: analysis.answerTime,
-                          }, { requireAnswered: direction !== 'OUTBOUND' });
+                          }, { requireAnswered: direction !== 'OUTBOUND', source: historySource(analysis.teamMember) });
             }
             setDirection(leg, analysis.legDirection, 'history');
             setExternalNumber(leg, analysis.externalNumber);
             if (!leg.externalName && analysis.externalName) leg.externalName = analysis.externalName;
-            if (analysis.answered && (leg.direction === 'OUTBOUND' || analysis.legDirection === 'OUTBOUND')) {
-                          leg.customerAnswered = true;
+            if (analysis.answered) {
+                          leg.sawAnswer = true;
+                          leg.explicitlyUnanswered = false;
+                          if (leg.direction === 'OUTBOUND' || analysis.legDirection === 'OUTBOUND') leg.customerAnswered = true;
+            } else if (analysis.explicitlyUnanswered && !leg.sawAnswer && !leg.customerAnswered) {
+                          leg.explicitlyUnanswered = true;
             }
             if (analysis.legId) {
                           leg.extraLegIds = leg.extraLegIds || new Set();
@@ -445,8 +470,15 @@ function timeRangesOverlap(a, b) {
 // conversationSpaceId (see DUPLICATE-LEG FIX above) the same way recordTranscript/
 // recordRecordingLink already do - without this, a stray event arriving after cleanup
 // would silently spin up a brand-new, mostly-empty leg and finalize it a second time.
+function indexLegId(leg, conversationSpaceId, id) {
+            if (!id) return;
+            leg.extraLegIds = leg.extraLegIds || new Set();
+            leg.extraLegIds.add(id);
+            legIdToConversation.set(id, conversationSpaceId);
+}
+
 function recordLegState(conversationSpaceId, {
-            legId, lines, recordingOwners, externalConnected, externalName, externalNumber,
+            legId, lines, participantLegIds, recordingOwners, externalConnected, externalName, externalNumber,
             direction, directionSource, dialString, callCreated, callEnded, accountKey,
             callIdVersion, expectedTranscriptIds,
 }) {
@@ -472,6 +504,9 @@ function recordLegState(conversationSpaceId, {
                           leg.externalConflict = false;
                           leg.csrChain = [];
                           leg.customerAnswered = false;
+                          leg.explicitlyUnanswered = false;
+                          leg.sawAnswer = false;
+                          leg.teamMemberSource = null;
                           leg.dialString = null;
                           leg.direction = null;
                           leg.directionSource = null;
@@ -481,6 +516,7 @@ function recordLegState(conversationSpaceId, {
                           leg.legId = legId;
                           legIdToConversation.set(legId, conversationSpaceId);
             }
+            for (const id of participantLegIds || []) indexLegId(leg, conversationSpaceId, id);
             setDirection(leg, direction, directionSource || 'metadata');
             setExternalNumber(leg, externalNumber);
             if (externalName && !leg.externalName) leg.externalName = externalName;
@@ -524,8 +560,19 @@ function recordLegState(conversationSpaceId, {
 // call-events stream sometimes omits entirely.
 let loggedHistoryShape = false;
 
-function recordCallHistoryEvent(payload) {
+function historyBody(payload) {
             const content = payload?.content || {};
+            if (content.originatorId || content.legId) return content;
+            if (content.item && (content.item.originatorId || content.item.legId)) return content.item;
+            if (Array.isArray(content.items)) {
+                          const item = content.items.find((entry) => entry && (entry.originatorId || entry.legId));
+                          if (item) return item;
+            }
+            return content;
+}
+
+function recordCallHistoryEvent(payload) {
+            const content = historyBody(payload);
             const { originatorId, legId } = content;
             if (!originatorId) return;
             if (!loggedHistoryShape) {
@@ -535,6 +582,9 @@ function recordCallHistoryEvent(payload) {
 
             const analysis = callParties.analyzeCallHistory(content, roster.getRoster());
             let conversationSpaceId = legId ? legIdToConversation.get(legId) : undefined;
+            if (!conversationSpaceId && analysis.conversationSpaceId && legs.has(analysis.conversationSpaceId)) {
+                          conversationSpaceId = analysis.conversationSpaceId;
+            }
             if (!conversationSpaceId) {
                           // Fall back only to an OPEN conversation already linked to this originator.
                           // A finalized or number-mismatched conversation is not reused.
@@ -777,9 +827,18 @@ function describeGroup(groupKey) {
             const direction = legRecords.find((leg) => leg.direction)?.direction || null;
             const callCreated = legRecords.map((leg) => leg.callCreated).filter(Boolean).sort()[0];
             const callEnded = legRecords.map((leg) => leg.callEnded).filter(Boolean).sort().slice(-1)[0];
-            const customerAnswered = legRecords.some((leg) => leg.customerAnswered);
-            const inboundAnswered = csrChain.some((entry) => entry.answered && entry.name);
-            const answered = direction === 'OUTBOUND' ? customerAnswered : Boolean(direction === 'INBOUND' && inboundAnswered);
+            const explicitYes = direction === 'OUTBOUND'
+              ? legRecords.some((leg) => leg.customerAnswered)
+              : Boolean(direction === 'INBOUND' && csrChain.some((entry) => entry.answered && (entry.name || entry.extension)));
+            const explicitNo = !explicitYes && legRecords.some((leg) => leg.explicitlyUnanswered);
+            // No answer field and no CONNECTED party is unknown, not "the call was not answered".
+            const answered = explicitYes ? true : (explicitNo ? false : null);
+            const hasTranscript = legRecords.some((leg) => {
+                          const transcript = leg.transcript;
+                          if (!transcript) return false;
+                          if (typeof transcript === 'string') return transcript.trim().length > 0;
+                          return true;
+            });
 
             return {
                           conversationSpaceIds,
@@ -793,7 +852,13 @@ function describeGroup(groupKey) {
                           callCreated,
                           callEnded,
                           substantive: legRecords.some((leg) => legIsSubstantive(leg)),
+                          hasTranscript,
+                          hasRecording: legRecords.some((leg) => leg.driveLink || leg.recordingId),
                           suppressPost: legRecords.some((leg) => leg.suppressPost),
+                          skipArtifacts: legRecords.some((leg) => leg.skipArtifacts),
+                          teamMemberSource: csrChain.length
+                            ? (legRecords.map((leg) => leg.teamMemberSource).find(Boolean) || 'none')
+                            : 'none',
                           answered,
             };
 }
@@ -810,12 +875,23 @@ function siblingSnapshots(groupKey) {
                           if (!snap.callCreated && leg.callCreated) snap.callCreated = leg.callCreated;
                           if (leg.callEnded) snap.callEnded = leg.callEnded;
                           if (legIsSubstantive(leg)) snap.substantive = true;
+                          if (leg.transcript) snap.hasTranscript = true;
+                          if (leg.driveLink || leg.recordingId) snap.hasRecording = true;
+                          const legAnswered = Boolean(leg.customerAnswered || (leg.csrChain || []).some((entry) => entry.answered));
+                          if (legAnswered) snap.answered = true;
+                          else if (snap.answered !== true && leg.explicitlyUnanswered) snap.answered = false;
             }
             return [...byGroup.values()];
 }
 
 function planForGroup(groupKey, described) {
-            if (described.suppressPost) return { action: 'suppress', reason: 'folded into another leg' };
+            if (described.suppressPost) {
+                          return {
+                                          action: 'suppress',
+                                          reason: 'folded into another leg',
+                                          skipArtifacts: Boolean(described.skipArtifacts),
+                          };
+            }
             const normalized = normalizeNumberForDedup(described.externalNumber);
             const prior = normalized ? recentlyFinalizedByExternalNumber.get(normalized) : null;
             const recent = prior
@@ -830,15 +906,20 @@ function planForGroup(groupKey, described) {
                           callCreated: described.callCreated,
                           callEnded: described.callEnded,
                           substantive: described.substantive,
+                          hasTranscript: described.hasTranscript,
+                          hasRecording: described.hasRecording,
+                          answered: described.answered,
                           openSiblings: siblingSnapshots(groupKey),
                           recent,
             });
 }
 
-function markSuppressed(groupKey) {
+function markSuppressed(groupKey, options = {}) {
             for (const id of conversationSpaceIdsFor(groupKey)) {
                           const leg = legs.get(id);
-                          if (leg) leg.suppressPost = true;
+                          if (!leg) continue;
+                          leg.suppressPost = true;
+                          if (options.skipArtifacts) leg.skipArtifacts = true;
             }
 }
 
@@ -852,6 +933,7 @@ function rememberFinalizedNumber(groupKey, described) {
                           callEnded: described.callEnded,
                           direction: described.direction,
                           externalNumber: described.externalNumber,
+                          substantive: described.substantive === true,
             });
 }
 
@@ -978,7 +1060,14 @@ async function finalizeInteraction(groupKey) {
                           scheduleFinalize(groupKey);
                           return;
             }
-            if (plan.suppressSibling) markSuppressed(plan.suppressSibling);
+            if (plan.suppressSibling) markSuppressed(plan.suppressSibling, { skipArtifacts: Boolean(plan.skipSiblingArtifacts) });
+            console.log(`Team member source: ${described.teamMemberSource || 'none'}`);
+            if (plan.skipArtifacts) {
+                          console.log(`Interaction ${groupKey} not posted (${plan.reason}).`);
+                          await releaseHeldAudio(conversationSpaceIds, legRecords.some((leg) => leg.cardFlagged));
+                          cleanupGroup(groupKey, conversationSpaceIds);
+                          return;
+            }
             if (plan.action === 'post' || (plan.action === 'suppress' && /duplicate|overlapping/i.test(plan.reason))) {
                           rememberFinalizedNumber(groupKey, described);
             }
