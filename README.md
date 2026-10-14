@@ -134,4 +134,8 @@ GoTo webhook notification  ──►  this service
                                               # in another terminal, once PUBLIC_BASE_URL is a real reachable URL:
                                               npm run setup
                                               ```
-                                              
+
+## Admin routes
+
+`/admin/*` (`/admin/post-note`, `/admin/reprocess-call`, and the others) is on the public URL. Set `ADMIN_TOKEN` and send that value in the `X-Admin-Token` header, or as `Authorization: Bearer <token>`. If `ADMIN_TOKEN` is unset, the routes stay open and the process logs `ADMIN_TOKEN is not set. /admin routes are open until it is configured.`
+

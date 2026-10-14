@@ -17,10 +17,12 @@ const heymarketClient = require('./heymarketClient');
 const feedbackMonitor = require('./feedbackMonitor');
 const callParties = require('./callParties');
 const roster = require('./roster');
+const { requireAdmin, warnIfAdminOpen } = require('./adminAuth');
 const { listAccountUsers } = require('./gotoClient');
 
 const app = express();
 app.use(express.json({ limit: '5mb' }));
+app.use('/admin', requireAdmin);
 
 // In-memory correlation state. This is intentionally ephemeral (lost on restart,
 // redeploy, or the free-tier instance spinning down) - it only needs to survive the
@@ -614,4 +616,7 @@ res.status(500).json({ error: err.message });
 app.get('/healthz', (req, res) => res.json({ ok: true }));
 
 const port = process.env.PORT || 3001;
-app.listen(port, () => console.log(`GoTo Call Notes listening on :${port}`));
+app.listen(port, () => {
+  console.log(`GoTo Call Notes listening on :${port}`);
+  warnIfAdminOpen();
+});
