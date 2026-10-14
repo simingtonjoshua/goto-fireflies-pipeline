@@ -1,4 +1,4 @@
-const { describe, it, beforeEach } = require('node:test');
+const { describe, it, beforeEach, after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
@@ -1182,5 +1182,270 @@ describe('call id version', () => {
     assert.equal(callParties.callIdVersion('11111111-1111-3111-8111-111111111111'), '3');
     assert.equal(callParties.callIdVersion('11111111-1111-4111-8111-111111111111'), '4');
     assert.equal(callParties.callIdVersion('not-a-uuid'), null);
+  });
+});
+
+describe('inbound answerer', () => {
+  const book = roster.createRoster(ROSTER_CONFIG, [OFFICE]);
+
+  beforeEach(() => {
+    interactions.resetForTests();
+    roster.setRosterForTests(book);
+  });
+
+  after(() => {
+    interactions.resetForTests();
+    roster.resetRosterForTests();
+  });
+
+  it('credits an inbound callee named on a DID when history joins by the customer number', () => {
+    interactions.recordLegState('conv-in-did', {
+      legId: 'leg-customer-only',
+      lines: [],
+      participantLegIds: ['leg-customer-only'],
+      direction: 'INBOUND',
+      directionSource: 'metadata',
+      externalNumber: CUSTOMER,
+      callCreated: '2026-10-13T20:27:00.000Z',
+    });
+    interactions.recordCallHistoryEvent({
+      content: {
+        originatorId: 'orig-in-did',
+        legId: 'leg-not-in-starting',
+        direction: 'INBOUND',
+        caller: { name: 'Jordan', number: CUSTOMER },
+        callee: { name: 'Emily Kingdon', number: '5550101888' },
+        talkTime: 87000,
+      },
+    });
+    const leg = interactions.peekLeg('conv-in-did');
+    assert.deepEqual(names(leg), ['Emily Kingdon (00006)']);
+    assert.equal(leg.teamMemberSource, 'call history');
+    assert.equal(roster.last10(leg.externalNumber), CUSTOMER);
+    interactions.resetForTests();
+  });
+
+  it('does not attach inbound history when two open calls share the number', () => {
+    interactions.recordLegState('conv-in-a', {
+      legId: 'leg-a',
+      lines: [],
+      direction: 'INBOUND',
+      directionSource: 'metadata',
+      externalNumber: CUSTOMER,
+      callCreated: '2026-10-13T20:27:00.000Z',
+    });
+    interactions.recordLegState('conv-in-b', {
+      legId: 'leg-b',
+      lines: [],
+      direction: 'INBOUND',
+      directionSource: 'metadata',
+      externalNumber: CUSTOMER,
+      callCreated: '2026-10-13T20:28:00.000Z',
+    });
+    interactions.recordCallHistoryEvent({
+      content: {
+        originatorId: 'orig-ambiguous',
+        legId: 'leg-not-indexed',
+        direction: 'INBOUND',
+        caller: { number: CUSTOMER, name: 'Jordan' },
+        callee: { name: 'Emily Kingdon', number: OFFICE },
+        answerTime: '2026-10-13T20:27:05.000Z',
+      },
+    });
+    assert.deepEqual(interactions.peekLeg('conv-in-a').csrChain, []);
+    assert.deepEqual(interactions.peekLeg('conv-in-b').csrChain, []);
+    interactions.resetForTests();
+  });
+
+  it('falls back to a roster introduction on the team channel', () => {
+    interactions.recordLegState('conv-josh-intro', {
+      legId: 'leg-josh-intro',
+      lines: [],
+      direction: 'INBOUND',
+      directionSource: 'metadata',
+      externalNumber: CUSTOMER,
+      callCreated: '2026-10-13T17:06:00.000Z',
+    });
+    interactions.recordTranscript('conv-josh-intro', 'rec-josh', {
+      results: [
+        { transcript: 'Hello?', channel: 0, startTimeMs: 0 },
+        { transcript: 'This is Josh speaking. How can I help you?', channel: 1, startTimeMs: 1000 },
+      ],
+    });
+    interactions.applyTranscriptAnswerers('conv-josh-intro');
+    const leg = interactions.peekLeg('conv-josh-intro');
+    assert.equal(leg.csrChain[0].name, 'Joshua Simington');
+    assert.equal(leg.csrChain[0].extension, '00003');
+    assert.equal(leg.teamMemberSource, 'transcript introduction');
+    interactions.resetForTests();
+  });
+
+  it('credits the person the caller asked for when the team member says that is them', () => {
+    const found = callParties.answererFromTranscript({
+      direction: 'INBOUND',
+      csrChain: [],
+      transcript: {
+        results: [
+          { transcript: 'Hi, is Emily there?', channel: 0, startTimeMs: 0 },
+          { transcript: 'That would be me.', channel: 1, startTimeMs: 1500 },
+        ],
+      },
+    }, book);
+    assert.equal(found.name, 'Emily Kingdon');
+    assert.equal(found.extension, '00006');
+  });
+
+  it('does not treat the after-hours recording as Joshua answering', () => {
+    const found = callParties.answererFromTranscript({
+      direction: 'INBOUND',
+      csrChain: [],
+      transcript: {
+        results: [
+          { transcript: 'Hi there, this is Josh. Please leave your name after the tone.', channel: 0, startTimeMs: 0 },
+          { transcript: 'Hi, I need a shade repaired.', channel: 1, startTimeMs: 8000 },
+        ],
+      },
+    }, book);
+    assert.equal(found, null);
+  });
+});
+
+describe('substantive leg and fragment dedup', () => {
+  const now = new Date('2026-10-13T20:31:00.000Z').getTime();
+
+  it('posts the real inbound conversation when an empty leg for that number already finalized', () => {
+    const plan = callParties.postingPlan({
+      externalNumber: CUSTOMER,
+      direction: 'INBOUND',
+      now,
+      callCreated: '2026-10-13T20:27:00.000Z',
+      callEnded: '2026-10-13T20:28:30.000Z',
+      substantive: true,
+      fragment: false,
+      recent: {
+        groupKey: 'parked',
+        externalNumber: CUSTOMER,
+        direction: 'INBOUND',
+        callCreated: '2026-10-13T20:26:10.000Z',
+        callEnded: '2026-10-13T20:26:40.000Z',
+        substantive: false,
+      },
+    });
+    assert.equal(plan.action, 'post');
+    assert.equal(plan.skipArtifacts, undefined);
+  });
+
+  it('drops a one-line fragment when a sibling recording has the conversation', () => {
+    const fragment = callParties.postingPlan({
+      externalNumber: CUSTOMER,
+      direction: 'OUTBOUND',
+      now,
+      callCreated: '2026-10-13T20:25:00.000Z',
+      callEnded: '2026-10-13T20:25:04.000Z',
+      substantive: true,
+      fragment: true,
+      openSiblings: [{
+        groupKey: 'voicemail',
+        externalNumber: CUSTOMER,
+        direction: 'OUTBOUND',
+        callCreated: '2026-10-13T20:25:05.000Z',
+        callEnded: '2026-10-13T20:25:40.000Z',
+        substantive: true,
+        fragment: false,
+      }],
+    });
+    assert.equal(fragment.action, 'suppress');
+    assert.equal(fragment.skipArtifacts, true);
+
+    const real = callParties.postingPlan({
+      externalNumber: CUSTOMER,
+      direction: 'OUTBOUND',
+      now,
+      callCreated: '2026-10-13T20:25:05.000Z',
+      callEnded: '2026-10-13T20:25:40.000Z',
+      substantive: true,
+      fragment: false,
+      openSiblings: [{
+        groupKey: 'greeting-fragment',
+        externalNumber: CUSTOMER,
+        direction: 'OUTBOUND',
+        callCreated: '2026-10-13T20:25:00.000Z',
+        callEnded: '2026-10-13T20:25:04.000Z',
+        substantive: true,
+        fragment: true,
+      }],
+    });
+    assert.equal(real.action, 'post');
+    assert.equal(real.suppressSibling, 'greeting-fragment');
+    assert.equal(real.skipSiblingArtifacts, true);
+  });
+
+  it('holds a fragment briefly when the rest of the recording has not arrived', () => {
+    const held = callParties.postingPlan({
+      externalNumber: CUSTOMER,
+      direction: 'OUTBOUND',
+      now,
+      callCreated: '2026-10-13T20:30:00.000Z',
+      callEnded: '2026-10-13T20:30:03.000Z',
+      substantive: true,
+      fragment: true,
+    });
+    assert.equal(held.action, 'hold');
+    assert.equal(callParties.callIsFragment({
+      transcript: { results: [{ transcript: 'Hey, this is Sue.' }] },
+    }), true);
+    assert.equal(callParties.callIsFragment({
+      transcript: {
+        results: [
+          { transcript: 'Hey, this is Sue. Please leave a message.' },
+          { transcript: 'Hi Sue, this is Emily with Budget Blinds, calling about Thursday.' },
+        ],
+      },
+    }), false);
+  });
+});
+
+describe('inbound speaker sanity', () => {
+  it('flips an inbound call when the open greeting was labeled as the customer', () => {
+    const rows = openaiClient.formatLegTranscript({
+      direction: 'INBOUND',
+      csrChain: [],
+      transcript: {
+        results: [
+          { transcript: "It's a great day here at Budget Blinds, how can I help you?", channel: 0, startTimeMs: 0 },
+          { transcript: "My name's Paul and I was trying to get an appointment.", channel: 1, startTimeMs: 2000 },
+          { transcript: 'We can do Thursday between 10 and 2.', channel: 0, startTimeMs: 5000 },
+        ],
+      },
+    });
+    assert.deepEqual(rows.map((row) => row.label), ['Recording', 'Customer', 'Team Member']);
+  });
+
+  it('leaves a correctly channeled inbound greeting on the team side', () => {
+    const rows = openaiClient.formatLegTranscript({
+      direction: 'INBOUND',
+      csrChain: [{ name: 'Emily Kingdon', extension: '00006' }],
+      transcript: {
+        results: [
+          { transcript: "My name's Paul and I was trying to get an appointment.", channel: 0, startTimeMs: 0 },
+          { transcript: "It's a great day here at Budget Blinds, how can I help you?", channel: 1, startTimeMs: 1500 },
+        ],
+      },
+    });
+    assert.deepEqual(rows.map((row) => row.label), ['Customer', 'Recording']);
+  });
+
+  it('labels park and zip-code prompts as recordings', () => {
+    const rows = openaiClient.formatLegTranscript({
+      direction: 'OUTBOUND',
+      csrChain: [{ name: 'Amy Bullock', extension: '00001' }],
+      transcript: {
+        results: [
+          { transcript: 'I am sorry, but there is no call parked on that extension. Please try again.', channel: 1, startTimeMs: 0 },
+          { transcript: 'Please enter your zip code.', channel: 0, startTimeMs: 2000 },
+        ],
+      },
+    });
+    assert.deepEqual(rows.map((row) => row.label), ['Recording', 'Recording']);
   });
 });

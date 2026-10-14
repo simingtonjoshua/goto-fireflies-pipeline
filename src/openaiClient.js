@@ -571,7 +571,9 @@ Treat the speaker labels as ground truth. Do not swap who did something because 
 
 Each transcript line is prefixed with "[Ns]" - the number of seconds into the call that line started.
 
-Write a plain-language summary of what actually happened on this call - not a fixed template, just an accurate account of the conversation. Use as many or as few sentences as the call actually needs (a single short sentence is fine for a quick callback; a fuller paragraph is fine for a detailed booking or a complicated issue). Do not force the call into a category, and do not add a header or label announcing what "type" of call this was - just describe it.
+Write a plain-language summary of what actually happened on this call - not a fixed template, just an accurate account of the conversation. Use as many or as few sentences as the call actually needs (a single short sentence is fine for a quick callback; a fuller paragraph is fine for a detailed booking or a complicated issue). Do not force the call into a category, and do not add a header or label announcing what "type" of call this was - just describe it. Do not open the summary with a raw transcript fragment or a quote of the first line. Start with a sentence about who called whom and what happened.
+
+Never invent a team member's name from the company name. "Budget Blinds" and mishearings of it (Lines, Lions, Blends, Blind) are the business, not a person. If Team Member(s) is unknown, say "a team member".
 
 Keep every concrete detail the call actually contained, stated plainly and exactly rather than rounded off or compressed:
 - The exact number of windows/doors mentioned and the product(s) discussed together in one clause (e.g. "15 windows, roller shades" - never split the count off on its own like "15.").

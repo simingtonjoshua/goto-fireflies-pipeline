@@ -49,6 +49,10 @@ const ALWAYS_SYSTEM = [
   /forwarded to an automatic voice message system/i,
   /the person you(?:['’]re| are) trying to reach is not available/i,
   /at the tone, please record your message/i,
+  /no call parked/i,
+  /please enter your (?:zip|postal|pin|extension|account)/i,
+  /\bhours of \d/i,
+  /\b\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)\s+to\s+\d/i,
   /\bour (normal )?business hours\b/i,
   /\bwe are (currently )?closed\b/i,
   /\bpress [0-9]\b/i,
@@ -130,7 +134,7 @@ function isSystemRecordingUtterance(text, roster) {
 }
 
 function systemRecordingPromptLine() {
-  return 'System recordings (never a live person, even if a name is spoken): the "this call may be recorded" announcement, the "thank you for calling" greeting, the "we are currently assisting other callers" queue message, the after-hours greeting in Joshua\'s voice that asks the caller to leave their name, carrier voicemail prompts ("your call has been forwarded to voicemail", "at the tone, please record your message"), business-hours messages, and IVR "press 1" menus.';
+  return 'System recordings (never a live person, even if a name is spoken): the "this call may be recorded" announcement, the "thank you for calling" greeting, the "we are currently assisting other callers" queue message, the after-hours greeting in Joshua\'s voice that asks the caller to leave their name, carrier voicemail prompts ("your call has been forwarded to voicemail", "at the tone, please record your message"), the "no call parked on that extension" message, business-hours messages, IVR "press 1" menus, and prompts that ask the caller to enter a zip code.';
 }
 
 function customerDialString(dialString, roster) {
@@ -371,6 +375,9 @@ function historyAnswerTime(content) {
     if (text && !/^(false|no)$/i.test(text)) return text;
   }
   if (EXPLICIT_ANSWERED.has(historyDisposition(content))) return content.startTime || true;
+  // Talk time is connected conversation time. Ring duration is not an answer.
+  const talk = Number(content.talkTime ?? content.talkDuration ?? content.talkTimeMs);
+  if (Number.isFinite(talk) && talk > 0) return content.startTime || true;
   return null;
 }
 
@@ -399,15 +406,40 @@ function partyLooksInternal(party, extension) {
   return Boolean(party.userKey || party.userId || party.extensionNumber || party.extension);
 }
 
+// Call-history parties sometimes nest the line under `type`, the same way
+// call-state participants do. Lift the fields partyExtension/partyPerson read.
+function flattenParty(party) {
+  if (!party || typeof party !== 'object') return {};
+  const type = party.type && typeof party.type === 'object' ? party.type : {};
+  const name = party.name || type.name || null;
+  const number = party.number || party.phoneNumber || type.number || type.phoneNumber || null;
+  return {
+    ...type,
+    ...party,
+    name,
+    number,
+    phoneNumber: party.phoneNumber || type.phoneNumber || number,
+    extensionNumber: party.extensionNumber || type.extensionNumber || party.extension || type.extension || null,
+    extension: party.extension || type.extension || null,
+    userKey: party.userKey || type.userKey || null,
+    userId: party.userId || type.userId || null,
+    type: typeof party.type === 'string' ? party.type : (type.value || party.participantType || null),
+  };
+}
+
 function partyPerson(party, roster) {
   const extension = partyExtension(party, roster);
   const byExtension = roster.personByExtension(extension);
   if (byExtension) {
     return { person: byExtension, extension: byExtension.extension || extension, matchedBy: 'extension' };
   }
-  if (partyLooksInternal(party, extension)) {
-    const byName = roster.personByName(party && party.name);
-    if (byName) return { person: byName, extension: byName.extension, matchedBy: 'name' };
+  const byInternalName = partyLooksInternal(party, extension) ? roster.personByName(party && party.name) : null;
+  if (byInternalName) return { person: byInternalName, extension: byInternalName.extension, matchedBy: 'name' };
+  // Desk caller-id: the roster name beside the office DID, not an extension.
+  const number = party && (party.number || party.phoneNumber);
+  const byDidName = roster.personByName(party && party.name);
+  if (byDidName && number && roster.isSystemNumber(number)) {
+    return { person: byDidName, extension: byDidName.extension, matchedBy: 'name' };
   }
   if (extension) return { person: null, extension, matchedBy: 'extension' };
   return { person: null, extension: null, matchedBy: null };
@@ -421,8 +453,8 @@ function firstCustomerNumber(candidates, roster) {
 }
 
 function analyzeCallHistory(content = {}, roster = rosterApi.getRoster()) {
-  const caller = content.caller || {};
-  const callee = content.callee || {};
+  const caller = flattenParty(content.caller);
+  const callee = flattenParty(content.callee);
   const legDirection = normalizeDirection(content.direction);
   const callerInfo = partyPerson(caller, roster);
   const calleeInfo = partyPerson(callee, roster);
@@ -489,6 +521,19 @@ function analyzeCallHistory(content = {}, roster = rosterApi.getRoster()) {
       person = byName;
       extension = byName.extension;
       matchedBy = 'name';
+    }
+  } else if (!person && (legDirection === 'INBOUND' || !legDirection)) {
+    // Inbound history often names the answerer on the callee and puts the office
+    // DID in the number, so the extension match never sees them.
+    const byName = roster.personByName(callee.name);
+    if (byName) {
+      person = byName;
+      extension = byName.extension;
+      matchedBy = 'name';
+      if (!externalNumber && callerNumber) {
+        externalNumber = callerNumber;
+        externalName = caller.name || null;
+      }
     }
   }
 
@@ -660,8 +705,53 @@ function textHasTeamSelfIdentification(text, leg, roster) {
   return false;
 }
 
+// The live open greeting proves which inbound channel is the company side.
+// The after-hours recording and the park/queue prompts do not: those can sit
+// on the caller's channel without the team member being there.
+function inboundLiveTeamCue(text) {
+  const value = String(text || '');
+  if (/please leave (your )?name/i.test(value)) return false;
+  if (/hi there,\s+this is josh\b/i.test(value)) return false;
+  if (/no call parked/i.test(value)) return false;
+  if (/currently assisting other callers/i.test(value)) return false;
+  if (/\bit'?s a (?:great|good) day\b/i.test(value)) return true;
+  if (/\bhow can i help you\b/i.test(value)) return true;
+  if (/\bthank you for calling\b/i.test(value) && new RegExp(BUSINESS_NAME, 'i').test(value)) return true;
+  return false;
+}
+
+function liveRosterSpeakingIntro(text, roster) {
+  const value = String(text || '');
+  if (!value.trim() || isSystemRecordingUtterance(value, roster)) return false;
+  return rosterIntroNames(roster).some((name) => {
+    const escaped = escapeRegExp(name);
+    return new RegExp(`\\b(?:this is|i'm|i am)\\s+${escaped}\\b`, 'i').test(value)
+      || new RegExp(`\\b${escaped}\\s+speaking\\b`, 'i').test(value);
+  });
+}
+
+function channelProvesInboundTeam(utterances, channel, leg, roster) {
+  return (utterances || []).some((utterance) => {
+    if (Number(utterance.channel) !== channel) return false;
+    if (inboundLiveTeamCue(utterance.text)) return true;
+    if (liveRosterSpeakingIntro(utterance.text, roster)) return true;
+    if (!utteranceCanProveTeamChannel(utterance.text, roster)) return false;
+    return textHasTeamSelfIdentification(utterance.text, leg || {}, roster);
+  });
+}
+
+function claimTeamChannel(roles, present, teamChannel) {
+  roles[teamChannel] = 'team';
+  for (const channel of present) {
+    if (channel === teamChannel) continue;
+    if (roles[channel] === 'team' || roles[channel] == null) roles[channel] = 'customer';
+  }
+}
+
 // GoTo's channel map, corrected when a single channel's own introduction
 // contradicts it. Does not look at which channel spoke first.
+// Inbound calls also flip when the open greeting ("Budget Blinds, how can I
+// help you") or a live roster introduction landed on the customer channel.
 function channelRolesForLeg(utterances, leg, roster = rosterApi.getRoster()) {
   const present = [];
   for (const utterance of utterances || []) {
@@ -679,21 +769,23 @@ function channelRolesForLeg(utterances, leg, roster = rosterApi.getRoster()) {
       .join(' ');
     return textHasTeamSelfIdentification(text, leg || {}, roster);
   });
-  if (signalChannels.length !== 1) return { roles, corrected: false };
-
-  const teamChannel = signalChannels[0];
-  const current = roles[teamChannel];
-  if (current === 'team') return { roles, corrected: false };
-  // Only override a customer label, or fill in a side GoTo did not label.
-  // A system-owned channel is left alone.
-  if (current !== 'customer' && current != null) return { roles, corrected: false };
-
-  roles[teamChannel] = 'team';
-  for (const channel of present) {
-    if (channel === teamChannel) continue;
-    if (roles[channel] === 'team' || roles[channel] == null) roles[channel] = 'customer';
+  if (signalChannels.length === 1) {
+    const teamChannel = signalChannels[0];
+    const current = roles[teamChannel];
+    if (current !== 'team' && (current === 'customer' || current == null)) {
+      claimTeamChannel(roles, present, teamChannel);
+      return { roles, corrected: true, teamChannel };
+    }
   }
-  return { roles, corrected: true, teamChannel };
+
+  if ((leg && leg.direction) === 'INBOUND') {
+    const proof = present.filter((channel) => channelProvesInboundTeam(utterances, channel, leg || {}, roster));
+    if (proof.length === 1 && roles[proof[0]] === 'customer') {
+      claimTeamChannel(roles, present, proof[0]);
+      return { roles, corrected: true, teamChannel: proof[0] };
+    }
+  }
+  return { roles, corrected: false };
 }
 
 function simpleUtterances(raw) {
@@ -710,6 +802,113 @@ function transcriptIsSubstantive(raw, roster = rosterApi.getRoster()) {
   const utterances = simpleUtterances(raw);
   if (!utterances.length) return false;
   return utterances.some((utterance) => !isSystemRecordingUtterance(utterance.text, roster));
+}
+
+function detailedUtterances(raw) {
+  if (!raw) return [];
+  const items = Array.isArray(raw) ? raw : raw.results || raw.items || raw.transcriptions || [];
+  if (!Array.isArray(items)) return [];
+  return items
+    .filter((item) => item && (item.transcript || item.text))
+    .map((item) => ({
+      text: String(item.transcript || item.text || '').trim(),
+      channel: Number(item.channel),
+      startTimeMs: Number(item.startTimeMs) || 0,
+    }))
+    .filter((item) => item.text);
+}
+
+// One short non-system line (the start of a voicemail greeting, a one-second
+// fragment) is not a separate conversation when a sibling recording has the rest.
+function callIsFragment({ transcript, callCreated, callEnded } = {}, roster = rosterApi.getRoster()) {
+  if (!transcriptIsSubstantive(transcript, roster)) return false;
+  const utterances = simpleUtterances(transcript).filter((utterance) => !isSystemRecordingUtterance(utterance.text, roster));
+  if (utterances.length !== 1) return false;
+  const words = utterances[0].text.trim().split(/\s+/).filter(Boolean);
+  if (words.length <= 8) return true;
+  if (callCreated && callEnded) {
+    const ms = new Date(callEnded).getTime() - new Date(callCreated).getTime();
+    if (ms >= 0 && ms < 3000) return true;
+  }
+  return false;
+}
+
+function peopleMatchingIntroToken(roster, token) {
+  const target = String(token || '').trim().toLowerCase();
+  if (!target) return [];
+  const canonical = target === 'josh' ? 'joshua' : target;
+  const matches = [];
+  for (const entry of roster.byExtension.values()) {
+    const first = String(entry.name || '').trim().split(/\s+/)[0].toLowerCase();
+    if (first === canonical) matches.push(entry);
+  }
+  return matches;
+}
+
+function personFromIntroTokens(roster, tokens) {
+  const matched = [];
+  for (const token of tokens) {
+    for (const entry of peopleMatchingIntroToken(roster, token)) {
+      if (!matched.some((existing) => existing.name === entry.name && existing.extension === entry.extension)) {
+        matched.push(entry);
+      }
+    }
+  }
+  const names = [...new Set(matched.map((entry) => entry.name))];
+  if (names.length !== 1) return null;
+  const same = matched.filter((entry) => entry.name === names[0]);
+  const extensions = [...new Set(same.map((entry) => entry.extension).filter(Boolean))];
+  return { name: names[0], extension: extensions.length === 1 ? extensions[0] : null };
+}
+
+function statedRosterPerson(text, roster) {
+  const tokens = [];
+  for (const name of rosterIntroNames(roster)) {
+    const escaped = escapeRegExp(name);
+    const pattern = new RegExp(
+      `\\b(?:this is|i'm|i am)\\s+${escaped}\\b|\\b${escaped}\\s+speaking\\b`,
+      'i',
+    );
+    if (pattern.test(text)) tokens.push(name);
+  }
+  return personFromIntroTokens(roster, tokens);
+}
+
+function askedRosterPerson(text, roster) {
+  const tokens = [];
+  for (const name of rosterIntroNames(roster)) {
+    const escaped = escapeRegExp(name);
+    const pattern = new RegExp(
+      `\\b(?:is|for)\\s+${escaped}\\s+there\\b|\\b(?:speak|talk|speaking)\\s+(?:to|with)\\s+${escaped}\\b|\\b${escaped}\\s+there\\b`,
+      'i',
+    );
+    if (pattern.test(text)) tokens.push(name);
+  }
+  return personFromIntroTokens(roster, tokens);
+}
+
+const CONFIRM_ME = /\b(?:that would be me|that'?s me|this is (?:she|her|he|him)|you'?re speaking with(?: me)?)\b/i;
+
+// Used only when call history and call-state never named an inbound answerer.
+// Reads the team channel after the same channel correction the transcript uses.
+function answererFromTranscript(leg, roster = rosterApi.getRoster()) {
+  if (!leg || leg.direction !== 'INBOUND') return null;
+  const utterances = detailedUtterances(leg.transcript);
+  if (!utterances.length) return null;
+  const assignment = channelRolesForLeg(utterances, leg, roster);
+  const teamText = utterances
+    .filter((utterance) => assignment.roles[Number(utterance.channel)] === 'team' && !isSystemRecordingUtterance(utterance.text, roster))
+    .map((utterance) => utterance.text)
+    .join(' ');
+  const customerText = utterances
+    .filter((utterance) => assignment.roles[Number(utterance.channel)] === 'customer' && !isSystemRecordingUtterance(utterance.text, roster))
+    .map((utterance) => utterance.text)
+    .join(' ');
+  const stated = statedRosterPerson(teamText, roster);
+  if (stated) return stated;
+  const asked = askedRosterPerson(customerText, roster);
+  if (asked && CONFIRM_ME.test(teamText)) return asked;
+  return null;
 }
 
 function last10(value) {
@@ -754,6 +953,10 @@ function detailScore(info = {}) {
 // Opposite-direction calls and two real back-to-back conversations stay separate.
 // Two same-direction legs for one number that both lack a conversation, and that
 // start within SIBLING_WINDOW_MS, post once — overlap was missing the ~1s twins.
+function otherHasContent(other) {
+  return Boolean(other && other.substantive && !other.fragment);
+}
+
 function postingPlan({
   externalNumber,
   externalConflict,
@@ -761,6 +964,7 @@ function postingPlan({
   callCreated,
   callEnded,
   substantive,
+  fragment = false,
   hasTranscript = false,
   hasRecording = false,
   answered = null,
@@ -775,30 +979,45 @@ function postingPlan({
     && other.direction === direction
     && sameCustomer(other.externalNumber, externalNumber);
 
-  if (recent && recent.groupKey && sameCall(recent) && timeRangesOverlap(recent, { callCreated, callEnded })) {
-    if (!substantive && recent.substantive === false) {
-      return { action: 'suppress', reason: 'same-minute duplicate with no conversation', skipArtifacts: true };
+  if (recent && recent.groupKey && sameCall(recent)) {
+    const close = withinWindow(recent.callCreated, callCreated, SIBLING_WINDOW_MS);
+    const overlap = timeRangesOverlap(recent, { callCreated, callEnded });
+    if (close || overlap) {
+      // A real conversation is never the leg we drop, including when an empty
+      // or one-line fragment for the same number already posted.
+      if (substantive && !fragment && (recent.substantive === false || recent.fragment)) {
+        return { action: 'post', reason: 'substantive conversation' };
+      }
+      if (fragment && otherHasContent(recent)) {
+        return { action: 'suppress', reason: 'fragment leg of a conversation', skipArtifacts: true };
+      }
+      if (!substantive && recent.substantive === false && (close || overlap)) {
+        return { action: 'suppress', reason: 'same-minute duplicate with no conversation', skipArtifacts: true };
+      }
+      if (overlap) {
+        return { action: 'suppress', reason: 'overlapping duplicate leg', skipArtifacts: true };
+      }
     }
-    return { action: 'suppress', reason: 'overlapping duplicate leg' };
-  }
-  if (
-    recent
-    && recent.groupKey
-    && sameCall(recent)
-    && !substantive
-    && recent.substantive === false
-    && withinWindow(recent.callCreated, callCreated, SIBLING_WINDOW_MS)
-  ) {
-    return { action: 'suppress', reason: 'same-minute duplicate with no conversation', skipArtifacts: true };
   }
 
   const sibling = openSiblings.find((other) => sameCall(other) && withinWindow(other.callCreated, callCreated, SIBLING_WINDOW_MS));
   if (sibling) {
+    if (fragment && otherHasContent(sibling)) {
+      return { action: 'suppress', reason: 'fragment leg of a conversation', skipArtifacts: true };
+    }
+    if (substantive && !fragment && sibling.fragment) {
+      return {
+        action: 'post',
+        reason: 'substantive conversation',
+        suppressSibling: sibling.groupKey,
+        skipSiblingArtifacts: true,
+      };
+    }
     if (!substantive && sibling.substantive) {
-      return { action: 'suppress', reason: 'announcement leg of an open conversation', mergeInto: sibling.groupKey };
+      return { action: 'suppress', reason: 'announcement leg of an open conversation', mergeInto: sibling.groupKey, skipArtifacts: true };
     }
     if (substantive && !sibling.substantive) {
-      return { action: 'post', reason: 'substantive leg', suppressSibling: sibling.groupKey };
+      return { action: 'post', reason: 'substantive leg', suppressSibling: sibling.groupKey, skipSiblingArtifacts: true };
     }
     if (!substantive && !sibling.substantive) {
       const age = callEnded ? now - new Date(callEnded).getTime() : 0;
@@ -826,11 +1045,14 @@ function postingPlan({
       }
     }
     if (timeRangesOverlap({ callCreated, callEnded }, sibling)) {
-      return { action: 'suppress', reason: 'overlapping open duplicate', mergeInto: sibling.groupKey };
+      return { action: 'suppress', reason: 'overlapping open duplicate', mergeInto: sibling.groupKey, skipArtifacts: true };
     }
     return { action: 'post', reason: 'separate substantive call' };
   }
 
+  if (fragment && callEnded && (now - new Date(callEnded).getTime()) < ANNOUNCEMENT_HOLD_MS) {
+    return { action: 'hold', reason: 'fragment hold' };
+  }
   if (!substantive && callEnded && (now - new Date(callEnded).getTime()) < ANNOUNCEMENT_HOLD_MS) {
     return { action: 'hold', reason: 'announcement-only hold' };
   }
@@ -856,6 +1078,8 @@ module.exports = {
   isSystemRecordingUtterance,
   systemRecordingPromptLine,
   transcriptIsSubstantive,
+  callIsFragment,
+  answererFromTranscript,
   postingPlan,
   callIdVersion,
   uniqueExternalNumbers,
