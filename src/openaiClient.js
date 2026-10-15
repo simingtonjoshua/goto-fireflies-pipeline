@@ -585,7 +585,7 @@ Keep every concrete detail the call actually contained, stated plainly and exact
 
 If a detail wasn't mentioned, simply leave it out rather than writing "Not mentioned" as filler - only call out something as missing if the absence itself matters (e.g. the customer never gave a callback number and clearly should have).
 
-IMPORTANT - identifying the customer: never treat the "Caller ID" metadata value as the customer's real name. That value is a phone company / carrier line label (often a city, region, or business name - e.g. "Rancho Cordova / East Elk Grove (RC)") attached to the phone number, not a person's name. Only use a real personal name for the customer if the customer states it themselves somewhere in the transcript. If no real name was ever stated, refer to the customer by their phone number (as given in the metadata) instead of guessing or using the Caller ID label.
+IMPORTANT - identifying the customer: never treat the "Caller ID" metadata value as the customer's real name. That value is a phone company / carrier line label (often a city, region, or business name - e.g. "Rancho Cordova / East Elk Grove (RC)") attached to the phone number, not a person's name. Only use a real personal name for the customer if the customer states it themselves somewhere in the transcript. If no real name was ever stated, refer to the customer by their phone number (as given in the metadata) instead of guessing or using the Caller ID label. When a team member confirms they are the person the caller asked for ("that would be me", "it's me", "yes it is") and a name comes right after that confirmation ("that would be me, Karen"), that name is the customer's, not the team member's. Do not rename the team member to it.
 
 IMPORTANT - never invent a phone number: only ever write a phone number that appears EXACTLY as given in the "Customer phone number" metadata line, or that the customer explicitly states themselves in the transcript. If the metadata says the number is unknown and no number was ever spoken in the transcript, just don't include a number - never reuse a callback number the team member recites for someone else, or any other unrelated number, as if it were the customer's own.
 
@@ -593,11 +593,11 @@ IMPORTANT - a one-sided transcript is still a transcript: if the transcript is j
 
 IMPORTANT - vendor/solicitation calls are not customer calls: if the caller is clearly a vendor, salesperson, recruiter, advertiser, or other outside business calling to sell or pitch something TO Budget Blinds (rather than asking about window treatments themselves), do not refer to them as "the customer" anywhere in the summary. Identify the caller by their actual name and company if stated (e.g. "Natalie from Clear Channel Outdoor"), and describe plainly what they were soliciting and what was said - do not frame it as a customer inquiry.
 
-IMPORTANT - who called whom: the metadata includes this call's direction. OUTBOUND means a Budget Blinds team member placed this call to the customer's number - never describe an outbound call as something the customer initiated (e.g. never say "the customer called" for an outbound call). INBOUND means the customer called in to Budget Blinds. Also always use the times exactly as given in the metadata (they're already in the correct local time) - never do your own timezone conversion or restate a time differently than given.
+IMPORTANT - who called whom: the metadata includes this call's direction. OUTBOUND means a Budget Blinds team member placed this call to the customer's number - never describe an outbound call as something the customer initiated (e.g. never say "the customer called" for an outbound call). The first person in the team member path is the one who placed an outbound call. Later names are later hops, not the person who dialed. INBOUND means the customer called in to Budget Blinds. Also always use the times exactly as given in the metadata (they're already in the correct local time) - never do your own timezone conversion or restate a time differently than given.
 
 IMPORTANT - supplier/vendor support calls (the reverse case): sometimes this call is Budget Blinds contacting - or being contacted back by - an outside supplier or vendor's OWN support/order line about a problem with an order Budget Blinds placed with them (e.g. missing or incorrect parts in a shipment). In this scenario Budget Blinds is the one being served, not the customer described elsewhere in these instructions. Identify the external party by their real name and company if stated (e.g. "Jackie from Custom Browns Group"), describe the order/shipment problem as Budget Blinds' own issue rather than a customer's, and read the transcript literally to determine which side actually reported the problem - do not assume the external party is the one with the complaint just because that's the more common pattern; a Budget Blinds team member can be the one describing what's wrong with a shipment they received.
 
-IMPORTANT - automated systems are not customers: if the "Customer"-labeled channel is clearly an automated phone system, IVR menu, or hold-queue recording (menu options, "press one," hold-time announcements, a scripted greeting) rather than a live person, describe it as such (e.g. "an automated support line" or "the hold system") rather than treating it as a customer. This is common when a Budget Blinds team member calls an outside vendor's own support line, and there may be no real third-party "customer" on the call at all.
+IMPORTANT - automated systems are not customers: if the "Customer"-labeled channel is clearly an automated phone system, IVR menu, or hold-queue recording (menu options, "press one," hold-time announcements, a scripted greeting) rather than a live person, describe it as such (e.g. "an automated support line" or "the hold system") rather than treating it as a customer. This is common when a Budget Blinds team member calls an outside vendor's own support line, and there may be no real third-party "customer" on the call at all. Lines labeled Recording — "thank you for calling", "press one", "estimated wait time", "save your place in line", "welcome to Bright", "when you have finished recording, you may hang up" — are never the customer. A call that is a team member waiting on a vendor menu or hold queue is a hold call: say they were on hold, and do not say the customer explained the menu, the portal, or the wait time. Words the team member says to someone who is not on the phone, while that hold is playing, are still the team member on a hold call.
 
 IMPORTANT - hold time: if the metadata includes a "Hold periods detected" line, mention in the summary that the caller was placed on hold and roughly how long it lasted (e.g. "the customer was placed on hold for about 45 seconds while ___ checked on availability"). If that line is absent, don't mention holds at all - don't guess at a hold happening just because there was a pause in the transcript.`;
 
@@ -630,17 +630,24 @@ function answeredFactLine(answered, twoSided) {
     return 'Answered: unknown. The phone system did not say whether the call was answered. Do not claim that the call was not answered.';
 }
 
+function pathName(csrPath, which) {
+    if (!csrPath || !csrPath.length) return null;
+    const raw = which === 'first' ? csrPath[0] : csrPath[csrPath.length - 1];
+    const name = String(raw).replace(/\s*\([^)]*\)\s*$/, '').trim();
+    if (!name || /^unknown$/i.test(name)) return null;
+    return name;
+}
+
 function buildNoTranscriptSummary({ csrPath, externalNumber, direction, callCreated, answered }) {
     const displayNumber = driveClient.formatPhoneForDisplay(externalNumber);
     const when = driveClient.formatPacific(callCreated);
-    const lastTeamMember = (csrPath && csrPath.length)
-      ? csrPath[csrPath.length - 1].replace(/\s*\([^)]*\)\s*$/, '').trim()
-          : null;
+    const lastTeamMember = pathName(csrPath, 'last');
+    const originator = pathName(csrPath, 'first');
     const wasAnswered = answered === true;
     const answerUnknown = answered !== true && answered !== false;
 
   if (direction === 'OUTBOUND') {
-        const who = lastTeamMember || 'A Budget Blinds team member';
+        const who = originator || 'A Budget Blinds team member';
         if (wasAnswered) {
               return `No transcript was available for this call. ${who} placed an outbound call to ${displayNumber} on ${when}, and the phone system shows the call was answered, but no conversation audio or transcript was captured.`;
         }

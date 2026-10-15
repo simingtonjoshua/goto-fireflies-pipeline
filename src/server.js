@@ -254,6 +254,7 @@ function trackCallState(payload) {
             externalConnected: analysis.externalConnected,
             externalName: merged.externalName,
             externalNumber: merged.externalNumber,
+            originatorNumber: analysis.originatorNumber,
             direction: merged.direction,
             directionSource: merged.directionSource,
             dialString: merged.dialString,
@@ -272,7 +273,12 @@ function trackCallState(payload) {
                   for (const r of (p.type && p.type.recordings) || []) recordingIds.add(r.id);
         }
         for (const r of state.recordings || []) recordingIds.add(r.id);
-        for (const id of recordingIds) recordingMetadata.set(id, merged);
+        for (const id of recordingIds) {
+                  recordingMetadata.set(id, merged);
+                  if (interactions.attachParkedOrphan(id, conversationSpaceId)) {
+                            console.log(`Call-state linked parked orphan recording ${id} to ${conversationSpaceId}.`);
+                  }
+        }
 
   const answered = analysis.lines.filter((line) => line.connected && !line.isSystem).map((line) => line.extension || line.name);
         console.log(
@@ -314,9 +320,25 @@ async function handleTranscriptReady(recordingId) {
 
   const meta = recordingMetadata.get(recordingId);
         if (!meta || !meta.conversationSpaceId) {
-                  console.log(
-                              `Transcript for ${recordingId} has no known conversationSpaceId yet - this is the "orphan recording" case (see the parked-call investigation from 2026-07-19/20). Dropping for now; Call History correlation (src/interactions.js) may still resolve the recording itself once we also track recordingId -> legId, which isn't wired up yet.`
-                            );
+                  interactions.parkOrphanTranscript(recordingId, transcript);
+                  const started = Date.now();
+                  const retry = (delay, finalAttempt) => {
+                            const timer = setTimeout(() => {
+                                      const later = recordingMetadata.get(recordingId);
+                                      if (later && later.conversationSpaceId && interactions.attachParkedOrphan(recordingId, later.conversationSpaceId)) {
+                                                return;
+                                      }
+                                      if (finalAttempt) interactions.abandonOrphan(recordingId);
+                            }, delay);
+                            if (timer.unref) timer.unref();
+                  };
+                  // Call-state sometimes names the recording after the transcript
+                  // notification. Retry across the quiet period and the backstop,
+                  // then log the open legs so the next audit can see why it was lost.
+                  retry(45 * 1000, false);
+                  retry(3 * 60 * 1000, false);
+                  retry(10 * 60 * 1000, true);
+                  console.log(`Orphan recording ${recordingId} parked at ${new Date(started).toISOString()}; will retry for 10 minutes.`);
                   return;
         }
 

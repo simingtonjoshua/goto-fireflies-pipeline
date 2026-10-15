@@ -589,6 +589,16 @@ describe('speaker labels and summary facts', () => {
     assert.equal(/connected/i.test(outbound), false);
     assert.equal(/reached/i.test(outbound), false);
     assert.match(outbound, /does not show that the call was answered/);
+
+    const transferred = openaiClient.buildNoTranscriptSummary({
+      csrPath: ['Emily Kingdon (00006)', 'Joshua Simington (00003)'],
+      externalNumber: '5032604268',
+      direction: 'OUTBOUND',
+      callCreated: '2026-10-14T21:12:00.000Z',
+      answered: null,
+    });
+    assert.match(transferred, /Emily Kingdon placed an outbound call/);
+    assert.equal(/Joshua Simington placed an outbound call/.test(transferred), false);
   });
 
   it('gives the summarizer fixed facts and the known system recordings', () => {
@@ -616,6 +626,9 @@ describe('speaker labels and summary facts', () => {
     assert.match(text, /service order/i);
     assert.match(text, /customer signs it and pays/i);
     assert.match(text, /Never write that the customer will send a service order for a team member to sign or pay/);
+    assert.match(text, /that would be me, Karen/);
+    assert.match(text, /first person in the team member path/);
+    assert.match(text, /hold call/i);
   });
 
   // Live outbound return call, 2026-10-12: direction and the team-member credit were
@@ -1295,6 +1308,93 @@ describe('inbound answerer', () => {
     assert.equal(found.extension, '00006');
   });
 
+  it('credits Josh from the Oct 14 lines even when a non-roster line is on the chain and a channel is missing', () => {
+    interactions.recordLegState('conv-josh-352', {
+      legId: 'leg-josh-352',
+      lines: [{ legId: 'queue', extension: '00801', name: null, connected: true, answered: true }],
+      direction: 'INBOUND',
+      directionSource: 'metadata',
+      externalNumber: '7073726803',
+      callCreated: '2026-10-14T22:52:00.000Z',
+    });
+    interactions.recordTranscript('conv-josh-352', 'rec-352', {
+      results: [
+        { transcript: 'Yes, this is Christine. I missed your call.', channel: 1, startTimeMs: 0 },
+        { transcript: 'Please note that your call may be recorded for quality assurance or training purposes.', channel: 0, startTimeMs: 1000 },
+        { transcript: "It's a great day here at Budget Blind.", channel: 0, startTimeMs: 7000 },
+        { transcript: 'This is Josh speaking.', startTimeMs: 13000 },
+      ],
+    });
+    interactions.applyTranscriptAnswerers('conv-josh-352');
+    const leg = interactions.peekLeg('conv-josh-352');
+    assert.equal(leg.csrChain.length, 1);
+    assert.equal(leg.csrChain[0].name, 'Joshua Simington');
+    assert.equal(leg.csrChain[0].extension, '00003');
+    assert.equal(leg.teamMemberSource, 'transcript introduction');
+
+    const fourTen = callParties.answererFromTranscript({
+      direction: 'INBOUND',
+      csrChain: [],
+      transcript: {
+        results: [
+          { transcript: 'Please note that your call may be recorded for quality assurance or training purposes.', channel: 1, startTimeMs: 0 },
+          { transcript: 'We can hear a bunch of blinds. This is Josh speaking. How can I help you?', channel: 1, startTimeMs: 6000 },
+          { transcript: "Where's your showroom?", channel: 0, startTimeMs: 10000 },
+        ],
+      },
+    }, book);
+    assert.equal(fourTen.name, 'Joshua Simington');
+  });
+
+  it('credits Emily from the Oct 14 confirmations and leaves an unnamed greeting unknown', () => {
+    const emilyPlease = callParties.answererFromTranscript({
+      direction: 'INBOUND',
+      transcript: {
+        results: [
+          { transcript: 'Please note that your call may be recorded for quality assurance or training purposes.', channel: 1, startTimeMs: 0 },
+          { transcript: "It's a great day here, I'm going to help you.", channel: 1, startTimeMs: 10000 },
+          { transcript: 'Hi, Emily, please.', channel: 0, startTimeMs: 13000 },
+          { transcript: "It's me, I'm going to help you.", channel: 1, startTimeMs: 15000 },
+        ],
+      },
+    }, book);
+    assert.equal(emilyPlease.name, 'Emily Kingdon');
+
+    const yesItIs = callParties.answererFromTranscript({
+      direction: 'INBOUND',
+      transcript: {
+        results: [
+          { transcript: "It's a great day here at Budget Bullion, second day hope", channel: 1, startTimeMs: 7000 },
+          { transcript: 'Hi, is this Emily?', channel: 0, startTimeMs: 11000 },
+          { transcript: 'yes it is.', channel: 1, startTimeMs: 12000 },
+        ],
+      },
+    }, book);
+    assert.equal(yesItIs.name, 'Emily Kingdon');
+
+    const callingFor = callParties.answererFromTranscript({
+      direction: 'INBOUND',
+      transcript: {
+        results: [
+          { transcript: 'Hi, I was calling for Emily.', channel: 0, startTimeMs: 0 },
+          { transcript: 'Oh, that would be me, Karen.', channel: 1, startTimeMs: 1500 },
+        ],
+      },
+    }, book);
+    assert.equal(callingFor.name, 'Emily Kingdon');
+
+    const unnamed = callParties.answererFromTranscript({
+      direction: 'INBOUND',
+      transcript: {
+        results: [
+          { transcript: 'Budget Blinds, can you please hold?', channel: 1, startTimeMs: 0 },
+          { transcript: 'Okay, thanks.', channel: 0, startTimeMs: 2000 },
+        ],
+      },
+    }, book);
+    assert.equal(unnamed, null);
+  });
+
   it('does not treat the after-hours recording as Joshua answering', () => {
     const found = callParties.answererFromTranscript({
       direction: 'INBOUND',
@@ -1435,6 +1535,37 @@ describe('inbound speaker sanity', () => {
     assert.deepEqual(rows.map((row) => row.label), ['Customer', 'Recording']);
   });
 
+  it('labels vendor hold menus and the carrier hang-up prompt as recordings', () => {
+    const rows = openaiClient.formatLegTranscript({
+      direction: 'OUTBOUND',
+      csrChain: [],
+      transcript: {
+        results: [
+          { transcript: 'Thank you for calling Hunter Douglas.', channel: 1, startTimeMs: 0 },
+          { transcript: 'You have reached the budget blinds dedicated support line.', channel: 1, startTimeMs: 2000 },
+          { transcript: 'For customer and technical support, press one.', channel: 1, startTimeMs: 15000 },
+          { transcript: 'Your estimated wait time is less than 10 minutes.', channel: 1, startTimeMs: 290000 },
+          { transcript: 'If you would like to save your place in line and have an agent call you back.', channel: 1, startTimeMs: 37000 },
+          { transcript: 'Welcome to Bright, our new dealer portal replacing the link.', channel: 1, startTimeMs: 80000 },
+          { transcript: 'When you have finished recording, you may hang up.', channel: 1, startTimeMs: 8000 },
+          { transcript: 'Do you know how many minutes?', channel: 0, startTimeMs: 47000 },
+          { transcript: "It's a great day.", channel: 0, startTimeMs: 485000 },
+        ],
+      },
+    });
+    assert.deepEqual(rows.map((row) => `${row.seconds}:${row.label}:${row.text.slice(0, 24)}`), [
+      '0:Recording:Thank you for calling Hu',
+      '2:Recording:You have reached the bud',
+      '8:Recording:When you have finished r',
+      '15:Recording:For customer and technic',
+      '37:Recording:If you would like to sav',
+      '47:Team Member:Do you know how many min',
+      '80:Recording:Welcome to Bright, our n',
+      '290:Recording:Your estimated wait time',
+      '485:Team Member:It\'s a great day.',
+    ]);
+  });
+
   it('labels park and zip-code prompts as recordings', () => {
     const rows = openaiClient.formatLegTranscript({
       direction: 'OUTBOUND',
@@ -1447,5 +1578,276 @@ describe('inbound speaker sanity', () => {
       },
     });
     assert.deepEqual(rows.map((row) => row.label), ['Recording', 'Recording']);
+  });
+});
+
+describe('outbound intro attribution', () => {
+  const book = roster.createRoster(ROSTER_CONFIG, [OFFICE]);
+
+  beforeEach(() => {
+    interactions.resetForTests();
+    roster.setRosterForTests(book);
+  });
+
+  after(() => {
+    interactions.resetForTests();
+    roster.resetRosterForTests();
+  });
+
+  it('credits Emily from the voicemail intro when call-state named nobody', () => {
+    interactions.recordLegState('conv-vm', {
+      legId: 'leg-vm',
+      lines: [],
+      direction: 'OUTBOUND',
+      directionSource: 'metadata',
+      externalNumber: '4157131063',
+      callCreated: '2026-10-14T16:14:00.000Z',
+    });
+    interactions.recordTranscript('conv-vm', 'rec-vm', {
+      results: [
+        { transcript: 'your call has been forwarded to voicemail.', channel: 0, startTimeMs: 0 },
+        { transcript: 'When you have finished recording, you may hang up.', channel: 0, startTimeMs: 8000 },
+        { transcript: "Hi there, my name is Emily. I'm calling on behalf of Budget Blinds.", channel: 1, startTimeMs: 11000 },
+      ],
+    });
+    interactions.applyTranscriptAnswerers('conv-vm');
+    const leg = interactions.peekLeg('conv-vm');
+    assert.equal(leg.csrChain[0].name, 'Emily Kingdon');
+    assert.equal(leg.csrChain[0].extension, '00006');
+    assert.equal(leg.teamMemberSource, 'outbound introduction');
+
+    const ron = callParties.outboundIntroAnswerer({
+      direction: 'OUTBOUND',
+      transcript: {
+        results: [
+          { transcript: 'At the tone, please record your message.', channel: 0, startTimeMs: 0 },
+          { transcript: "Hi Ron, my name is Emily. I'm calling on behalf of Budget Blinds.", channel: 1, startTimeMs: 4000 },
+        ],
+      },
+    }, book);
+    assert.equal(ron.name, 'Emily Kingdon');
+
+    const unnamed = callParties.outboundIntroAnswerer({
+      direction: 'OUTBOUND',
+      transcript: {
+        results: [
+          { transcript: "I'm calling on behalf of Budget Blinds.", channel: 1, startTimeMs: 0 },
+        ],
+      },
+    }, book);
+    assert.equal(unnamed, null);
+  });
+});
+
+describe('inbound caller recovery', () => {
+  const book = roster.createRoster(ROSTER_CONFIG, [OFFICE]);
+
+  beforeEach(() => {
+    interactions.resetForTests();
+    roster.setRosterForTests(book);
+  });
+
+  after(() => {
+    interactions.resetForTests();
+    roster.resetRosterForTests();
+  });
+
+  const maryTranscript = {
+    results: [
+      { transcript: 'Hi, is this Emily?', channel: 0, startTimeMs: 0 },
+      { transcript: 'yes it is.', channel: 1, startTimeMs: 1200 },
+      { transcript: "Hi, Emily. This is Mary. I've decided not to proceed because of the delivery time.", channel: 0, startTimeMs: 3000 },
+    ],
+  };
+
+  it('posts a substantive inbound when only call history had the caller number', () => {
+    interactions.recordLegState('conv-mary', {
+      legId: 'leg-mary-state',
+      lines: [],
+      participantLegIds: ['leg-mary-state'],
+      direction: 'INBOUND',
+      directionSource: 'metadata',
+      externalNumber: null,
+      callCreated: '2026-10-14T20:16:00.000Z',
+      callEnded: '2026-10-14T20:17:00.000Z',
+    });
+    interactions.recordTranscript('conv-mary', 'rec-mary', maryTranscript);
+    interactions.applyTranscriptAnswerers('conv-mary');
+    interactions.recordCallHistoryEvent({
+      content: {
+        originatorId: 'orig-mary',
+        legId: 'leg-not-in-starting',
+        direction: 'INBOUND',
+        startTime: '2026-10-14T20:16:02.000Z',
+        caller: { name: 'MERRY CROSLIN', number: '+19168350499' },
+        callee: { name: 'Direct DID', number: '5550101888' },
+        talkTime: 60000,
+      },
+    });
+    const described = interactions.describeForTests('conv-mary');
+    assert.equal(roster.last10(described.externalNumber), '9168350499');
+    assert.equal(described.externalConflict, false);
+    assert.equal(described.csrChain[0].name, 'Emily Kingdon');
+    const plan = callParties.postingPlan({
+      externalNumber: described.externalNumber,
+      externalConflict: described.externalConflict,
+      direction: described.direction,
+      substantive: described.substantive,
+      hasTranscript: described.hasTranscript,
+      callCreated: described.callCreated,
+      callEnded: described.callEnded,
+      answered: described.answered,
+    });
+    assert.equal(plan.action, 'post');
+  });
+
+  it('uses the STARTING originator number when call-state did not pick a caller', () => {
+    const analysis = callParties.analyzeCallState(callState({
+      conversationSpaceId: '44444444-4444-3444-8444-444444444444',
+      direction: 'INBOUND',
+      callCreated: '2026-10-14T21:14:00.000Z',
+      participants: [
+        {
+          participantId: 'orig',
+          originator: 'orig',
+          legId: 'leg-orig',
+          status: { value: 'CONNECTED' },
+          type: { value: 'PHONE_NUMBER', callerNumber: '+15032604268', callee: { number: '5550101777' } },
+        },
+      ],
+    }), book);
+    assert.equal(analysis.externalNumber, null);
+    assert.equal(roster.last10(analysis.originatorNumber), '5032604268');
+
+    interactions.recordLegState('conv-caryn', {
+      legId: 'leg-orig',
+      lines: analysis.lines,
+      direction: 'INBOUND',
+      directionSource: 'metadata',
+      externalNumber: null,
+      originatorNumber: analysis.originatorNumber,
+      callCreated: '2026-10-14T21:14:00.000Z',
+      callEnded: '2026-10-14T21:16:00.000Z',
+    });
+    interactions.recordTranscript('conv-caryn', 'rec-caryn', {
+      results: [
+        { transcript: 'Hi, I was calling for Emily.', channel: 0, startTimeMs: 0 },
+        { transcript: 'Oh, that would be me, Karen.', channel: 1, startTimeMs: 1500 },
+        { transcript: 'I need to book an install for Friday between 12 and 4.', channel: 0, startTimeMs: 4000 },
+      ],
+    });
+    interactions.applyTranscriptAnswerers('conv-caryn');
+    const described = interactions.describeForTests('conv-caryn');
+    assert.equal(roster.last10(described.externalNumber), '5032604268');
+    assert.equal(described.csrChain[0].name, 'Emily Kingdon');
+  });
+
+  it('does not invent a number for a greeting with no conversation', () => {
+    interactions.recordLegState('conv-greeting', {
+      legId: 'leg-greeting',
+      lines: [],
+      direction: 'INBOUND',
+      directionSource: 'metadata',
+      externalNumber: null,
+      originatorNumber: '+15308487479',
+      callCreated: '2026-10-14T15:24:00.000Z',
+      callEnded: '2026-10-14T15:24:20.000Z',
+    });
+    interactions.recordTranscript('conv-greeting', 'rec-greeting', {
+      results: [
+        { transcript: "It's a great day here at Budget Blinds. Our normal business hours are 9 to 5.", channel: 0, startTimeMs: 0 },
+      ],
+    });
+    const described = interactions.describeForTests('conv-greeting');
+    assert.equal(described.substantive, false);
+    assert.equal(described.externalNumber, null);
+  });
+
+  it('posts the history caller when call-state reported two numbers', () => {
+    interactions.recordLegState('conv-conflict', {
+      legId: 'leg-conflict',
+      lines: [],
+      direction: 'INBOUND',
+      directionSource: 'metadata',
+      externalNumber: CUSTOMER,
+      callCreated: '2026-10-14T20:16:00.000Z',
+      callEnded: '2026-10-14T20:17:00.000Z',
+    });
+    interactions.recordLegState('conv-conflict', {
+      legId: 'leg-conflict',
+      lines: [],
+      direction: 'INBOUND',
+      directionSource: 'metadata',
+      externalNumber: OTHER_CUSTOMER,
+      callCreated: '2026-10-14T20:16:00.000Z',
+      callEnded: '2026-10-14T20:17:00.000Z',
+    });
+    interactions.recordTranscript('conv-conflict', 'rec-conflict', maryTranscript);
+    interactions.recordCallHistoryEvent({
+      content: {
+        originatorId: 'orig-conflict',
+        legId: 'leg-conflict',
+        direction: 'INBOUND',
+        startTime: '2026-10-14T20:16:02.000Z',
+        caller: { number: CUSTOMER, name: 'Mary' },
+        callee: { name: 'Emily Kingdon', number: OFFICE },
+        talkTime: 60000,
+      },
+    });
+    const described = interactions.describeForTests('conv-conflict');
+    assert.equal(roster.last10(described.externalNumber), CUSTOMER);
+    assert.equal(described.externalConflict, false);
+  });
+
+  it('does not pick a caller when two different caller numbers were seen', () => {
+    interactions.recordLegState('conv-two', {
+      legId: 'leg-two',
+      lines: [],
+      direction: 'INBOUND',
+      directionSource: 'metadata',
+      externalNumber: null,
+      originatorNumber: CUSTOMER,
+      callCreated: '2026-10-14T20:16:00.000Z',
+      callEnded: '2026-10-14T20:17:00.000Z',
+    });
+    interactions.recordTranscript('conv-two', 'rec-two', maryTranscript);
+    interactions.recordCallHistoryEvent({
+      content: {
+        originatorId: 'orig-two',
+        legId: 'leg-not-indexed',
+        direction: 'INBOUND',
+        startTime: '2026-10-14T20:16:02.000Z',
+        caller: { number: OTHER_CUSTOMER, name: 'Someone Else' },
+        callee: { name: 'Direct', number: '5550101888' },
+        talkTime: 60000,
+      },
+    });
+    const described = interactions.describeForTests('conv-two');
+    assert.equal(described.externalNumber, null);
+  });
+});
+
+describe('parked orphan transcripts', () => {
+  beforeEach(() => interactions.resetForTests());
+  after(() => interactions.resetForTests());
+
+  it('attaches a transcript once the recording is linked to a conversation', () => {
+    interactions.parkOrphanTranscript('rec-twinkle', {
+      results: [
+        { transcript: 'I need a second remote for the shade at the top of the stairs.', channel: 0, startTimeMs: 0 },
+        { transcript: 'I will get the cost and call you back.', channel: 1, startTimeMs: 4000 },
+      ],
+    });
+    assert.equal(interactions.peekLeg('conv-twinkle'), null);
+    assert.equal(interactions.attachParkedOrphan('rec-twinkle', 'conv-twinkle'), true);
+    assert.equal(interactions.peekLeg('conv-twinkle').recordingId, 'rec-twinkle');
+    assert.equal(interactions.attachParkedOrphan('rec-twinkle', 'conv-twinkle'), false);
+  });
+
+  it('logs and drops an orphan that never gets a conversation', () => {
+    interactions.parkOrphanTranscript('rec-michelle', { results: [{ transcript: 'Hello?', channel: 0, startTimeMs: 0 }] });
+    assert.equal(interactions.abandonOrphan('rec-michelle'), true);
+    assert.equal(interactions.abandonOrphan('rec-michelle'), false);
+    assert.equal(interactions.attachParkedOrphan('rec-michelle', 'conv-late'), false);
   });
 });

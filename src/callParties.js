@@ -56,7 +56,22 @@ const ALWAYS_SYSTEM = [
   /\bour (normal )?business hours\b/i,
   /\bwe are (currently )?closed\b/i,
   /\bpress [0-9]\b/i,
+  /\bpress\s+(?:one|two|three|four|five|six|seven|eight|nine|zero|pound|star)\b/i,
   /\bfor (sales|service|the operator), press\b/i,
+  /\bestimated wait time\b/i,
+  /\bsave your place in line\b/i,
+  /\bplease continue to hold\b/i,
+  /\bwelcome to bright\b/i,
+  /\bbright (?:resource hub|homepage|home page|dealer portal)\b/i,
+  /\bcalendar syncing with\b/i,
+  /\btransition to bright\b/i,
+  /\bwhen you have finished recording,\s+you may hang up\b/i,
+  /\byou have reached the\b/i,
+  /\bdedicated support line\b/i,
+  /\byour call may be monitored\b/i,
+  /\bplease do not hang up\b/i,
+  /\bplease state your name after the tone\b/i,
+  /\bnumber we will call you back\b/i,
 ];
 
 const SCRIPT_UNLESS_LIVE = [
@@ -134,7 +149,7 @@ function isSystemRecordingUtterance(text, roster) {
 }
 
 function systemRecordingPromptLine() {
-  return 'System recordings (never a live person, even if a name is spoken): the "this call may be recorded" announcement, the "thank you for calling" greeting, the "we are currently assisting other callers" queue message, the after-hours greeting in Joshua\'s voice that asks the caller to leave their name, carrier voicemail prompts ("your call has been forwarded to voicemail", "at the tone, please record your message"), the "no call parked on that extension" message, business-hours messages, IVR "press 1" menus, and prompts that ask the caller to enter a zip code.';
+  return 'System recordings (never a live person, even if a name is spoken): the "this call may be recorded" announcement, the "thank you for calling" greeting, the "we are currently assisting other callers" queue message, the after-hours greeting in Joshua\'s voice that asks the caller to leave their name, carrier voicemail prompts ("your call has been forwarded to voicemail", "at the tone, please record your message", "when you have finished recording, you may hang up"), the "no call parked on that extension" message, business-hours messages, IVR menus ("press 1", "press one"), vendor hold queues ("estimated wait time", "save your place in line", "welcome to Bright"), and prompts that ask the caller to enter a zip code.';
 }
 
 function customerDialString(dialString, roster) {
@@ -194,6 +209,31 @@ function pickExternalFromParticipants({ direction, participants, dialString, ros
     if (any) return { number: any.number, name: any.name };
   }
   return { number: null, name: null };
+}
+
+// Inbound STARTING's originator is the outside caller. Call-state sometimes puts
+// their number on callerNumber / ani / phoneNumber instead of type.caller, and the
+// callee on a forwarded or direct-DID leg is our line. Only the originator's own
+// caller fields count here — a callee DID is not the customer.
+function originatorCustomerNumber(participants, roster) {
+  for (const participant of participants || []) {
+    if (!participantIsOriginator(participant)) continue;
+    const type = typeOf(participant);
+    const callerObject = type.caller && typeof type.caller === 'object' ? type.caller.number : null;
+    const candidates = [
+      callerObject,
+      typeof type.caller === 'string' ? type.caller : null,
+      type.callerNumber,
+      type.ani,
+      type.phoneNumber,
+      participant.callerNumber,
+      participant.phoneNumber,
+    ];
+    for (const candidate of candidates) {
+      if (usableCustomerNumber(candidate, roster)) return candidate;
+    }
+  }
+  return null;
 }
 
 function extensionFromType(type, roster) {
@@ -297,6 +337,7 @@ function analyzeCallState(payload, roster = rosterApi.getRoster()) {
     dialString: metadata.dialString,
     roster,
   });
+  const originatorNumber = originatorCustomerNumber(participants, roster);
 
   // One non-system LINE on an outbound STARTING event is the person who dialed,
   // even when GoTo's originator id is the session rather than that device, and
@@ -321,6 +362,7 @@ function analyzeCallState(payload, roster = rosterApi.getRoster()) {
     accountKey: metadata.accountKey || null,
     externalNumber: external.number,
     externalName: external.name,
+    originatorNumber,
     lines,
     participantLegIds,
     recordingOwners,
@@ -571,6 +613,7 @@ function analyzeCallHistory(content = {}, roster = rosterApi.getRoster()) {
     teamMember,
     externalNumber,
     externalName,
+    startTime: content.startTime || content.callCreated || content.timestamp || null,
   };
 }
 
@@ -812,8 +855,11 @@ function detailedUtterances(raw) {
     .filter((item) => item && (item.transcript || item.text))
     .map((item) => ({
       text: String(item.transcript || item.text || '').trim(),
-      channel: Number(item.channel),
-      startTimeMs: Number(item.startTimeMs) || 0,
+      // A missing channel is what the doc labels as channel 0. Number(undefined)
+      // is NaN, which dropped the line from the answerer while the doc still
+      // showed it as Team Member.
+      channel: item.channel == null || item.channel === '' ? 0 : Number(item.channel),
+      startTimeMs: Number(item.startTimeMs ?? item.start_time_ms) || 0,
     }))
     .filter((item) => item.text);
 }
@@ -879,7 +925,12 @@ function askedRosterPerson(text, roster) {
   for (const name of rosterIntroNames(roster)) {
     const escaped = escapeRegExp(name);
     const pattern = new RegExp(
-      `\\b(?:is|for)\\s+${escaped}\\s+there\\b|\\b(?:speak|talk|speaking)\\s+(?:to|with)\\s+${escaped}\\b|\\b${escaped}\\s+there\\b`,
+      `\\b(?:is|for)\\s+${escaped}\\s+there\\b` +
+      `|\\b(?:speak|talk|speaking)\\s+(?:to|with)\\s+${escaped}\\b` +
+      `|\\b${escaped}\\s+there\\b` +
+      `|\\bis this\\s+${escaped}\\b` +
+      `|\\b(?:was\\s+)?calling for\\s+${escaped}\\b` +
+      `|\\b${escaped}\\s*,\\s*please\\b`,
       'i',
     );
     if (pattern.test(text)) tokens.push(name);
@@ -887,28 +938,59 @@ function askedRosterPerson(text, roster) {
   return personFromIntroTokens(roster, tokens);
 }
 
-const CONFIRM_ME = /\b(?:that would be me|that'?s me|this is (?:she|her|he|him)|you'?re speaking with(?: me)?)\b/i;
+const CONFIRM_ME = /\b(?:that would be me|that'?s me|this is (?:she|her|he|him)|you'?re speaking with(?: me)?|it'?s me|yes it is)\b/i;
+
+function roleForUtterance(assignment, utterance, leg) {
+  const channel = Number(utterance.channel);
+  if (Object.prototype.hasOwnProperty.call(assignment.roles, channel)) return assignment.roles[channel];
+  return channelRole(channel, leg);
+}
+
+// Team vs customer text using the same channel map the doc labels use.
+function speakerTexts(leg, roster) {
+  const utterances = detailedUtterances(leg && leg.transcript);
+  if (!utterances.length) return null;
+  const assignment = channelRolesForLeg(utterances, leg, roster);
+  const textFor = (role) => utterances
+    .filter((utterance) => roleForUtterance(assignment, utterance, leg) === role && !isSystemRecordingUtterance(utterance.text, roster))
+    .map((utterance) => utterance.text)
+    .join(' ');
+  return { teamText: textFor('team'), customerText: textFor('customer') };
+}
 
 // Used only when call history and call-state never named an inbound answerer.
 // Reads the team channel after the same channel correction the transcript uses.
 function answererFromTranscript(leg, roster = rosterApi.getRoster()) {
   if (!leg || leg.direction !== 'INBOUND') return null;
-  const utterances = detailedUtterances(leg.transcript);
-  if (!utterances.length) return null;
-  const assignment = channelRolesForLeg(utterances, leg, roster);
-  const teamText = utterances
-    .filter((utterance) => assignment.roles[Number(utterance.channel)] === 'team' && !isSystemRecordingUtterance(utterance.text, roster))
-    .map((utterance) => utterance.text)
-    .join(' ');
-  const customerText = utterances
-    .filter((utterance) => assignment.roles[Number(utterance.channel)] === 'customer' && !isSystemRecordingUtterance(utterance.text, roster))
-    .map((utterance) => utterance.text)
-    .join(' ');
-  const stated = statedRosterPerson(teamText, roster);
+  const texts = speakerTexts(leg, roster);
+  if (!texts) return null;
+  const stated = statedRosterPerson(texts.teamText, roster);
   if (stated) return stated;
-  const asked = askedRosterPerson(customerText, roster);
-  if (asked && CONFIRM_ME.test(teamText)) return asked;
+  const asked = askedRosterPerson(texts.customerText, roster);
+  if (asked && CONFIRM_ME.test(texts.teamText)) return asked;
   return null;
+}
+
+// "my name is Emily ... on behalf of Budget Blinds" / "this is Emily with Budget Blinds".
+// Same window as rosterIntroNearBusiness. A greeting with no roster name stays unknown.
+function personFromOutboundIntro(text, roster) {
+  const tokens = [];
+  for (const name of rosterIntroNames(roster)) {
+    const pattern = new RegExp(
+      `\\b(?:this is|i'm|i am|my name is)\\s+${escapeRegExp(name)}\\b(?!['’])` +
+      `(?:[\\s,.;:!?]+\\S+){0,8}[\\s,.;:!?]+(?:on behalf of\\b|${BUSINESS_NAME}\\b)`,
+      'i',
+    );
+    if (pattern.test(text)) tokens.push(name);
+  }
+  return personFromIntroTokens(roster, tokens);
+}
+
+function outboundIntroAnswerer(leg, roster = rosterApi.getRoster()) {
+  if (!leg || leg.direction !== 'OUTBOUND') return null;
+  const texts = speakerTexts(leg, roster);
+  if (!texts || !texts.teamText) return null;
+  return personFromOutboundIntro(texts.teamText, roster);
 }
 
 function last10(value) {
@@ -1080,6 +1162,7 @@ module.exports = {
   transcriptIsSubstantive,
   callIsFragment,
   answererFromTranscript,
+  outboundIntroAnswerer,
   postingPlan,
   callIdVersion,
   uniqueExternalNumbers,
