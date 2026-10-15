@@ -1192,15 +1192,39 @@ function isRosterChainEntry(entry, book) {
 
 // A queue, DID, or other non-roster line in csrChain is not an answerer. It used
 // to block the transcript fallback while the sheet still showed unknown.
+function groupLooksInbound(groupKey) {
+            for (const id of conversationSpaceIdsFor(groupKey)) {
+                          const leg = legs.get(id);
+                          if (leg && leg.direction === 'INBOUND') return true;
+            }
+            return false;
+}
+
+// A queue or agent leg of an inbound call is often tagged OUTBOUND. The doc
+// still labels "This is Josh speaking" as Team Member on that leg's channel
+// map, then the old inbound-only check skipped the leg and the header stayed
+// unknown. Credit whoever that team-labeled channel introduces.
 function applyTranscriptAnswerers(groupKey) {
             const book = roster.getRoster();
+            const inboundGroup = groupLooksInbound(groupKey);
             for (const id of conversationSpaceIdsFor(groupKey)) {
                           const leg = legs.get(id);
                           if (!leg) continue;
                           if ((leg.csrChain || []).some((entry) => isRosterChainEntry(entry, book))) continue;
-                          const found = leg.direction === 'INBOUND'
-                            ? callParties.answererFromTranscript(leg, book)
-                            : (leg.direction === 'OUTBOUND' ? callParties.outboundIntroAnswerer(leg, book) : null);
+                          const outboundLegOfInbound = inboundGroup && leg.direction === 'OUTBOUND';
+                          let found = null;
+                          let source = 'transcript introduction';
+                          if (leg.direction === 'OUTBOUND' && !inboundGroup) {
+                                          found = callParties.outboundIntroAnswerer(leg, book);
+                                          source = 'outbound introduction';
+                          } else if (outboundLegOfInbound) {
+                                          found = callParties.teamChannelAnswerer(leg, book);
+                          } else if (leg.direction === 'INBOUND' || inboundGroup || !leg.direction) {
+                                          found = callParties.answererFromTranscript(
+                                            leg.direction ? leg : { ...leg, direction: 'INBOUND' },
+                                            book,
+                                          );
+                          }
                           if (!found) continue;
                           leg.csrChain = (leg.csrChain || []).filter((entry) => isRosterChainEntry(entry, book));
                           considerTeamMember(leg, {
@@ -1208,7 +1232,7 @@ function applyTranscriptAnswerers(groupKey) {
                                           extension: found.extension,
                                           answered: true,
                                           connected: true,
-                          }, { requireAnswered: false, source: leg.direction === 'OUTBOUND' ? 'outbound introduction' : 'transcript introduction' });
+                          }, { requireAnswered: false, source });
             }
 }
 
