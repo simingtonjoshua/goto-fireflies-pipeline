@@ -343,7 +343,18 @@ function setDirection(leg, direction, source) {
             }
 }
 
-function setExternalNumber(leg, number) {
+function rememberCallerNumber(leg, number) {
+            if (!leg || !number) return;
+            const book = roster.getRoster();
+            if (book.isSystemNumber(number) || book.extensionFrom(number)) return;
+            if (!roster.last10(number)) return;
+            leg.callerNumbers = leg.callerNumbers || [];
+            if (leg.callerNumbers.some((existing) => callParties.sameCustomer(existing, number))) return;
+            leg.callerNumbers.push(number);
+}
+
+function setExternalNumber(leg, number, options = {}) {
+            if (options.caller) rememberCallerNumber(leg, number);
             if (!number) return;
             const book = roster.getRoster();
             if (book.isSystemNumber(number) || book.extensionFrom(number)) return;
@@ -362,7 +373,7 @@ function historySource(teamMember) {
             return 'call history';
 }
 
-function applyHistory(leg, analysis) {
+function applyHistory(leg, analysis, options = {}) {
             const direction = leg.direction || analysis.legDirection;
             if (analysis.teamMember) {
                           considerTeamMember(leg, {
@@ -375,7 +386,12 @@ function applyHistory(leg, analysis) {
                           }, { requireAnswered: direction !== 'OUTBOUND', source: historySource(analysis.teamMember) });
             }
             setDirection(leg, analysis.legDirection, 'history');
-            setExternalNumber(leg, analysis.externalNumber);
+            const inboundCaller = analysis.legDirection === 'INBOUND';
+            if (options.setNumber === false) {
+                          if (inboundCaller) rememberCallerNumber(leg, analysis.externalNumber);
+            } else {
+                          setExternalNumber(leg, analysis.externalNumber, { caller: inboundCaller });
+            }
             if (!leg.externalName && analysis.externalName) leg.externalName = analysis.externalName;
             if (analysis.answered) {
                           leg.sawAnswer = true;
@@ -408,11 +424,19 @@ function flushPendingHistory(conversationSpaceId) {
                           const originator = originatorForConversation.get(conversationSpaceId);
                           const originMatch = analysis.originatorId && originator && analysis.originatorId === originator;
                           const numberMatch = historyMatchesLegByNumber(leg, analysis);
-                          if (!legMatch && !originMatch && !numberMatch) {
+                          const recovery = !legMatch && !originMatch && !numberMatch
+                            && matchingNumberlessInboundIds(analysis).length === 1
+                            && matchingNumberlessInboundIds(analysis)[0] === conversationSpaceId;
+                          if (!legMatch && !originMatch && !numberMatch && !recovery) {
                                           kept.push(item);
                                           continue;
                           }
+                          if (recovery) {
+                                          applyHistory(leg, analysis, { setNumber: false });
+                                          continue;
+                          }
                           if (analysis.externalNumber && leg.externalNumber && !callParties.sameCustomer(leg.externalNumber, analysis.externalNumber)) {
+                                          if (analysis.legDirection === 'INBOUND') rememberCallerNumber(leg, analysis.externalNumber);
                                           console.log(`REVIEW: parked call history does not match conversation ${conversationSpaceId}. Leaving it unmatched.`);
                                           kept.push(item);
                                           continue;
@@ -480,7 +504,7 @@ function indexLegId(leg, conversationSpaceId, id) {
 
 function recordLegState(conversationSpaceId, {
             legId, lines, participantLegIds, recordingOwners, externalConnected, externalName, externalNumber,
-            direction, directionSource, dialString, callCreated, callEnded, accountKey,
+            originatorNumber, direction, directionSource, dialString, callCreated, callEnded, accountKey,
             callIdVersion, expectedTranscriptIds,
 }) {
             if (!legs.has(conversationSpaceId) && wasRecentlyFinalized(conversationSpaceId)) {
@@ -520,6 +544,7 @@ function recordLegState(conversationSpaceId, {
             for (const id of participantLegIds || []) indexLegId(leg, conversationSpaceId, id);
             setDirection(leg, direction, directionSource || 'metadata');
             setExternalNumber(leg, externalNumber);
+            if (originatorNumber && leg.direction === 'INBOUND') rememberCallerNumber(leg, originatorNumber);
             if (externalName && !leg.externalName) leg.externalName = externalName;
             if (dialString) leg.dialString = dialString;
             if (callCreated) leg.callCreated = callCreated;
@@ -582,6 +607,38 @@ function historyMatchesLegByNumber(leg, analysis) {
             return true;
 }
 
+const INBOUND_CALLER_MATCH_MS = 3 * 60 * 1000;
+
+function historyStartMs(analysis) {
+            if (!analysis || !analysis.startTime) return null;
+            const ms = new Date(analysis.startTime).getTime();
+            return Number.isFinite(ms) ? ms : null;
+}
+
+// null when the history event has no start time to compare. false when it is a
+// different call. true when it falls in this leg's window.
+function legWindowMatchesHistory(leg, analysis) {
+            const startMs = historyStartMs(analysis);
+            if (startMs == null || !leg || !leg.callCreated) return null;
+            const created = new Date(leg.callCreated).getTime();
+            if (!Number.isFinite(created)) return null;
+            const ended = leg.callEnded ? new Date(leg.callEnded).getTime() : null;
+            if (ended != null && startMs >= created - 5000 && startMs <= ended + 60 * 1000) return true;
+            return Math.abs(startMs - created) <= INBOUND_CALLER_MATCH_MS;
+}
+
+function matchingNumberlessInboundIds(analysis) {
+            if (!analysis || analysis.legDirection !== 'INBOUND' || !analysis.externalNumber) return [];
+            const ids = [];
+            for (const [id, leg] of legs) {
+                          if (!leg || leg.externalNumber) continue;
+                          if (leg.direction && leg.direction !== 'INBOUND') continue;
+                          if (legWindowMatchesHistory(leg, analysis) === false) continue;
+                          ids.push(id);
+            }
+            return ids;
+}
+
 function findConversationForHistory(analysis) {
             if (analysis.legId && legIdToConversation.has(analysis.legId)) {
                           return { id: legIdToConversation.get(analysis.legId), join: 'legId' };
@@ -603,6 +660,8 @@ function findConversationForHistory(analysis) {
                           }
                           if (candidates.length === 1) return { id: candidates[0], join: 'customer-number' };
             }
+            const recovered = matchingNumberlessInboundIds(analysis);
+            if (recovered.length === 1) return { id: recovered[0], join: 'inbound-recovery' };
             return { id: null, join: 'none' };
 }
 
@@ -633,10 +692,16 @@ function recordCallHistoryEvent(payload) {
             const leg = getOrCreateLeg(conversationSpaceId);
             leg.conversationSpaceId = conversationSpaceId;
             if (analysis.externalNumber && leg.externalNumber && !callParties.sameCustomer(leg.externalNumber, analysis.externalNumber)) {
+                          if (analysis.legDirection === 'INBOUND') rememberCallerNumber(leg, analysis.externalNumber);
                           console.log(`REVIEW: call history for originator ${originatorId} does not match conversation ${conversationSpaceId}. Not attaching it and not reusing that number.`);
                           return;
             }
-            applyHistory(leg, analysis);
+            if (join === 'inbound-recovery') {
+                          console.log(`Inbound caller recovered from call history for conversation ${conversationSpaceId} (no call-state number).`);
+                          applyHistory(leg, analysis, { setNumber: false });
+            } else {
+                          applyHistory(leg, analysis);
+            }
             linkConversationToOriginator(conversationSpaceId, originatorId);
             flushPendingHistory(conversationSpaceId);
 }
@@ -835,6 +900,24 @@ function clearLegIndex(leg) {
             for (const extra of leg.extraLegIds || []) legIdToConversation.delete(extra);
 }
 
+function pendingCallerNumbersFor(legRecords) {
+            const found = [];
+            const inGroup = new Set((legRecords || []).map((leg) => leg.conversationSpaceId));
+            for (const item of pendingHistory) {
+                          const analysis = callParties.analyzeCallHistory(item.content, roster.getRoster());
+                          if (analysis.legDirection !== 'INBOUND' || !analysis.externalNumber) continue;
+                          const matched = (legRecords || []).filter((leg) => {
+                                          if (leg.direction && leg.direction !== 'INBOUND') return false;
+                                          return legWindowMatchesHistory(leg, analysis) !== false;
+                          });
+                          if (matched.length !== 1) continue;
+                          const others = matchingNumberlessInboundIds(analysis).filter((id) => !inGroup.has(id));
+                          if (others.length) continue;
+                          found.push(analysis.externalNumber);
+            }
+            return found;
+}
+
 function describeGroup(groupKey) {
             const conversationSpaceIds = [...conversationSpaceIdsFor(groupKey)];
             const legRecords = conversationSpaceIds
@@ -854,7 +937,7 @@ function describeGroup(groupKey) {
             }
 
             const numbers = callParties.uniqueExternalNumbers(legRecords.map((leg) => leg.externalNumber));
-            const externalConflict = legRecords.some((leg) => leg.externalConflict) || numbers.length > 1;
+            let externalConflict = legRecords.some((leg) => leg.externalConflict) || numbers.length > 1;
             const direction = legRecords.find((leg) => leg.direction)?.direction || null;
             const callCreated = legRecords.map((leg) => leg.callCreated).filter(Boolean).sort()[0];
             const callEnded = legRecords.map((leg) => leg.callEnded).filter(Boolean).sort().slice(-1)[0];
@@ -871,12 +954,32 @@ function describeGroup(groupKey) {
                           return true;
             });
 
+            let externalNumber = externalConflict ? null : (numbers[0] || null);
+            const substantive = legRecords.some((leg) => legIsSubstantive(leg));
+            // A direct DID or forwarded inbound often has no call-state caller.
+            // Call history and the STARTING originator still carried it. Post that
+            // number for a real conversation instead of leaving the note unsent.
+            // A greeting with no conversation keeps the missing-number review.
+            if (direction === 'INBOUND' && substantive) {
+                          const recovered = callParties.uniqueExternalNumbers(
+                            legRecords.flatMap((leg) => leg.callerNumbers || []).concat(pendingCallerNumbersFor(legRecords)),
+                          );
+                          if (recovered.length === 1 && (!externalNumber || externalConflict)) {
+                                          console.log(
+                                            `Inbound caller recovered for ${groupKey}: ${recovered[0]} `
+                                            + `(call-state ${externalConflict ? 'conflicted' : 'had no number'}).`,
+                                          );
+                                          externalNumber = recovered[0];
+                                          externalConflict = false;
+                          }
+            }
+
             return {
                           conversationSpaceIds,
                           legRecords,
                           csrChain,
                           csrPath: csrChain.map((entry) => `${entry.name || 'unknown'} (${entry.extension || 'unknown ext'})`),
-                          externalNumber: externalConflict ? null : (numbers[0] || null),
+                          externalNumber,
                           externalConflict,
                           externalName: legRecords.find((leg) => leg.externalName)?.externalName,
                           direction,
@@ -1080,19 +1183,32 @@ function buildTranscriptDocHtml({ externalName, externalNumber, direction, csrPa
 // are wrapped in their own try/catch and never throw out of this function - a
 // summarization, Drive, or Heymarket outage should never crash the webhook handler or
 // block cleanup of this interaction's in-memory state below.
+function isRosterChainEntry(entry, book) {
+            if (!entry) return false;
+            if (entry.extension && book.personByExtension(entry.extension)) return true;
+            if (entry.name && book.personByName(entry.name)) return true;
+            return false;
+}
+
+// A queue, DID, or other non-roster line in csrChain is not an answerer. It used
+// to block the transcript fallback while the sheet still showed unknown.
 function applyTranscriptAnswerers(groupKey) {
+            const book = roster.getRoster();
             for (const id of conversationSpaceIdsFor(groupKey)) {
                           const leg = legs.get(id);
-                          if (!leg || leg.direction !== 'INBOUND') continue;
-                          if ((leg.csrChain || []).some((entry) => entry.name || entry.extension)) continue;
-                          const found = callParties.answererFromTranscript(leg, roster.getRoster());
+                          if (!leg) continue;
+                          if ((leg.csrChain || []).some((entry) => isRosterChainEntry(entry, book))) continue;
+                          const found = leg.direction === 'INBOUND'
+                            ? callParties.answererFromTranscript(leg, book)
+                            : (leg.direction === 'OUTBOUND' ? callParties.outboundIntroAnswerer(leg, book) : null);
                           if (!found) continue;
+                          leg.csrChain = (leg.csrChain || []).filter((entry) => isRosterChainEntry(entry, book));
                           considerTeamMember(leg, {
                                           name: found.name,
                                           extension: found.extension,
                                           answered: true,
                                           connected: true,
-                          }, { requireAnswered: false, source: 'transcript introduction' });
+                          }, { requireAnswered: false, source: leg.direction === 'OUTBOUND' ? 'outbound introduction' : 'transcript introduction' });
             }
 }
 
@@ -1230,9 +1346,64 @@ async function finalizeInteraction(groupKey) {
             cleanupGroup(groupKey, conversationSpaceIds);
 }
 
+// recordingId -> { transcript, receivedAt }
+// A transcript notification can arrive before call-state has named its
+// conversationSpaceId. Parking it (instead of dropping it) lets the next
+// call-state event that mentions the recording attach it.
+const parkedOrphans = new Map();
+
+function openLegSnapshot() {
+            const open = [];
+            for (const [id, leg] of legs) {
+                          open.push({
+                                          id,
+                                          direction: leg.direction || null,
+                                          externalNumber: leg.externalNumber || null,
+                                          callCreated: leg.callCreated || null,
+                                          callEnded: leg.callEnded || null,
+                          });
+            }
+            return open;
+}
+
+function parkOrphanTranscript(recordingId, transcript) {
+            if (!recordingId) return;
+            const existing = parkedOrphans.get(recordingId) || { receivedAt: Date.now() };
+            existing.transcript = transcript;
+            parkedOrphans.set(recordingId, existing);
+            console.log(
+              `ORPHAN transcript parked recordingId=${recordingId} reason=no conversationSpaceId `
+              + `openLegs=${JSON.stringify(openLegSnapshot())}`,
+            );
+}
+
+function attachParkedOrphan(recordingId, conversationSpaceId) {
+            const parked = parkedOrphans.get(recordingId);
+            if (!parked || !parked.transcript || !conversationSpaceId) return false;
+            parkedOrphans.delete(recordingId);
+            const waitedMs = Date.now() - parked.receivedAt;
+            console.log(
+              `ORPHAN transcript attached recordingId=${recordingId} conversationSpaceId=${conversationSpaceId} waitedMs=${waitedMs}`,
+            );
+            recordTranscript(conversationSpaceId, recordingId, parked.transcript);
+            return true;
+}
+
+function abandonOrphan(recordingId) {
+            const parked = parkedOrphans.get(recordingId);
+            if (!parked) return false;
+            parkedOrphans.delete(recordingId);
+            console.log(
+              `ORPHAN transcript gave up recordingId=${recordingId} waitedMs=${Date.now() - parked.receivedAt} `
+              + `reason=still no conversationSpaceId openLegs=${JSON.stringify(openLegSnapshot())}`,
+            );
+            return true;
+}
+
 function resetForTests() {
             for (const timer of closeTimers.values()) clearTimeout(timer);
             closeTimers.clear();
+            parkedOrphans.clear();
             audioUploader = null;
             legs.clear();
             legIdToConversation.clear();
@@ -1273,4 +1444,8 @@ module.exports = {
             resetForTests,
             peekLeg,
             applyTranscriptAnswerers,
+            describeForTests: describeGroup,
+            parkOrphanTranscript,
+            attachParkedOrphan,
+            abandonOrphan,
 };
