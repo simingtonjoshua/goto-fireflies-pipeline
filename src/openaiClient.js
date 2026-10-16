@@ -425,6 +425,18 @@ function teamMemberNameForUtterance(csrChain, leg, utterance) {
   return active.name;
 }
 
+// "Josh?" on a vendor menu is the person who placed the outbound call, not a customer.
+function chainClaimsSpokenName(csrChain, text) {
+  const spoken = String(text || '').trim().replace(/[?.!,]+$/g, '').toLowerCase();
+  if (!spoken || /\s/.test(spoken)) return false;
+  return (csrChain || []).some((entry) => {
+    const first = String(entry.name || '').trim().split(/\s+/)[0].toLowerCase();
+    if (!first) return false;
+    if (first === spoken) return true;
+    return first === 'joshua' && spoken === 'josh';
+  });
+}
+
 // Labels start from GoTo's channel and participant data (callParties.channelRole).
 // A team self-introduction that contradicts that map corrects the whole channel
 // (callParties.channelRolesForLeg). Talk order is not a role. A known greeting,
@@ -453,7 +465,10 @@ function formatLegTranscript(leg) {
       ? assignment.roles[Number(u.channel)]
       : callParties.channelRole(u.channel, leg);
     let label;
-    if (role === 'team') {
+    const loneName = role === 'customer'
+      && leg.direction === 'OUTBOUND'
+      && chainClaimsSpokenName(csrChain, u.text);
+    if (role === 'team' || loneName) {
       label = teamMemberNameForUtterance(csrChain, leg, u) || 'Team Member';
     } else if (role === 'customer') {
       label = 'Customer';

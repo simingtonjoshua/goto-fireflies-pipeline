@@ -391,8 +391,15 @@ function findExtraSpans(text, blocked, bounds) {
         if (!validExpirationDigits(digits)) continue;
         const start = slice[0].start;
         const end = slice[slice.length - 1].end;
-        if (!looseContext(start) || isProtectedNumber(text, start, end)) continue;
+        // "seven twenty eight or eight" beside "he left his card" is a quantity.
+        // A spoken expiration needs an expiration word or a real card number,
+        // not the word "card" on the next line.
         const after = text.slice(end, end + 16);
+        if (/^\s+or\b/i.test(after)) continue;
+        const spokenContext = nearAny(start, expWords, 80)
+          || cardNearby(start)
+          || around(start, 'exp');
+        if (!spokenContext || isProtectedNumber(text, start, end)) continue;
         if (/^\s*(?:dollars?|bucks|percent)\b/i.test(after)) continue;
         if (!best || (end - start) > (best.end - best.start)) best = { start, end, token: '[REDACTED-EXP]' };
       }

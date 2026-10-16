@@ -69,6 +69,19 @@ const ALWAYS_SYSTEM = [
   /\byou have reached the\b/i,
   /\bdedicated support line\b/i,
   /\byour call may be monitored\b/i,
+  /\bthis call may be monitored\b/i,
+  /\bour team is currently in training\b/i,
+  /\bback on the phones\b/i,
+  /\bto avoid waiting on hold\b/i,
+  /\bplease select the callback\b/i,
+  /\bwe will call you back\b/i,
+  /\bwe appreciate your patience\b/i,
+  /\bto check the status of an order\b/i,
+  /\bfor customer and technical support\b/i,
+  /\bfor warranty support\b/i,
+  /\bto place a (?:new|parts) order\b/i,
+  /\bthe system will automatically disconnect\b/i,
+  /\bschedule your callback\b/i,
   /\bplease do not hang up\b/i,
   /\bplease state your name after the tone\b/i,
   /\bnumber we will call you back\b/i,
@@ -681,6 +694,12 @@ const TEAM_I_AM_AT_BUSINESS = new RegExp(
   'i',
 );
 const TEAM_I_AM_WITH_BUSINESS = new RegExp(`\\b(?:i'm|i am)\\s+with\\s+${BUSINESS_NAME}\\b`, 'i');
+// "it's Josh with budget blinds and Sacramento" — our rep calling another franchise.
+// "it's a great day" is not a name (NOT_A_PERSON_NAME).
+const TEAM_ITS_NAME_AT_BUSINESS = new RegExp(
+  `\\bit(?:'s| is)\\s+(?!${NOT_A_PERSON_NAME}\\b)[A-Za-z][A-Za-z']+(?:\\s+[A-Za-z][A-Za-z']+){0,2}\\s+(?:over\\s+at|at|with|from)\\s+${BUSINESS_NAME}\\b`,
+  'i',
+);
 // "calling on behalf of", "giving a call on behalf of", "giving you a call from",
 // "reaching out on behalf of", "calling from", and the same frames with the business name.
 const TEAM_ON_BEHALF = new RegExp(
@@ -731,6 +750,7 @@ function textHasTeamSelfIdentification(text, leg, roster) {
   const value = String(text || '');
   if (!value.trim()) return false;
   if (TEAM_SELF_ID_AT_BUSINESS.test(value)) return true;
+  if (TEAM_ITS_NAME_AT_BUSINESS.test(value)) return true;
   if (TEAM_I_AM_AT_BUSINESS.test(value)) return true;
   if (TEAM_I_AM_WITH_BUSINESS.test(value)) return true;
   if (TEAM_ON_BEHALF.test(value)) return true;
@@ -805,13 +825,29 @@ function channelRolesForLeg(utterances, leg, roster = rosterApi.getRoster()) {
   const roles = {};
   for (const channel of present) roles[channel] = channelRole(channel, leg || {});
 
-  const signalChannels = present.filter((channel) => {
+  let signalChannels = present.filter((channel) => {
     const text = (utterances || [])
       .filter((utterance) => Number(utterance.channel) === channel && utteranceCanProveTeamChannel(utterance.text, roster))
       .map((utterance) => utterance.text)
       .join(' ');
     return textHasTeamSelfIdentification(text, leg || {}, roster);
   });
+  // Both sides can say "Budget Blinds" when one franchise calls another.
+  // The channel that names the person who placed the call stays the team side.
+  if (signalChannels.length > 1) {
+    const credited = teamIntroNames(leg || {});
+    const named = signalChannels.filter((channel) => {
+      const text = (utterances || [])
+        .filter((utterance) => Number(utterance.channel) === channel)
+        .map((utterance) => utterance.text)
+        .join(' ');
+      return credited.some((name) => new RegExp(
+        `\\b(?:this is|i'm|i am|my name is|it(?:'s| is))\\s+${escapeRegExp(name)}\\b`,
+        'i',
+      ).test(text));
+    });
+    if (named.length === 1) signalChannels = named;
+  }
   if (signalChannels.length === 1) {
     const teamChannel = signalChannels[0];
     const current = roles[teamChannel];
@@ -908,16 +944,23 @@ function personFromIntroTokens(roster, tokens) {
 }
 
 function statedRosterPerson(text, roster) {
-  const tokens = [];
+  // The earliest live introduction wins. A later "this is Emily" must not
+  // erase "This is Josh speaking" by making the whole call ambiguous.
+  let best = null;
   for (const name of rosterIntroNames(roster)) {
     const escaped = escapeRegExp(name);
     const pattern = new RegExp(
       `\\b(?:this is|i'm|i am)\\s+${escaped}\\b|\\b${escaped}\\s+speaking\\b`,
-      'i',
+      'ig',
     );
-    if (pattern.test(text)) tokens.push(name);
+    let match = pattern.exec(text);
+    while (match) {
+      if (!best || match.index < best.index) best = { index: match.index, name };
+      match = pattern.exec(text);
+    }
   }
-  return personFromIntroTokens(roster, tokens);
+  if (!best) return null;
+  return personFromIntroTokens(roster, [best.name]);
 }
 
 function askedRosterPerson(text, roster) {
@@ -958,10 +1001,10 @@ function speakerTexts(leg, roster) {
   return { teamText: textFor('team'), customerText: textFor('customer') };
 }
 
-// Used only when call history and call-state never named an inbound answerer.
-// Reads the team channel after the same channel correction the transcript uses.
-function answererFromTranscript(leg, roster = rosterApi.getRoster()) {
-  if (!leg || leg.direction !== 'INBOUND') return null;
+// The person speaking on the channel the doc labels as the team side.
+// Does not require the leg's own direction: a queue leg of an inbound call is
+// often tagged OUTBOUND, and that tag used to skip this match entirely.
+function teamChannelAnswerer(leg, roster = rosterApi.getRoster()) {
   const texts = speakerTexts(leg, roster);
   if (!texts) return null;
   const stated = statedRosterPerson(texts.teamText, roster);
@@ -969,6 +1012,14 @@ function answererFromTranscript(leg, roster = rosterApi.getRoster()) {
   const asked = askedRosterPerson(texts.customerText, roster);
   if (asked && CONFIRM_ME.test(texts.teamText)) return asked;
   return null;
+}
+
+// Used only when call history and call-state never named an inbound answerer.
+// Reads the team channel after the same channel correction the transcript uses.
+function answererFromTranscript(leg, roster = rosterApi.getRoster()) {
+  if (!leg || (leg.direction && leg.direction !== 'INBOUND')) return null;
+  const asInbound = leg.direction ? leg : { ...leg, direction: 'INBOUND' };
+  return teamChannelAnswerer(asInbound, roster);
 }
 
 // "my name is Emily ... on behalf of Budget Blinds" / "this is Emily with Budget Blinds".
@@ -1055,7 +1106,19 @@ function postingPlan({
   recent = null,
 }) {
   if (externalConflict) return { action: 'review', reason: 'conflicting external numbers' };
-  if (!externalNumber) return { action: 'review', reason: 'missing external number' };
+  if (!externalNumber) {
+    // A one-minute answered inbound often ends before call history delivers the
+    // caller id. Hold, using the same 3-minute backstop as transcripts, so the
+    // number can still land on the first note. A hours-only greeting is not
+    // substantive and still closes without a number.
+    if (direction === 'INBOUND' && substantive && callEnded) {
+      const age = now - new Date(callEnded).getTime();
+      if (Number.isFinite(age) && age >= 0 && age < 3 * 60 * 1000) {
+        return { action: 'hold', reason: 'waiting for inbound caller number' };
+      }
+    }
+    return { action: 'review', reason: 'missing external number' };
+  }
 
   const sameCall = (other) => other
     && other.direction === direction
@@ -1162,6 +1225,7 @@ module.exports = {
   transcriptIsSubstantive,
   callIsFragment,
   answererFromTranscript,
+  teamChannelAnswerer,
   outboundIntroAnswerer,
   postingPlan,
   callIdVersion,

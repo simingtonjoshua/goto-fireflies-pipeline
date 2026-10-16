@@ -170,6 +170,17 @@ describe('card redaction', () => {
     assert.equal(textOf(again).includes('123'), false);
   });
 
+  it('does not mask a spoken quantity beside he left his card', () => {
+    const result = cardRedact.redactTranscript({
+      results: [
+        { transcript: 'I is seven twenty eight or eight.', channel: 0 },
+        { transcript: 'He left his card and information at my front door.', channel: 0 },
+      ],
+    });
+    assert.equal(textOf(result), 'I is seven twenty eight or eight.\nHe left his card and information at my front door.');
+    assert.equal(result.masked, false);
+  });
+
   it('leaves zip codes, prices, appointment times, and phone numbers visible', () => {
     const cases = [
       'zip code 95670',

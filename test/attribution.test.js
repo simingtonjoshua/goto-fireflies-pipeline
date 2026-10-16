@@ -1851,3 +1851,161 @@ describe('parked orphan transcripts', () => {
     assert.equal(interactions.attachParkedOrphan('rec-michelle', 'conv-late'), false);
   });
 });
+
+describe('Oct 15 inbound answerer on an outbound-tagged leg', () => {
+  beforeEach(() => interactions.resetForTests());
+  after(() => interactions.resetForTests());
+
+  it('credits Josh when the recording leg is tagged outbound and the call is inbound', () => {
+    interactions.recordLegState('conv-in-1056', {
+      legId: 'leg-in-1056',
+      lines: [],
+      direction: 'INBOUND',
+      directionSource: 'metadata',
+      externalNumber: '9165051285',
+      callCreated: '2026-10-15T17:56:00.000Z',
+      callEnded: '2026-10-15T18:02:00.000Z',
+    });
+    interactions.recordLegState('conv-agent-1056', {
+      legId: 'leg-agent-1056',
+      lines: [],
+      direction: 'OUTBOUND',
+      directionSource: 'metadata',
+      callCreated: '2026-10-15T17:56:05.000Z',
+      callEnded: '2026-10-15T18:02:00.000Z',
+    });
+    interactions.recordTranscript('conv-agent-1056', 'rec-1056', {
+      results: [
+        { transcript: 'Please note that your call may be recorded for quality assurance or training purposes.', channel: 1, startTimeMs: 0 },
+        { transcript: "It's a great day here at Budget Blinds.", channel: 1, startTimeMs: 7000 },
+        { transcript: 'This is Josh speaking. How can I help you?', channel: 0, startTimeMs: 12000 },
+        { transcript: 'Hi Josh, how are you?', channel: 1, startTimeMs: 14000 },
+      ],
+    });
+    interactions.recordCallHistoryEvent({ content: { originatorId: 'orig-1056', legId: 'leg-in-1056', direction: 'INBOUND' } });
+    interactions.recordCallHistoryEvent({ content: { originatorId: 'orig-1056', legId: 'leg-agent-1056', direction: 'OUTBOUND' } });
+    interactions.applyTranscriptAnswerers('orig-1056');
+    const described = interactions.describeForTests('orig-1056');
+    assert.equal(described.direction, 'INBOUND');
+    assert.deepEqual(described.csrPath, ['Joshua Simington (00003)']);
+    const rows = openaiClient.formatLegTranscript(described.legRecords.find((leg) => leg.transcript));
+    assert.match(rows.map((row) => `${row.label}: ${row.text}`).join('\n'), /Joshua Simington: This is Josh speaking/);
+  });
+
+  it('leaves an unnamed hold request unknown on that same outbound-tagged leg', () => {
+    interactions.recordLegState('conv-in-hold', {
+      legId: 'leg-in-hold',
+      lines: [],
+      direction: 'INBOUND',
+      directionSource: 'metadata',
+      callCreated: '2026-10-15T16:01:00.000Z',
+    });
+    interactions.recordLegState('conv-agent-hold', {
+      legId: 'leg-agent-hold',
+      lines: [],
+      direction: 'OUTBOUND',
+      directionSource: 'metadata',
+      callCreated: '2026-10-15T16:01:05.000Z',
+    });
+    interactions.recordTranscript('conv-agent-hold', 'rec-hold', {
+      results: [
+        { transcript: 'Budget Blinds, can you please hold?', channel: 0, startTimeMs: 0 },
+        { transcript: 'Okay, thanks.', channel: 1, startTimeMs: 2000 },
+      ],
+    });
+    interactions.recordCallHistoryEvent({ content: { originatorId: 'orig-hold', legId: 'leg-in-hold', direction: 'INBOUND' } });
+    interactions.recordCallHistoryEvent({ content: { originatorId: 'orig-hold', legId: 'leg-agent-hold', direction: 'OUTBOUND' } });
+    interactions.applyTranscriptAnswerers('orig-hold');
+    const described = interactions.describeForTests('orig-hold');
+    assert.deepEqual(described.csrPath, []);
+  });
+});
+
+describe('Oct 15 franchisee speaker swap', () => {
+  it('keeps our Josh on the team side when the other franchise answers', () => {
+    const rows = openaiClient.formatLegTranscript({
+      direction: 'OUTBOUND',
+      csrChain: [{ name: 'Joshua Simington', extension: '00003' }],
+      transcript: {
+        results: [
+          { transcript: 'Good morning budget blinds.', channel: 0, startTimeMs: 0 },
+          { transcript: 'This is Leigh T.', channel: 0, startTimeMs: 1000 },
+          { transcript: "Hey, ladies, it's Josh with budget blinds and Sacramento.", channel: 1, startTimeMs: 3000 },
+          { transcript: 'How are you doing?', channel: 1, startTimeMs: 5000 },
+          { transcript: "Hey Josh, I'm good.", channel: 0, startTimeMs: 6000 },
+        ],
+      },
+    });
+    const labeled = rows.map((row) => `${row.label}: ${row.text}`);
+    assert.match(labeled[0], /^Customer: Good morning budget blinds/);
+    assert.match(labeled[1], /^Customer: This is Leigh T/);
+    assert.match(labeled[2], /^Joshua Simington: Hey, ladies, it's Josh with budget blinds/);
+    assert.match(labeled[4], /^Customer: Hey Josh, I'm good/);
+  });
+});
+
+describe('Oct 15 short inbound caller number', () => {
+  const ended = '2026-10-15T16:02:00.000Z';
+  const justAfter = new Date('2026-10-15T16:02:30.000Z').getTime();
+  const later = new Date('2026-10-15T16:06:00.000Z').getTime();
+
+  it('holds a substantive inbound with no number and reviews a hours greeting immediately', () => {
+    const held = callParties.postingPlan({
+      externalNumber: null,
+      direction: 'INBOUND',
+      substantive: true,
+      callEnded: ended,
+      now: justAfter,
+    });
+    assert.equal(held.action, 'hold');
+    assert.match(held.reason, /caller number/);
+
+    const gaveUp = callParties.postingPlan({
+      externalNumber: null,
+      direction: 'INBOUND',
+      substantive: true,
+      callEnded: ended,
+      now: later,
+    });
+    assert.equal(gaveUp.action, 'review');
+
+    const greeting = callParties.postingPlan({
+      externalNumber: null,
+      direction: 'INBOUND',
+      substantive: false,
+      callEnded: ended,
+      now: justAfter,
+    });
+    assert.equal(greeting.action, 'review');
+  });
+});
+
+describe('Oct 15 vendor menu labels', () => {
+  it('labels the Hunter Douglas training menu as a recording, and Josh\'s name as Joshua', () => {
+    const rows = openaiClient.formatLegTranscript({
+      direction: 'OUTBOUND',
+      csrChain: [{ name: 'Joshua Simington', extension: '00003' }],
+      transcript: {
+        results: [
+          { transcript: 'Thank you for calling Hunter Douglas.', channel: 0, startTimeMs: 0 },
+          { transcript: 'Our team is currently in training', channel: 0, startTimeMs: 2000 },
+          { transcript: 'and will be back on the phones at the top of the hour.', channel: 0, startTimeMs: 3000 },
+          { transcript: 'To avoid waiting on hold,', channel: 0, startTimeMs: 7000 },
+          { transcript: 'please select the callback option', channel: 0, startTimeMs: 9000 },
+          { transcript: 'The system will automatically disconnect this call to schedule', channel: 0, startTimeMs: 91000 },
+          { transcript: 'Josh?', channel: 1, startTimeMs: 71000 },
+        ],
+      },
+    });
+    const labels = rows.map((row) => `${row.label}: ${row.text.slice(0, 24)}`);
+    assert.deepEqual(labels, [
+      'Recording: Thank you for calling Hu',
+      'Recording: Our team is currently in',
+      'Recording: and will be back on the ',
+      'Recording: To avoid waiting on hold',
+      'Recording: please select the callba',
+      'Joshua Simington: Josh?',
+      'Recording: The system will automati',
+    ]);
+  });
+});
