@@ -18,6 +18,7 @@ const feedbackMonitor = require('./feedbackMonitor');
 const callParties = require('./callParties');
 const roster = require('./roster');
 const { requireAdmin, warnIfAdminOpen } = require('./adminAuth');
+const { healthPayload } = require('./health');
 const { listAccountUsers } = require('./gotoClient');
 
 const app = express();
@@ -635,10 +636,19 @@ res.status(500).json({ error: err.message });
 }
 });
 
-app.get('/healthz', (req, res) => res.json({ ok: true }));
+app.get('/healthz', (req, res) => res.json(healthPayload()));
 
 const port = process.env.PORT || 3001;
 app.listen(port, () => {
+  const book = roster.getRoster();
+  const extensions = book.byExtension ? book.byExtension.size : 0;
+  const source = process.env.TEAM_ROSTER_JSON
+    ? 'TEAM_ROSTER_JSON'
+    : (process.env.TEAM_ROSTER_PATH || 'config/team-roster.json');
   console.log(`GoTo Call Notes listening on :${port}`);
+  console.log(`Roster: ${extensions} extensions from ${source}.`);
+  if (!extensions) {
+    console.error('Roster is empty. A transcript introduction cannot be matched to a team member, so inbound Team Member(s) stays unknown.');
+  }
   warnIfAdminOpen();
 });

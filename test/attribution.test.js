@@ -2009,3 +2009,247 @@ describe('Oct 15 vendor menu labels', () => {
     ]);
   });
 });
+
+describe('Oct 19 inbound answerer on the live transcript shape', () => {
+  const book = roster.createRoster(ROSTER_CONFIG, [OFFICE]);
+
+  beforeEach(() => {
+    interactions.resetForTests();
+    roster.setRosterForTests(book);
+  });
+
+  after(() => {
+    interactions.resetForTests();
+    roster.resetRosterForTests();
+  });
+
+  // GoTo transcription JSON, the shape fetchTranscript returns and recordTranscript stores.
+  // Channel 1 is the inbound team side (what the caller heard). Channel 0 is the caller.
+  function liveGoto(lines, teamChannel) {
+    const customerChannel = teamChannel === 0 ? 1 : 0;
+    return {
+      version: '1.0.0',
+      results: lines.map(([seconds, role, text]) => ({
+        type: 'utterances',
+        transcript: text,
+        final: true,
+        startTimeMs: seconds * 1000,
+        endTimeMs: seconds * 1000 + 800,
+        channel: role === 'customer' ? customerChannel : teamChannel,
+        languageCode: 'en-US',
+      })),
+    };
+  }
+
+  function play(id, lines, teamChannel, extra = {}) {
+    interactions.recordLegState(id, {
+      legId: `leg-${id}`,
+      lines: [],
+      participantLegIds: [`leg-${id}`],
+      direction: 'INBOUND',
+      directionSource: 'metadata',
+      externalNumber: extra.externalNumber || '9166285645',
+      externalName: extra.externalName || 'MARIA FERGUSON',
+      callCreated: extra.callCreated || '2026-10-19T19:08:00.000Z',
+      callEnded: extra.callEnded || '2026-10-19T19:09:00.000Z',
+    });
+    interactions.recordTranscript(id, `rec-${id}`, liveGoto(lines, teamChannel));
+    interactions.applyTranscriptAnswerers(id);
+    const described = interactions.describeForTests(id);
+    const leg = described.legRecords.find((entry) => entry.transcript);
+    return {
+      described,
+      rows: openaiClient.formatLegTranscript(leg),
+    };
+  }
+
+  // 12:08 PM PT IN (916) 628-5645. The Drive doc labeled the intro "Team Member"
+  // and the header unknown. With the roster file loaded, the same utterances credit Joshua.
+  const maria = [
+    [0, 'team', 'Please note that your call may be recorded for quality assurance or training purposes.'],
+    [9, 'team', "It's a great day here at Budget Blinds."],
+    [11, 'team', "This is Josh speaking. I'm going to help you."],
+    [13, 'customer', 'Hey, Josh, I think that was you that I spoke with earlier.'],
+    [16, 'team', 'Yes, Maria. And I think actually'],
+    [19, 'team', 'your daughter had called in Nicole, correct?'],
+    [22, 'customer', 'Yes, yes.'],
+    [23, 'team', 'Okay. I think she'],
+    [23, 'customer', 'I was just going to say,'],
+    [24, 'team', 'called in. She got you all set up actually with an appointment. You guys are on the schedule'],
+    [28, 'team', 'for the 21st with an arrival time between 2.30 and 3.'],
+    [34, 'customer', "yeah, that's what she told me."],
+    [35, 'customer', "That's why I was calling you."],
+    [37, 'customer', "I didn't watch."],
+    [37, 'team', 'Yeah, my colleague is the one who...'],
+    [39, 'team', 'who intercepted that part of the call.'],
+    [41, 'team', "So I didn't hear that."],
+    [42, 'team', 'I was just returning the call'],
+    [43, 'team', 'as I had promised 30 minutes later.'],
+    [46, 'team', 'So, but my colleague just let me know'],
+    [48, 'team', 'that she got you guys all on the calendar.'],
+    [50, 'team', 'And we look forward to seeing you on the 21st.'],
+    [53, 'customer', 'Well, there you go. We were both trying to be polite, and I called you just as a courtesy'],
+    [56, 'team', 'Well, I appreciate you letting me know here, Maria.'],
+    [58, 'customer', 'call to say, well, my daughter has it all set up. Here you go, ladies.'],
+    [65, 'team', 'You have a wonderful day'],
+    [67, 'team', 'and we look forward to seeing you soon.'],
+    [69, 'team', 'Thank you.'],
+    [69, 'customer', 'Alrighty, thank you so much. You have a great day. Bye.'],
+    [71, 'team', 'Take care.'],
+  ];
+
+  // 4:16 PM PT IN (510) 220-7533.
+  const usher = [
+    [0, 'team', 'Please note that your call may be recorded for quality assurance or training purposes.'],
+    [6, 'team', "It's a great day here at Budget Blind."],
+    [9, 'team', "It's Josh speaking."],
+    [11, 'customer', 'Hi Josh, my last name is Usher.'],
+    [14, 'customer', 'I had an appointment with Heather tomorrow at 11.30,'],
+    [17, 'customer', "and I'd like to cancel."],
+    [19, 'team', 'Yeah, can I ask the reason for cancellation, Mr. Asher?'],
+    [22, 'customer', 'I just made different choices,'],
+    [24, 'team', "Yeah, so you've already completed the window treatment"],
+    [25, 'team', 'project elsewhere.'],
+    [27, 'customer', 'I believe so.'],
+    [28, 'team', 'OK.'],
+    [29, 'team', "We'd love an opportunity to provide you an estimate"],
+    [31, 'team', 'or highly rated in the area.'],
+    [33, 'team', 'So if you wanted to end up getting back on our schedule,'],
+    [35, 'team', 'just please reach out.'],
+    [36, 'team', "And we'd be more than happy to provide an estimate."],
+    [39, 'customer', 'I appreciate that. Thank you so much, Josh.'],
+    [40, 'team', 'You have a great day.'],
+    [42, 'customer', 'You too. Be well.'],
+  ];
+
+  it('credits Joshua from the Oct 19 docs when the roster file is loaded', () => {
+    const noon = play('conv-1019-1208', maria, 1);
+    assert.deepEqual(noon.described.csrPath, ['Joshua Simington (00003)']);
+    assert.equal(noon.described.teamMemberSource, 'transcript introduction');
+    const noonText = noon.rows.map((row) => `[${row.seconds}s] ${row.label}: ${row.text}`).join('\n');
+    assert.match(noonText, /\[9s\] Recording: It's a great day here at Budget Blinds\./);
+    assert.match(noonText, /\[11s\] Joshua Simington: This is Josh speaking\. I'm going to help you\./);
+
+    const flipped = play('conv-1019-1208-ch0', maria, 0);
+    assert.deepEqual(flipped.described.csrPath, ['Joshua Simington (00003)']);
+    assert.match(
+      flipped.rows.map((row) => `[${row.seconds}s] ${row.label}: ${row.text}`).join('\n'),
+      /\[11s\] Joshua Simington: This is Josh speaking/,
+    );
+
+    const afternoon = play('conv-1019-1616', usher, 1, {
+      externalNumber: '5102207533',
+      externalName: 'EMON USHER',
+      callCreated: '2026-10-19T23:16:00.000Z',
+      callEnded: '2026-10-19T23:17:00.000Z',
+    });
+    assert.deepEqual(afternoon.described.csrPath, ['Joshua Simington (00003)']);
+    assert.match(
+      afternoon.rows.map((row) => `[${row.seconds}s] ${row.label}: ${row.text}`).join('\n'),
+      /\[9s\] Joshua Simington: It's Josh speaking\./,
+    );
+  });
+
+  it('reproduces the Oct 19 unknown header when the roster is empty, as in the Docker image', () => {
+    roster.setRosterForTests(roster.createRoster({ people: [] }));
+    const played = play('conv-1019-empty-roster', maria, 1);
+    assert.deepEqual(played.described.csrPath, []);
+    assert.equal(played.described.teamMemberSource, 'none');
+    const text = played.rows.map((row) => `[${row.seconds}s] ${row.label}: ${row.text}`).join('\n');
+    assert.match(text, /\[9s\] Recording: It's a great day here at Budget Blinds\./);
+    assert.match(text, /\[11s\] Team Member: This is Josh speaking\. I'm going to help you\./);
+    assert.equal(text.includes('Joshua Simington'), false);
+  });
+
+  it('ships the roster file in the image the server actually runs', () => {
+    roster.resetRosterForTests();
+    assert.equal(roster.getRoster().personByExtension('00003').name, 'Joshua Simington');
+    assert.equal(roster.getRoster().firstNames.includes('Josh'), true);
+    const docker = fs.readFileSync(path.join(__dirname, '..', 'Dockerfile'), 'utf8');
+    assert.match(docker, /COPY config \.\/config/);
+  });
+});
+
+describe('Oct 19 recordings mislabeled as people', () => {
+  it('labels the queue continuation, the IVR tagline, and the carrier mailbox as recordings', () => {
+    const queue = openaiClient.formatLegTranscript({
+      direction: 'INBOUND',
+      csrChain: [],
+      transcript: {
+        results: [
+          { transcript: 'Please note that your call may be recorded for quality assurance or training purposes.', channel: 1, startTimeMs: 0 },
+          { transcript: 'Thank you for calling Budget Blinds.', channel: 1, startTimeMs: 25000 },
+          { transcript: 'We are currently assisting other callers.', channel: 1, startTimeMs: 28000 },
+          { transcript: 'However, your call is very important to us.', channel: 1, startTimeMs: 30000 },
+          { transcript: 'Please stay on the line.', channel: 1, startTimeMs: 32000 },
+        ],
+      },
+    });
+    assert.deepEqual(queue.map((row) => row.label), ['Recording', 'Recording', 'Recording', 'Recording', 'Recording']);
+
+    const ivr = openaiClient.formatLegTranscript({
+      direction: 'INBOUND',
+      csrChain: [],
+      transcript: {
+        results: [
+          { transcript: 'Thank you for calling Budget Blinds.', channel: 1, startTimeMs: 0 },
+          { transcript: 'The best in custom blinds, shades, shutters, drapes and more.', channel: 1, startTimeMs: 2000 },
+          { transcript: "It's a great day here.", channel: 1, startTimeMs: 40000 },
+          { transcript: "That's a great day here, budget blind.", channel: 1, startTimeMs: 8000 },
+          { transcript: 'Blimey speaking, can I start?', channel: 1, startTimeMs: 41000 },
+        ],
+      },
+    });
+    assert.deepEqual(ivr.map((row) => row.label), ['Recording', 'Recording', 'Recording', 'Recording', 'Team Member']);
+
+    const mailbox = openaiClient.formatLegTranscript({
+      direction: 'OUTBOUND',
+      csrChain: [{ name: 'Joshua Simington', extension: '00003' }],
+      transcript: {
+        results: [
+          { transcript: 'Your call has been forwarded to an automated voice messaging system.', channel: 0, startTimeMs: 0 },
+          { transcript: 'is not available.', channel: 0, startTimeMs: 15000 },
+          { transcript: 'The mailbox is full and cannot accept any messages at this time.', channel: 0, startTimeMs: 19000 },
+          { transcript: 'Goodbye.', channel: 0, startTimeMs: 22000 },
+        ],
+      },
+    });
+    assert.deepEqual(mailbox.map((row) => `${row.label}: ${row.text}`), [
+      'Recording: Your call has been forwarded to an automated voice messaging system.',
+      'Recording: is not available.',
+      'Recording: The mailbox is full and cannot accept any messages at this time.',
+      'Joshua Simington: Goodbye.',
+    ]);
+  });
+});
+
+describe('Oct 19 caller name in the summary prompt', () => {
+  it('tells the model to keep a confirmed caller and not a designer mentioned in passing', () => {
+    const built = openaiClient.buildSummaryMessages({
+      legRecords: [{
+        direction: 'INBOUND',
+        csrChain: [],
+        callCreated: '2026-10-19T17:16:00.000Z',
+        transcript: {
+          results: [
+            { transcript: 'Okay, is this Rick?', channel: 1, startTimeMs: 64000 },
+            { transcript: 'yes it is.', channel: 0, startTimeMs: 66000 },
+          ],
+        },
+      }],
+      csrPath: [],
+      externalName: 'RICHARD BROWN',
+      externalNumber: '5309067201',
+      direction: 'INBOUND',
+      callCreated: '2026-10-19T17:16:00.000Z',
+      callEnded: '2026-10-19T17:18:00.000Z',
+      answered: null,
+    });
+    assert.match(built.system, /is this Rick/);
+    assert.match(built.system, /yes it is/);
+    assert.match(built.system, /RICHARD BROWN/);
+    assert.match(built.system, /Heather/);
+    assert.match(built.system, /appointment with Heather/);
+    assert.match(built.user, /RICHARD BROWN/);
+  });
+});
