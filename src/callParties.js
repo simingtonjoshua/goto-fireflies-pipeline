@@ -46,7 +46,13 @@ const ALWAYS_SYSTEM = [
   /please leave a (message|voicemail)/i,
   /hi there,\s+this is josh\b/i,
   /your call has been forwarded to voicemail/i,
-  /forwarded to an automatic voice message system/i,
+  /forwarded to an automat(?:ic|ed) voice messag(?:e|ing) system/i,
+  /\bmailbox is full\b/i,
+  /\bcannot accept any messages\b/i,
+  /^\s*is not available[.!]?\s*$/i,
+  /\byour call is (?:very )?important to us\b/i,
+  /\bplease stay on the line\b/i,
+  /\bbest in custom blinds\b/i,
   /the person you(?:['’]re| are) trying to reach is not available/i,
   /at the tone, please record your message/i,
   /no call parked/i,
@@ -89,7 +95,8 @@ const ALWAYS_SYSTEM = [
 
 const SCRIPT_UNLESS_LIVE = [
   /\bthank you for calling\b/i,
-  /\bit'?s a (great|good) day here at\b/i,
+  /\bit'?s a (?:great|good) day here\b/i,
+  /\bthat'?s a (?:great|good) day here\b/i,
 ];
 
 const SIBLING_WINDOW_MS = 2 * 60 * 1000;
@@ -162,7 +169,7 @@ function isSystemRecordingUtterance(text, roster) {
 }
 
 function systemRecordingPromptLine() {
-  return 'System recordings (never a live person, even if a name is spoken): the "this call may be recorded" announcement, the "thank you for calling" greeting, the "we are currently assisting other callers" queue message, the after-hours greeting in Joshua\'s voice that asks the caller to leave their name, carrier voicemail prompts ("your call has been forwarded to voicemail", "at the tone, please record your message", "when you have finished recording, you may hang up"), the "no call parked on that extension" message, business-hours messages, IVR menus ("press 1", "press one"), vendor hold queues ("estimated wait time", "save your place in line", "welcome to Bright"), and prompts that ask the caller to enter a zip code.';
+  return 'System recordings (never a live person, even if a name is spoken): the "this call may be recorded" announcement, the "thank you for calling" / "it\'s a great day here" greeting, the "we are currently assisting other callers" queue message and its continuation ("your call is very important to us", "please stay on the line"), the "best in custom blinds" tagline, the after-hours greeting in Joshua\'s voice that asks the caller to leave their name, carrier voicemail prompts ("your call has been forwarded to voicemail", "automated voice messaging system", "mailbox is full", "at the tone, please record your message", "when you have finished recording, you may hang up"), the "no call parked on that extension" message, business-hours messages, IVR menus ("press 1", "press one"), vendor hold queues ("estimated wait time", "save your place in line", "welcome to Bright"), and prompts that ask the caller to enter a zip code.';
 }
 
 function customerDialString(dialString, roster) {
