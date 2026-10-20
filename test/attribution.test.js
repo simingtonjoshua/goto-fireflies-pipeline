@@ -2253,3 +2253,402 @@ describe('Oct 19 caller name in the summary prompt', () => {
     assert.match(built.user, /RICHARD BROWN/);
   });
 });
+
+describe('Oct 20 inbound answerer from the call events report', () => {
+  const book = roster.createRoster(ROSTER_CONFIG, [OFFICE]);
+  const CUSTOMER_20 = '5550101047';
+
+  beforeEach(() => {
+    interactions.resetForTests();
+    roster.setRosterForTests(book);
+  });
+
+  after(() => {
+    interactions.resetForTests();
+    roster.resetRosterForTests();
+  });
+
+  // Documented report shape, trimmed: callStates LINE status, nested line.extensionNumber,
+  // and the summary participant's userKey / userFirstName / userLastName. Phone numbers
+  // and ids here are synthetic. ENDING participants are empty, matching the live webhook.
+  function queueReport({ connectedExtension, connectedName, alsoRinging, userKey, extensionOnSummary }) {
+    const emilyLeg = 'leg-answerer';
+    const states = [
+      {
+        sequenceNumber: 1,
+        type: 'ACTIVE',
+        timestamp: '2026-10-20T16:43:02.000Z',
+        participants: [
+          {
+            legId: 'leg-caller',
+            status: { value: 'CONNECTED' },
+            type: { value: 'PHONE_NUMBER', number: `+1${CUSTOMER_20}` },
+          },
+          ...(alsoRinging || []).map((entry) => ({
+            legId: `leg-${entry.extension}`,
+            status: { value: 'RINGING' },
+            type: { value: 'LINE', extensionNumber: entry.extension, name: entry.name },
+          })),
+          {
+            legId: emilyLeg,
+            status: { value: 'RINGING' },
+            type: { value: 'LINE', extensionNumber: connectedExtension, name: connectedName },
+          },
+        ],
+      },
+      {
+        sequenceNumber: 2,
+        type: 'ACTIVE',
+        timestamp: '2026-10-20T16:43:08.000Z',
+        participants: [
+          {
+            legId: 'leg-caller',
+            status: { value: 'CONNECTED' },
+            type: { value: 'PHONE_NUMBER', phoneNumber: { number: `+1${CUSTOMER_20}` } },
+          },
+          {
+            legId: emilyLeg,
+            status: { value: 'CONNECTED' },
+            type: { value: 'LINE', line: { extensionNumber: connectedExtension, name: connectedName } },
+          },
+        ],
+      },
+      { sequenceNumber: 3, type: 'ENDING', timestamp: '2026-10-20T16:47:00.000Z', participants: [] },
+    ];
+    return {
+      direction: 'INBOUND',
+      callAnswered: '2026-10-20T16:43:08.000Z',
+      participants: [
+        {
+          legId: emilyLeg,
+          name: connectedName,
+          number: extensionOnSummary || connectedExtension,
+          type: {
+            value: 'LINE',
+            userKey: userKey || null,
+            userFirstName: connectedName.split(' ')[0],
+            userLastName: connectedName.split(' ').slice(1).join(' '),
+          },
+        },
+      ],
+      interactiveVoiceResponseSystems: [
+        { type: { value: 'CALL_QUEUE', queueName: 'Main' } },
+      ],
+      callStates: states,
+    };
+  }
+
+  function greetingTranscript() {
+    return {
+      results: [
+        { transcript: "It's a great day here at Budget Blinds, how can I help you?", channel: 1, startTimeMs: 0 },
+        { transcript: 'I need to check on an order.', channel: 0, startTimeMs: 4000 },
+        { transcript: 'I can look that up for you.', channel: 1, startTimeMs: 7000 },
+      ],
+    };
+  }
+
+  it('keeps a unique full name unresolved when two extensions share it, and uses the first line for a spoken name', () => {
+    assert.equal(book.personByName('Amy Bullock'), null);
+    assert.equal(book.primaryByName('Amy Bullock').extension, '00001');
+    assert.equal(book.personByExtension('00005').name, 'Amy Bullock');
+  });
+
+  it('reads a connected nested line on a call-state payload', () => {
+    const analysis = callParties.analyzeCallState(callState({
+      conversationSpaceId: '66666666-6666-3666-8666-666666666666',
+      direction: 'INBOUND',
+      callCreated: '2026-10-20T16:43:00.000Z',
+      participants: [
+        {
+          participantId: 'emily',
+          originator: 'caller',
+          legId: 'leg-emily',
+          status: { value: 'CONNECTED' },
+          type: { value: 'LINE', line: { extensionNumber: '6', name: 'Emily Kingdon' } },
+        },
+      ],
+    }), book);
+    assert.equal(analysis.lines[0].name, 'Emily Kingdon');
+    assert.equal(analysis.lines[0].extension, '00006');
+    assert.equal(analysis.lines[0].connected, true);
+  });
+
+  it('credits only the connected roster line, not the phones that were still ringing', () => {
+    const found = callParties.answerersFromCallReport(queueReport({
+      connectedExtension: '00006',
+      connectedName: 'Emily Kingdon',
+      alsoRinging: [
+        { extension: '00007', name: 'Kristine Vandervort' },
+        { extension: '00004', name: 'Gala Wilbur' },
+      ],
+    }), book);
+    assert.deepEqual(found.map((entry) => entry.name), ['Emily Kingdon']);
+    assert.equal(found[0].extension, '00006');
+
+    const ringingOnly = callParties.answerersFromCallReport({
+      callStates: [
+        {
+          sequenceNumber: 1,
+          participants: [
+            { status: { value: 'RINGING' }, type: { value: 'LINE', extensionNumber: '00006', name: 'Emily Kingdon' } },
+            { status: { value: 'RINGING' }, type: { value: 'LINE', extensionNumber: '00003', name: 'Joshua Simington' } },
+          ],
+        },
+        { sequenceNumber: 2, type: 'ENDING', participants: [] },
+      ],
+    }, book);
+    assert.deepEqual(ringingOnly, []);
+
+    const twoSummaries = callParties.answerersFromCallReport({
+      participants: [
+        { name: 'Emily Kingdon', number: '00006', type: { value: 'LINE' } },
+        { name: 'Joshua Simington', number: '00003', type: { value: 'LINE' } },
+      ],
+    }, book);
+    assert.deepEqual(twoSummaries, []);
+
+    const oneSummary = callParties.answerersFromCallReport({
+      participants: [
+        { name: 'Emily Kingdon', number: '6', type: { value: 'LINE', userKey: 'user-emily', userFirstName: 'Emily', userLastName: 'Kingdon' } },
+      ],
+      callAnswered: '2026-10-20T16:43:08.000Z',
+    }, book);
+    assert.equal(oneSummary[0].name, 'Emily Kingdon');
+    assert.equal(oneSummary[0].extension, '00006');
+
+    const keyed = roster.createRoster(ROSTER_CONFIG, [OFFICE]);
+    keyed.indexApiUser({ userKey: 'user-emily', lines: [{ number: '00006' }] });
+    const byKey = callParties.answerersFromCallReport({
+      callStates: [{
+        sequenceNumber: 1,
+        timestamp: '2026-10-20T16:43:08.000Z',
+        participants: [{
+          status: { value: 'CONNECTED' },
+          type: { value: 'LINE', userKey: 'user-emily', userFirstName: 'Emily', userLastName: 'Kingdon' },
+        }],
+      }],
+    }, keyed);
+    assert.equal(byKey[0].name, 'Emily Kingdon');
+    assert.equal(byKey[0].extension, '00006');
+    assert.equal(byKey[0].matchedBy, 'userKey');
+  });
+
+  it('names the inbound answerer from the report when the greeting never says a name', async () => {
+    const fetched = [];
+    interactions.setCallReportFetcherForTests(async (id) => {
+      fetched.push(id);
+      if (id !== 'conv-1020-greeting') return null;
+      return queueReport({ connectedExtension: '00006', connectedName: 'Emily Kingdon' });
+    });
+    interactions.recordLegState('conv-1020-greeting', {
+      legId: 'leg-1020-greeting',
+      lines: [{ legId: 'queue', extension: '00801', name: null, connected: true, answered: true }],
+      participantLegIds: ['leg-1020-greeting'],
+      direction: 'INBOUND',
+      directionSource: 'metadata',
+      externalNumber: CUSTOMER_20,
+      callCreated: '2026-10-20T16:43:00.000Z',
+      callEnded: '2026-10-20T16:47:00.000Z',
+    });
+    interactions.recordTranscript('conv-1020-greeting', 'rec-1020', greetingTranscript());
+    await interactions.attributeInboundAnswerers('conv-1020-greeting');
+
+    const described = interactions.describeForTests('conv-1020-greeting');
+    assert.deepEqual(fetched, ['conv-1020-greeting']);
+    assert.deepEqual(described.csrPath, ['Emily Kingdon (00006)']);
+    assert.equal(described.teamMemberSource, 'call events report');
+    assert.equal(described.csrPath.join(' -> '), 'Emily Kingdon (00006)');
+
+    const rows = openaiClient.formatLegTranscript(described.legRecords.find((leg) => leg.transcript));
+    assert.deepEqual(rows.map((row) => row.label), ['Recording', 'Customer', 'Emily Kingdon']);
+
+    const built = openaiClient.buildSummaryMessages({
+      legRecords: described.legRecords,
+      csrPath: described.csrPath,
+      externalNumber: described.externalNumber,
+      direction: described.direction,
+      callCreated: described.callCreated,
+      callEnded: described.callEnded,
+      answered: described.answered,
+    });
+    assert.match(built.user, /Team member path \(in order, if transferred\/parked\): Emily Kingdon \(00006\)/);
+
+    const html = interactions.buildTranscriptDocHtml({
+      externalNumber: described.externalNumber,
+      direction: described.direction,
+      csrPath: described.csrPath,
+      callCreated: described.callCreated,
+      callEnded: described.callEnded,
+      summaryText: 'Emily looked up the order.',
+      legRecords: described.legRecords,
+    });
+    assert.match(html, /<b>Team Member\(s\):<\/b> Emily Kingdon \(00006\)/);
+  });
+
+  it('keeps the report answerer when the transcript introduces someone else', async () => {
+    interactions.setCallReportFetcherForTests(async () => queueReport({
+      connectedExtension: '00006',
+      connectedName: 'Emily Kingdon',
+    }));
+    interactions.recordLegState('conv-1020-disagree', {
+      legId: 'leg-1020-disagree',
+      lines: [],
+      direction: 'INBOUND',
+      directionSource: 'metadata',
+      externalNumber: CUSTOMER_20,
+      callCreated: '2026-10-20T17:00:00.000Z',
+      callEnded: '2026-10-20T17:04:00.000Z',
+    });
+    interactions.recordTranscript('conv-1020-disagree', 'rec-disagree', {
+      results: [
+        { transcript: 'This is Josh speaking.', channel: 1, startTimeMs: 0 },
+        { transcript: 'Hi Josh.', channel: 0, startTimeMs: 2000 },
+      ],
+    });
+    await interactions.attributeInboundAnswerers('conv-1020-disagree');
+    const described = interactions.describeForTests('conv-1020-disagree');
+    assert.deepEqual(described.csrPath, ['Emily Kingdon (00006)']);
+    assert.equal(described.teamMemberSource, 'call events report');
+  });
+
+  it('uses the extension GoTo sent when Amy answers on the home-office line', () => {
+    const found = callParties.answerersFromCallReport(queueReport({
+      connectedExtension: '00005',
+      connectedName: 'Amy Bullock',
+    }), book);
+    assert.equal(found[0].name, 'Amy Bullock');
+    assert.equal(found[0].extension, '00005');
+  });
+
+  it('falls back to the spoken name and fills Amy\'s extension from the roster', async () => {
+    interactions.setCallReportFetcherForTests(async () => null);
+    interactions.recordLegState('conv-1020-amy', {
+      legId: 'leg-1020-amy',
+      lines: [],
+      direction: 'INBOUND',
+      directionSource: 'metadata',
+      externalNumber: CUSTOMER_20,
+      callCreated: '2026-10-20T20:29:00.000Z',
+      callEnded: '2026-10-20T20:33:00.000Z',
+    });
+    interactions.recordTranscript('conv-1020-amy', 'rec-amy', {
+      results: [
+        { transcript: 'Hello?', channel: 0, startTimeMs: 0 },
+        { transcript: 'This is Amy speaking.', channel: 1, startTimeMs: 1000 },
+      ],
+    });
+    await interactions.attributeInboundAnswerers('conv-1020-amy');
+    const described = interactions.describeForTests('conv-1020-amy');
+    assert.deepEqual(described.csrPath, ['Amy Bullock (00001)']);
+    assert.equal(described.teamMemberSource, 'transcript introduction');
+    assert.equal(roster.formatTeamMember({ name: 'Amy Bullock' }, book), 'Amy Bullock (00001)');
+  });
+
+  it('credits the answering leg of a queue call when that leg is a separate conversation', async () => {
+    interactions.setCallReportFetcherForTests(async (id) => {
+      if (id === 'conv-1020-queue') {
+        return {
+          direction: 'INBOUND',
+          participants: [],
+          callStates: [{ sequenceNumber: 1, type: 'ENDING', participants: [] }],
+          associatedConversations: ['conv-1020-agent'],
+        };
+      }
+      if (id === 'conv-1020-agent') {
+        return queueReport({ connectedExtension: '00003', connectedName: 'Joshua Simington' });
+      }
+      return null;
+    });
+    interactions.recordLegState('conv-1020-queue', {
+      legId: 'leg-1020-queue',
+      lines: [],
+      direction: 'INBOUND',
+      directionSource: 'metadata',
+      externalNumber: CUSTOMER_20,
+      callCreated: '2026-10-20T18:00:00.000Z',
+      callEnded: '2026-10-20T18:06:00.000Z',
+    });
+    interactions.recordTranscript('conv-1020-queue', 'rec-queue', greetingTranscript());
+    await interactions.attributeInboundAnswerers('conv-1020-queue');
+    const described = interactions.describeForTests('conv-1020-queue');
+    assert.deepEqual(described.csrPath, ['Joshua Simington (00003)']);
+    assert.equal(described.teamMemberSource, 'call events report');
+  });
+
+  it('does not ask the report to rename an outbound call', async () => {
+    const fetched = [];
+    interactions.setCallReportFetcherForTests(async (id) => {
+      fetched.push(id);
+      return queueReport({ connectedExtension: '00003', connectedName: 'Joshua Simington' });
+    });
+    interactions.recordLegState('conv-1020-out', {
+      legId: 'leg-1020-out',
+      lines: [],
+      direction: 'OUTBOUND',
+      directionSource: 'metadata',
+      externalNumber: CUSTOMER_20,
+      callCreated: '2026-10-20T19:00:00.000Z',
+      callEnded: '2026-10-20T19:02:00.000Z',
+    });
+    interactions.recordTranscript('conv-1020-out', 'rec-out', {
+      results: [
+        { transcript: 'Hi, this is Emily with Budget Blinds.', channel: 0, startTimeMs: 0 },
+        { transcript: 'Hello.', channel: 1, startTimeMs: 2000 },
+      ],
+    });
+    await interactions.attributeInboundAnswerers('conv-1020-out');
+    const described = interactions.describeForTests('conv-1020-out');
+    assert.deepEqual(fetched, []);
+    assert.deepEqual(described.csrPath, ['Emily Kingdon (00006)']);
+    assert.equal(described.teamMemberSource, 'outbound introduction');
+  });
+
+  it('keeps a transfer in answer order and still falls back when the report request fails', async () => {
+    const transfer = callParties.answerersFromCallReport({
+      callStates: [
+        {
+          sequenceNumber: 2,
+          timestamp: '2026-10-20T21:00:10.000Z',
+          participants: [
+            { status: { value: 'CONNECTED' }, type: { value: 'LINE', extensionNumber: '00006', name: 'Emily Kingdon' } },
+          ],
+        },
+        {
+          sequenceNumber: 4,
+          timestamp: '2026-10-20T21:03:00.000Z',
+          participants: [
+            { status: { value: 'CONNECTED' }, type: { value: 'LINE', extensionNumber: '00003', name: 'Joshua Simington' } },
+            { status: { value: 'ON_HOLD' }, type: { value: 'LINE', extensionNumber: '00006', name: 'Emily Kingdon' } },
+          ],
+        },
+      ],
+    }, book);
+    assert.deepEqual(transfer.map((entry) => `${entry.name} (${entry.extension})`), [
+      'Emily Kingdon (00006)',
+      'Joshua Simington (00003)',
+    ]);
+
+    interactions.setCallReportFetcherForTests(async () => {
+      throw new Error('report unavailable');
+    });
+    interactions.recordLegState('conv-1020-fail', {
+      legId: 'leg-1020-fail',
+      lines: [],
+      direction: 'INBOUND',
+      directionSource: 'metadata',
+      externalNumber: CUSTOMER_20,
+      callCreated: '2026-10-20T21:10:00.000Z',
+      callEnded: '2026-10-20T21:12:00.000Z',
+    });
+    interactions.recordTranscript('conv-1020-fail', 'rec-fail', {
+      results: [
+        { transcript: 'This is Josh speaking.', channel: 1, startTimeMs: 0 },
+      ],
+    });
+    await interactions.attributeInboundAnswerers('conv-1020-fail');
+    const described = interactions.describeForTests('conv-1020-fail');
+    assert.deepEqual(described.csrPath, ['Joshua Simington (00003)']);
+    assert.equal(described.teamMemberSource, 'transcript introduction');
+  });
+});

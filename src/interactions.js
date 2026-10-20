@@ -187,6 +187,7 @@ const sheetsClient = require('./sheetsClient');
 const callParties = require('./callParties');
 const roster = require('./roster');
 const cardRedact = require('./cardRedact');
+const gotoClient = require('./gotoClient');
 
 const FINALIZE_QUIET_MS = 45 * 1000; // Anchored to the real call-ended signal as of the
 // 2026-07-21 fix (see BUG FIXED note above), so this only needs to cover GoTo's own
@@ -251,6 +252,8 @@ const PENDING_HISTORY_TTL_MS = 10 * 60 * 1000;
 
 let onFinalized = () => {};
 let audioUploader = null;
+// Tests inject this. Production uses GET /call-events-report/v1/reports/{id}.
+let callReportFetcher = null;
 
 function setOnFinalized(fn) {
             onFinalized = typeof fn === 'function' ? fn : () => {};
@@ -978,7 +981,7 @@ function describeGroup(groupKey) {
                           conversationSpaceIds,
                           legRecords,
                           csrChain,
-                          csrPath: csrChain.map((entry) => `${entry.name || 'unknown'} (${entry.extension || 'unknown ext'})`),
+                          csrPath: csrChain.map((entry) => roster.formatTeamMember(entry)),
                           externalNumber,
                           externalConflict,
                           externalName: legRecords.find((leg) => leg.externalName)?.externalName,
@@ -1186,8 +1189,16 @@ function buildTranscriptDocHtml({ externalName, externalNumber, direction, csrPa
 function isRosterChainEntry(entry, book) {
             if (!entry) return false;
             if (entry.extension && book.personByExtension(entry.extension)) return true;
-            if (entry.name && book.personByName(entry.name)) return true;
+            if (entry.name && (book.personByName(entry.name) || book.primaryByName(entry.name))) return true;
             return false;
+}
+
+function fillMissingExtensions(leg, book) {
+            for (const entry of leg.csrChain || []) {
+                          if (entry.extension || !entry.name) continue;
+                          const person = book.primaryByName(entry.name);
+                          if (person && person.extension) entry.extension = person.extension;
+            }
 }
 
 // A queue, DID, or other non-roster line in csrChain is not an answerer. It used
@@ -1204,40 +1215,141 @@ function groupLooksInbound(groupKey) {
 // still labels "This is Josh speaking" as Team Member on that leg's channel
 // map, then the old inbound-only check skipped the leg and the header stayed
 // unknown. Credit whoever that team-labeled channel introduces.
+function transcriptAnswererFor(leg, book, inboundGroup) {
+            if (leg.direction === 'OUTBOUND' && !inboundGroup) {
+                          return { found: callParties.outboundIntroAnswerer(leg, book), source: 'outbound introduction' };
+            }
+            if (inboundGroup && leg.direction === 'OUTBOUND') {
+                          return { found: callParties.teamChannelAnswerer(leg, book), source: 'transcript introduction' };
+            }
+            if (leg.direction === 'INBOUND' || inboundGroup || !leg.direction) {
+                          return {
+                                          found: callParties.answererFromTranscript(
+                                            leg.direction ? leg : { ...leg, direction: 'INBOUND' },
+                                            book,
+                                          ),
+                                          source: 'transcript introduction',
+                          };
+            }
+            return { found: null, source: null };
+}
+
+function applyFoundAnswerer(leg, found, source) {
+            const book = roster.getRoster();
+            leg.csrChain = (leg.csrChain || []).filter((entry) => isRosterChainEntry(entry, book));
+            considerTeamMember(leg, {
+                          name: found.name,
+                          extension: found.extension,
+                          userKey: found.userKey,
+                          answered: true,
+                          connected: true,
+                          answerTime: found.answerTime,
+            }, { requireAnswered: false, source });
+}
+
+// Call Events Report is the primary inbound answerer. The webhook ENDING event
+// does not include participants, and this subscription does not receive ACTIVE,
+// which is where the answering extension is CONNECTED. Transcript self-intro
+// still runs afterwards and only fills a leg the report left unnamed.
+async function loadInboundAnswerers(groupKey) {
+            if (!groupLooksInbound(groupKey)) return;
+            const book = roster.getRoster();
+            const fetchReport = callReportFetcher || gotoClient.fetchCallEventsReport;
+            const ids = [...conversationSpaceIdsFor(groupKey)];
+            const pending = ids.filter((id) => {
+                          const leg = legs.get(id);
+                          return leg && !(leg.csrChain || []).some((entry) => isRosterChainEntry(entry, book));
+            });
+            if (!pending.length) return;
+
+            const extras = [];
+            for (const id of pending) {
+                          let report = null;
+                          try {
+                                          report = await fetchReport(id);
+                          } catch (err) {
+                                          console.error(`Call events report for ${id} failed: ${err.message}`);
+                                          continue;
+                          }
+                          if (!report) continue;
+                          recordCallReport(id, report);
+                          const body = report.callStates || report.participants ? report : (report.content || report);
+                          for (const associated of body.associatedConversations || []) {
+                                          if (associated && !ids.includes(associated) && !extras.includes(associated)) extras.push(associated);
+                          }
+            }
+            if ([...conversationSpaceIdsFor(groupKey)].some((id) => {
+                          const leg = legs.get(id);
+                          return leg && (leg.csrChain || []).some((entry) => isRosterChainEntry(entry, book));
+            })) return;
+
+            const inboundId = ids.find((id) => {
+                          const leg = legs.get(id);
+                          return leg && leg.direction === 'INBOUND';
+            }) || ids[0];
+            for (const id of extras.slice(0, 4)) {
+                          let report = null;
+                          try {
+                                          report = await fetchReport(id);
+                          } catch (err) {
+                                          console.error(`Call events report for ${id} failed: ${err.message}`);
+                                          continue;
+                          }
+                          if (!report) continue;
+                          const answerers = callParties.answerersFromCallReport(report, book);
+                          const leg = legs.get(inboundId);
+                          if (!leg || !answerers.length) continue;
+                          for (const found of answerers) applyFoundAnswerer(leg, found, 'call events report');
+                          if ((leg.csrChain || []).some((entry) => isRosterChainEntry(entry, book))) return;
+            }
+}
+
+function recordCallReport(conversationSpaceId, report) {
+            const leg = legs.get(conversationSpaceId);
+            if (!leg || !report) return [];
+            const groupKey = groupKeyFor(conversationSpaceId);
+            if (leg.direction === 'OUTBOUND' && !groupLooksInbound(groupKey)) return [];
+            const book = roster.getRoster();
+            if ((leg.csrChain || []).some((entry) => isRosterChainEntry(entry, book))) return [];
+            const answerers = callParties.answerersFromCallReport(report, book);
+            for (const found of answerers) applyFoundAnswerer(leg, found, 'call events report');
+            if (answerers.length) {
+                          console.log(
+                                          `Inbound answerer from call events report: ${answerers.map((entry) => roster.formatTeamMember(entry)).join(' -> ')} conversation=${conversationSpaceId}`,
+                          );
+            }
+            return answerers;
+}
+
 function applyTranscriptAnswerers(groupKey) {
             const book = roster.getRoster();
             const inboundGroup = groupLooksInbound(groupKey);
             for (const id of conversationSpaceIdsFor(groupKey)) {
                           const leg = legs.get(id);
                           if (!leg) continue;
-                          if ((leg.csrChain || []).some((entry) => isRosterChainEntry(entry, book))) continue;
-                          const outboundLegOfInbound = inboundGroup && leg.direction === 'OUTBOUND';
-                          let found = null;
-                          let source = 'transcript introduction';
-                          if (leg.direction === 'OUTBOUND' && !inboundGroup) {
-                                          found = callParties.outboundIntroAnswerer(leg, book);
-                                          source = 'outbound introduction';
-                          } else if (outboundLegOfInbound) {
-                                          found = callParties.teamChannelAnswerer(leg, book);
-                          } else if (leg.direction === 'INBOUND' || inboundGroup || !leg.direction) {
-                                          found = callParties.answererFromTranscript(
-                                            leg.direction ? leg : { ...leg, direction: 'INBOUND' },
-                                            book,
-                                          );
+                          fillMissingExtensions(leg, book);
+                          const already = (leg.csrChain || []).find((entry) => isRosterChainEntry(entry, book));
+                          const { found, source } = transcriptAnswererFor(leg, book, inboundGroup);
+                          if (already) {
+                                          if (found && found.name && already.name && found.name !== already.name) {
+                                                          console.log(
+                                                                          `Transcript introduction names ${found.name}; keeping ${already.name} from ${leg.teamMemberSource || 'GoTo'}.`,
+                                                          );
+                                          }
+                                          continue;
                           }
                           if (!found) continue;
-                          leg.csrChain = (leg.csrChain || []).filter((entry) => isRosterChainEntry(entry, book));
-                          considerTeamMember(leg, {
-                                          name: found.name,
-                                          extension: found.extension,
-                                          answered: true,
-                                          connected: true,
-                          }, { requireAnswered: false, source });
+                          applyFoundAnswerer(leg, found, source);
             }
 }
 
-async function finalizeInteraction(groupKey) {
+async function attributeInboundAnswerers(groupKey) {
+            await loadInboundAnswerers(groupKey);
             applyTranscriptAnswerers(groupKey);
+}
+
+async function finalizeInteraction(groupKey) {
+            await attributeInboundAnswerers(groupKey);
             const described = describeGroup(groupKey);
             const {
                           conversationSpaceIds, legRecords, csrPath, externalNumber, externalName,
@@ -1424,11 +1536,16 @@ function abandonOrphan(recordingId) {
             return true;
 }
 
+function setCallReportFetcherForTests(fn) {
+            callReportFetcher = typeof fn === 'function' ? fn : null;
+}
+
 function resetForTests() {
             for (const timer of closeTimers.values()) clearTimeout(timer);
             closeTimers.clear();
             parkedOrphans.clear();
             audioUploader = null;
+            callReportFetcher = null;
             legs.clear();
             legIdToConversation.clear();
             originatorForConversation.clear();
@@ -1468,6 +1585,10 @@ module.exports = {
             resetForTests,
             peekLeg,
             applyTranscriptAnswerers,
+            attributeInboundAnswerers,
+            buildTranscriptDocHtml,
+            recordCallReport,
+            setCallReportFetcherForTests,
             describeForTests: describeGroup,
             parkOrphanTranscript,
             attachParkedOrphan,

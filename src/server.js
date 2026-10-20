@@ -533,7 +533,7 @@ app.post('/admin/reprocess-call', async (req, res) => {
                       callCreated,
                       csrChain: csrChain || [],
           }];
-                  const csrPath = (csrChain || []).map((c) => `${c.name || 'unknown'} (${c.extension || 'unknown ext'})`);
+                  const csrPath = (csrChain || []).map((c) => roster.formatTeamMember(c));
 
           const summaryText = await openaiClient.summarizeInteraction({
                       legRecords,
