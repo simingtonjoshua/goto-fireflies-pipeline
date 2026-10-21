@@ -262,6 +262,34 @@ async function fetchRecordingContent(recordingId) {
 // Used to map a call-history userKey back to a configured extension. Paginates on
 // nextPageMarker. A 401/403 (missing scope) is the caller's problem to log; this
 // throws so the roster refresh can fall back to the config file.
+// Completed-call report. The live call-events subscription on this service is
+// STARTING and ENDING only, and the ENDING event's participants array is empty
+// — the CONNECTED line was on the preceding ACTIVE state, which is not
+// delivered. Terminated calls are also absent from
+// GET /call-events/v1/conversation-spaces/{id}/events; GoTo says those events
+// are served here instead. Scope is cr.v1.read (the same read scope as call
+// history). A 401/403 leaves the caller to fall back to the transcript.
+// https://developer.goto.com/guides/GoToConnect/16_CallEventsReport/
+async function fetchCallEventsReport(conversationSpaceId) {
+  if (!conversationSpaceId) return null;
+  const res = await gotoFetch(
+    `${API_BASE}/call-events-report/v1/reports/${encodeURIComponent(conversationSpaceId)}`,
+  );
+  if (res.status === 404 || res.status === 401 || res.status === 403) {
+    await res.text().catch(() => '');
+    if (res.status !== 404) {
+      console.error(
+        `Call events report for ${conversationSpaceId} is not readable (${res.status}). Inbound answerer falls back to call history and the transcript.`,
+      );
+    }
+    return null;
+  }
+  if (!res.ok) {
+    throw new Error(`Failed to fetch call events report for ${conversationSpaceId} (${res.status})`);
+  }
+  return res.json();
+}
+
 async function listAccountUsers(accountKey) {
   const items = [];
   let pageMarker = null;
@@ -291,5 +319,6 @@ module.exports = {
   subscribeCallParkingEvents,
   fetchTranscript,
   fetchRecordingContent,
+  fetchCallEventsReport,
   listAccountUsers,
 };

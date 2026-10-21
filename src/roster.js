@@ -84,17 +84,30 @@ class Roster {
     return linked;
   }
 
-  // Full-name match. Two extensions for one name (Amy's desk and home office)
-  // stay unresolved until an extension is present.
-  personByName(name) {
+  peopleNamed(name) {
     const target = String(name || '').trim().toLowerCase();
-    if (!target) return null;
+    if (!target) return [];
     const matches = [];
     for (const entry of this.byExtension.values()) {
       if (String(entry.name || '').trim().toLowerCase() === target) matches.push(entry);
     }
+    return matches;
+  }
+
+  // Full-name match. Two extensions for one name (Amy's desk and home office)
+  // stay unresolved until an extension is present. Call history uses this so a
+  // name beside a caller-id DID is not guessed onto the wrong line.
+  personByName(name) {
+    const matches = this.peopleNamed(name);
     if (matches.length === 1) return matches[0];
     return null;
+  }
+
+  // First configured line for a full name. Amy Bullock is 00001 in the roster
+  // and 00005 is her home office, listed second. Used when the only signal is
+  // the spoken name and GoTo did not say which extension.
+  primaryByName(name) {
+    return this.peopleNamed(name)[0] || null;
   }
 
   personByExtension(value) {
@@ -154,11 +167,25 @@ function createRoster(config, systemNumbers) {
   return new Roster(config, systemNumbers || []);
 }
 
+// "Amy Bullock (00001)". A stored name with no extension uses the first
+// configured line for that name. A name GoTo did not put on the roster stays
+// "unknown ext".
+function formatTeamMember(entry, book = active) {
+  const name = (entry && entry.name) || 'unknown';
+  let extension = (entry && entry.extension) || null;
+  if (!extension && entry && entry.name && book && typeof book.primaryByName === 'function') {
+    const person = book.primaryByName(entry.name);
+    if (person && person.extension) extension = person.extension;
+  }
+  return `${name} (${extension || 'unknown ext'})`;
+}
+
 module.exports = {
   getRoster,
   setRosterForTests,
   resetRosterForTests,
   createRoster,
+  formatTeamMember,
   normalizeExtension,
   digitsOnly,
   last10,

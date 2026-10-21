@@ -9,7 +9,11 @@
 //
 // Who answered: a LINE participant counts only when their status is CONNECTED (or
 // on hold), or when their call-history leg shows an answer. RINGING devices, the
-// main line, and the forwarded cell are not the answering person. Outbound calls
+// main line, and the forwarded cell are not the answering person. The webhook
+// subscription is STARTING and ENDING, and ENDING participants are empty, so the
+// connected extension for an inbound queue or ring group is read from the Call
+// Events Report (answerersFromCallReport) when those events never named anyone.
+// Outbound calls
 // still credit the originator LINE (the person who placed the call) even before
 // the far end answers. Desk/cloud STARTING often has one non-system LINE whose
 // originator id is a session id, not that participant — that line placed the call.
@@ -134,8 +138,12 @@ function isGenericLineName(name) {
 }
 
 function payloadPersonName(type) {
-  const fromUser = [type.userFirstName, type.userLastName].filter(Boolean).join(' ').trim();
-  return fromUser || type.name || null;
+  const nested = type.line && typeof type.line === 'object' ? type.line : {};
+  const fromUser = [type.userFirstName || nested.userFirstName, type.userLastName || nested.userLastName]
+    .filter(Boolean)
+    .join(' ')
+    .trim();
+  return fromUser || type.name || nested.name || null;
 }
 
 // UUID version nibble. GoTo desk/cloud conversation ids observed in production are
@@ -258,8 +266,11 @@ function originatorCustomerNumber(participants, roster) {
 
 function extensionFromType(type, roster) {
   if (!type) return null;
+  const nested = type.line && typeof type.line === 'object' ? type.line : {};
   return roster.extensionFrom(type.extensionNumber)
+    || roster.extensionFrom(nested.extensionNumber)
     || roster.extensionFrom(type.extension)
+    || roster.extensionFrom(nested.extension)
     || roster.extensionFrom(type.lineNumber)
     || roster.extensionFrom(type.number);
 }
@@ -276,8 +287,9 @@ function participantIsOriginator(participant) {
 
 function lineFromParticipant(participant, roster) {
   const type = typeOf(participant);
+  const nested = type.line && typeof type.line === 'object' ? type.line : {};
   const extension = extensionFromType(type, roster);
-  const userKey = type.userKey || type.userId || participant.userKey || participant.userId || null;
+  const userKey = type.userKey || nested.userKey || type.userId || participant.userKey || participant.userId || null;
   const byKey = userKey ? roster.personByUserKey(userKey) : null;
   const byExtension = roster.personByExtension(extension);
   const known = byKey || byExtension;
@@ -946,8 +958,13 @@ function personFromIntroTokens(roster, tokens) {
   const names = [...new Set(matched.map((entry) => entry.name))];
   if (names.length !== 1) return null;
   const same = matched.filter((entry) => entry.name === names[0]);
-  const extensions = [...new Set(same.map((entry) => entry.extension).filter(Boolean))];
-  return { name: names[0], extension: extensions.length === 1 ? extensions[0] : null };
+  // Roster order. Amy Bullock is listed on 00001 and again on 00005 (home
+  // office); a spoken "Amy" with no extension from GoTo uses the first line.
+  const extensions = [];
+  for (const entry of same) {
+    if (entry.extension && !extensions.includes(entry.extension)) extensions.push(entry.extension);
+  }
+  return { name: names[0], extension: extensions[0] || null };
 }
 
 function statedRosterPerson(text, roster) {
@@ -1211,6 +1228,122 @@ function postingPlan({
   return { action: 'post', reason: 'ready' };
 }
 
+function reportBody(report) {
+  if (!report || typeof report !== 'object') return null;
+  if (report.callStates || report.participants) return report;
+  if (report.content && typeof report.content === 'object') return report.content;
+  return report;
+}
+
+function reportLineFields(participant) {
+  const type = typeOf(participant);
+  const nested = type.line && typeof type.line === 'object' ? type.line : {};
+  const fromUser = [type.userFirstName || nested.userFirstName, type.userLastName || nested.userLastName]
+    .filter(Boolean)
+    .join(' ')
+    .trim();
+  return {
+    extensionNumber: type.extensionNumber || nested.extensionNumber || (participant && participant.number) || null,
+    name: type.name || nested.name || (participant && participant.name) || fromUser || null,
+    userKey: type.userKey || nested.userKey || (participant && participant.userKey) || null,
+    userFirstName: type.userFirstName || nested.userFirstName || null,
+    userLastName: type.userLastName || nested.userLastName || null,
+  };
+}
+
+function mergeReportFields(primary, extra) {
+  if (!extra) return primary;
+  return {
+    extensionNumber: primary.extensionNumber || extra.extensionNumber,
+    name: primary.name || extra.name,
+    userKey: primary.userKey || extra.userKey,
+    userFirstName: primary.userFirstName || extra.userFirstName,
+    userLastName: primary.userLastName || extra.userLastName,
+  };
+}
+
+// Extension GoTo sent wins. A name with no extension uses the first configured
+// line (Amy's 00001), which personByName deliberately does not guess.
+function rosterLineFromFields(fields, roster) {
+  if (!fields) return null;
+  const extension = roster.extensionFrom(fields.extensionNumber);
+  const byExtension = extension ? roster.personByExtension(extension) : null;
+  const byKey = fields.userKey ? roster.personByUserKey(fields.userKey) : null;
+  const fullName = [fields.userFirstName, fields.userLastName].filter(Boolean).join(' ').trim();
+  const named = (value) => {
+    if (!value || isGenericLineName(value)) return null;
+    return roster.personByName(value) || roster.primaryByName(value);
+  };
+  const byUserName = named(fullName);
+  const byPayloadName = named(fields.name);
+  const person = byExtension || byKey || byUserName || byPayloadName;
+  if (!person) return null;
+  return {
+    name: person.name,
+    extension: (byExtension && byExtension.extension) || person.extension || null,
+    userKey: person.userKey || fields.userKey || null,
+    matchedBy: byExtension ? 'extension' : (byKey ? 'userKey' : 'name'),
+  };
+}
+
+// Who picked up, from a Call Events Report, without reading the transcript.
+// callStates carry status. A LINE counts only when CONNECTED or on hold, so the
+// other ringing phones in a ring group are not the answerer. The queue itself
+// is an interactiveVoiceResponseSystems entry, not a roster line. A summary
+// with no call states credits a roster line only when there is exactly one.
+function answerersFromCallReport(report, roster = rosterApi.getRoster()) {
+  const body = reportBody(report);
+  if (!body) return [];
+
+  const byLeg = new Map();
+  for (const participant of body.participants || []) {
+    if (participantKind(participant) !== 'LINE' || !participant.legId) continue;
+    byLeg.set(participant.legId, reportLineFields(participant));
+  }
+
+  const states = Array.isArray(body.callStates) ? [...body.callStates] : [];
+  states.sort((a, b) => (Number(a.sequenceNumber) || 0) - (Number(b.sequenceNumber) || 0));
+
+  const connected = new Map();
+  let sawLine = false;
+  for (const state of states) {
+    for (const participant of state.participants || []) {
+      if (participantKind(participant) !== 'LINE') continue;
+      sawLine = true;
+      if (!CONNECTED_STATUSES.has(statusOf(participant))) continue;
+      const fields = mergeReportFields(
+        reportLineFields(participant),
+        participant.legId ? byLeg.get(participant.legId) : null,
+      );
+      const line = rosterLineFromFields(fields, roster);
+      if (!line) continue;
+      const key = line.extension || line.name;
+      if (connected.has(key)) continue;
+      connected.set(key, {
+        ...line,
+        answered: true,
+        answerTime: state.timestamp || null,
+      });
+    }
+  }
+  if (connected.size) return [...connected.values()];
+  if (sawLine) return [];
+
+  const summary = [];
+  const seen = new Set();
+  for (const participant of body.participants || []) {
+    if (participantKind(participant) !== 'LINE') continue;
+    const line = rosterLineFromFields(reportLineFields(participant), roster);
+    if (!line) continue;
+    const key = line.extension || line.name;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    summary.push({ ...line, answered: true, answerTime: body.callAnswered || null });
+  }
+  if (summary.length === 1) return summary;
+  return [];
+}
+
 function uniqueExternalNumbers(numbers) {
   const seen = new Map();
   for (const number of numbers) {
@@ -1232,6 +1365,7 @@ module.exports = {
   transcriptIsSubstantive,
   callIsFragment,
   answererFromTranscript,
+  answerersFromCallReport,
   teamChannelAnswerer,
   outboundIntroAnswerer,
   postingPlan,
