@@ -539,7 +539,7 @@ app.post('/admin/reprocess-call', async (req, res) => {
           }];
                   const csrPath = (csrChain || []).map((c) => roster.formatTeamMember(c));
 
-          const summaryText = await openaiClient.summarizeInteraction({
+          const summaryResult = await openaiClient.summarizeInteraction({
                       legRecords,
                       csrPath,
                       externalName,
@@ -549,6 +549,8 @@ app.post('/admin/reprocess-call', async (req, res) => {
                       callEnded,
                       answered: answered === true ? true : answered === false ? false : null,
           });
+          const summaryText = summaryResult.summary;
+          const callTypeLabel = summaryResult.callTypeLabel;
 
           const topFolderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
                   const folderName = driveClient.buildCallFolderName({ callCreated, direction, externalNumber });
@@ -563,6 +565,7 @@ app.post('/admin/reprocess-call', async (req, res) => {
                   metaRows.push(
                               ['Direction', direction || 'unknown'],
                               ['Team Member(s)', csrPath.join(' → ') || 'unknown'],
+                              ['Call type', callTypeLabel || 'Other'],
                               ['Call started', driveClient.formatPacific(callCreated)],
                               ['Call ended', driveClient.formatPacific(callEnded)]
                             );
@@ -574,7 +577,11 @@ app.post('/admin/reprocess-call', async (req, res) => {
           await driveClient.createTranscriptDoc(folder.id, `${folderName} - Call Summary & Transcript`, docHtml);
                   console.log(`Admin: created transcript Doc for reprocessed call in folder ${folder.id}.`);
 
-          const noteText = `${summaryText}\n\nCall recording & transcript: ${folder.webViewLink}`;
+          const noteText = openaiClient.formatCallNote({
+                      summary: summaryText,
+                      callTypeLabel,
+                      folderLink: folder.webViewLink,
+          });
                   await heymarketClient.postPrivateNote(externalNumber, noteText, direction);
                   console.log(`Admin: posted Heymarket private note for reprocessed call (${externalNumber}).`);
 

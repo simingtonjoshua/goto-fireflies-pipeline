@@ -214,12 +214,18 @@
 // only a phrase that actually says so) and measures the gap until the next line as
 // the hold's rough duration, and a SYSTEM_PROMPT instruction tells the model to
 // mention it when present.
+// 13) CALL TYPE (team and vendor calls were still written as customer calls). The
+// prompt below stays the customer prompt. classifyCall (src/callType.js) picks
+// internal or vendor only on a strong signal; everything else, including an
+// unclear commerce word, keeps this prompt. The note and doc gain a "Call type"
+// line. Other/unknown from the model is written as Customer.
 
 const fetch = require('node-fetch');
 const driveClient = require('./driveClient');
 const callParties = require('./callParties');
 const roster = require('./roster');
 const cardRedact = require('./cardRedact');
+const callType = require('./callType');
 
 const OPENAI_URL = 'https://api.openai.com/v1/chat/completions';
 const MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
@@ -616,6 +622,45 @@ IMPORTANT - automated systems are not customers: if the "Customer"-labeled chann
 
 IMPORTANT - hold time: if the metadata includes a "Hold periods detected" line, mention in the summary that the caller was placed on hold and roughly how long it lasted (e.g. "the customer was placed on hold for about 45 seconds while ___ checked on availability"). If that line is absent, don't mention holds at all - don't guess at a hold happening just because there was a pause in the transcript.`;
 
+// Used when the other party is a coworker. The customer prompt above is not sent.
+const INTERNAL_SYSTEM_PROMPT = `You summarize internal phone calls for a Budget Blinds franchise. The other party is a team member (designer, installer, or office staff), not a customer. Speaker labels are already assigned: a team member's name, "Customer" (that label is the other person on the phone — on this call they are a coworker, so never call them the customer), "Recording", or "Channel N". Do not swap labels based on who spoke first. A "Recording" line is never a live person.
+
+The metadata includes fixed facts: this is an internal team call, the direction, whether it was answered, the team member path, and the other party's name when known. Do not change those facts. Use the other party's name. If their name is unknown, say "a team member". Never invent a name from "Budget Blinds".
+
+Write a plain-language summary of the conversation between coworkers. Use as many or as few sentences as the call needs. Do not open with a transcript quote. Start with who called whom and what they decided or discussed. Do not add a "Call type" line.
+
+Do not frame this as a customer call. Do not say "the customer's needs", "the customer called", or give the person on the phone customer next steps. If they discuss a customer, that customer is a third party who is not on the call: name that person and what the team agreed to do for them. Appointments, measurements, installs, invoices, and paperwork can come up; attribute them to the customer being discussed, not to the coworker on the phone.
+
+Keep every concrete detail the call contained (dates, arrival windows, addresses, order or reference numbers, dollar amounts, product names). If a detail was not mentioned, leave it out. Only write a phone number that appears in the metadata or was spoken in the transcript. OUTBOUND means the first person in the team member path placed the call; do not describe it as the other party calling in. Use the times exactly as given.
+
+A one-sided transcript is still a transcript: summarize the message that was left. Only say a transcript was unavailable if there are no lines at all. If a "Hold periods detected" line is present, mention the hold and about how long it lasted. If that line is absent, do not mention a hold.`;
+
+// Used when the other party is a vendor, supplier, or someone selling to the office.
+const VENDOR_SYSTEM_PROMPT = `You summarize vendor and supplier phone calls for a Budget Blinds franchise. The other party is a manufacturer, fabricator, sales rep, finance company, or other business — not a customer or prospect asking for window treatments. Speaker labels are already assigned: a team member's name, "Customer" (that label is the outside party — call them by name and company, never "the customer"), "Recording", or "Channel N". Do not swap labels. A "Recording" line is never a live person. A vendor menu, hold queue, or "dedicated support line" is the vendor's phone system.
+
+The metadata call type is fixed. Do not change it. Do not add a "Call type" line.
+
+Write a plain-language summary of the vendor conversation: orders, pricing, backorders, shipments, accounts, invoices, or what they were pitching. Name the person and company when stated. Budget Blinds is the customer of this vendor, so a missing or wrong shipment is Budget Blinds' issue with the vendor. Do not invent a homeowner, a consultation, or customer next steps unless a specific end customer was actually discussed as a third party.
+
+Keep every concrete detail (PO numbers, order numbers, dates, amounts, ETAs, product names). Do not invent a phone number. OUTBOUND means the team member placed the call to the vendor. Use the times exactly as given. A one-sided transcript, including a team member waiting on a vendor menu, is still a transcript: say they were on hold or left a message, and do not pretend the recording explained the order. If a "Hold periods detected" line is present, mention it. If it is absent, do not invent a hold.`;
+
+const UNKNOWN_TYPE_RULES = `Decide the call type before you summarize. The first line of your reply must be exactly one of these four lines:
+Call type: Customer
+Call type: Internal team
+Call type: Vendor
+Call type: Other
+
+Customer includes a prospect asking about window treatments, and it is the default when the other party is not clearly a coworker or a vendor. Internal team means the other party works with Budget Blinds (designer, installer, office); do not call that person the customer, and if a customer is discussed they are a third party. Vendor means a manufacturer, supplier, sales rep, finance company, or someone selling to Budget Blinds; frame the summary around orders, pricing, backorders, shipments, accounts, or the pitch. Other means none of those is clear.
+
+If you choose Customer, follow every customer-framing rule below and write the summary the way you would for a customer call. If you choose Internal team or Vendor, ignore instructions below that call the other party "the customer" or that describe a customer booking, and frame the summary as that call type. Still keep concrete details, the call direction, and the rule against inventing phone numbers. After the first line, do not add another type header.
+
+`;
+
+const UNKNOWN_SYSTEM_PROMPT = `${UNKNOWN_TYPE_RULES}${SYSTEM_PROMPT.replace(
+  'Do not force the call into a category, and do not add a header or label announcing what "type" of call this was - just describe it.',
+  'The call type was declared on your first line. Do not add a second type header.',
+)}`;
+
 // Builds the summary directly, without calling OpenAI at all, for a call with no
 // transcript text whatsoever (see header comment item 10 - NO-TRANSCRIPT ATTRIBUTION +
 // UTC-TIME FIX). There's no real conversation content for a model to summarize in this
@@ -653,7 +698,50 @@ function pathName(csrPath, which) {
     return name;
 }
 
-function buildNoTranscriptSummary({ csrPath, externalNumber, direction, callCreated, answered }) {
+function buildKnownPartyNoTranscriptSummary({
+  csrPath, externalNumber, direction, callCreated, answered, callType, partyName,
+}) {
+  const displayNumber = driveClient.formatPhoneForDisplay(externalNumber);
+  const when = driveClient.formatPacific(callCreated);
+  const lastTeamMember = pathName(csrPath, 'last');
+  const originator = pathName(csrPath, 'first');
+  const wasAnswered = answered === true;
+  const answerUnknown = answered !== true && answered !== false;
+  const other = callType === 'internal'
+    ? (partyName || 'another team member')
+    : (partyName || 'a vendor');
+  const phrase = callType === 'internal' ? 'an internal call' : 'a vendor call';
+
+  if (direction === 'OUTBOUND') {
+    const who = originator || 'A Budget Blinds team member';
+    const placed = `${who} placed ${phrase} to ${other} at ${displayNumber} on ${when}`;
+    if (wasAnswered) {
+      return `No transcript was available for this call. ${placed}, and the phone system shows the call was answered, but no conversation audio or transcript was captured.`;
+    }
+    if (answerUnknown) {
+      return `No transcript was available for this call. ${placed}. The phone system did not say whether the call was answered.`;
+    }
+    return `No transcript was available for this call. ${placed}. The phone system does not show that the call was answered (no answer, a greeting, or voicemail).`;
+  }
+  if (direction === 'INBOUND') {
+    const caller = partyName || (callType === 'internal' ? 'A team member' : 'A vendor');
+    if (wasAnswered && lastTeamMember) {
+      return `No transcript was available for this call. ${caller} called Budget Blinds on ${when} and the call was answered by ${lastTeamMember}, but no conversation audio or transcript was captured.`;
+    }
+    if (answerUnknown) {
+      return `No transcript was available for this call. ${caller} called Budget Blinds on ${when}. The phone system did not say whether a team member answered.`;
+    }
+    return `No transcript was available for this call. ${caller} called Budget Blinds on ${when}. The phone system does not show that a team member answered (missed call, greeting, or voicemail).`;
+  }
+  return `No transcript was available for this call with ${other} at ${displayNumber} on ${when}.`;
+}
+
+function buildNoTranscriptSummary({ csrPath, externalNumber, direction, callCreated, answered, callType, partyName }) {
+    if (callType === 'internal' || callType === 'vendor') {
+      return buildKnownPartyNoTranscriptSummary({
+        csrPath, externalNumber, direction, callCreated, answered, callType, partyName,
+      });
+    }
     const displayNumber = driveClient.formatPhoneForDisplay(externalNumber);
     const when = driveClient.formatPacific(callCreated);
     const lastTeamMember = pathName(csrPath, 'last');
@@ -683,48 +771,142 @@ function buildNoTranscriptSummary({ csrPath, externalNumber, direction, callCrea
     return `No transcript was available for this call involving ${displayNumber} on ${when}.`;
 }
 
-function buildSummaryMessages({ legRecords, csrPath, externalName, externalNumber, direction, callCreated, callEnded, answered }) {
+function systemPromptFor(type) {
+  if (type === 'internal') return INTERNAL_SYSTEM_PROMPT;
+  if (type === 'vendor') return VENDOR_SYSTEM_PROMPT;
+  if (type === 'unknown') return UNKNOWN_SYSTEM_PROMPT;
+  return SYSTEM_PROMPT;
+}
+
+function customerContextLines({ direction, answered, twoSided, csrPath, externalNumber, externalName, callCreated, callEnded, rows }) {
+  return [
+    'Fixed facts (do not change these):',
+    `Call direction: ${direction || 'unknown'} (OUTBOUND = a Budget Blinds team member placed this call to the customer; INBOUND = the customer called Budget Blinds - never describe an outbound call as something the customer did)`,
+    answeredFactLine(answered, twoSided),
+    `Team member path (in order, if transferred/parked): ${(csrPath || []).join(' -> ') || 'unknown'}`,
+    'Commercial roles (do not reverse): the team member sends any service order or warranty paperwork; the customer signs it and pays.',
+    `Customer phone number: ${driveClient.formatPhoneForDisplay(externalNumber)}`,
+    callParties.systemRecordingPromptLine(),
+    direction !== 'OUTBOUND' && externalName
+      ? `Caller ID on file for this number (a carrier/line label, not necessarily a person's name - see instructions above): ${externalName}`
+      : null,
+    `Call started: ${driveClient.formatPacific(callCreated)}`,
+    `Call ended: ${driveClient.formatPacific(callEnded)}`,
+    formatHoldContextLine(detectHoldPeriods(rows)),
+  ].filter(Boolean);
+}
+
+function typedContextLines({ classified, direction, answered, twoSided, csrPath, externalNumber, externalName, callCreated, callEnded, rows }) {
+  const who = classified.partyName || (classified.type === 'vendor' ? 'the vendor' : 'the other team member');
+  const directionLine = classified.type === 'unknown'
+    ? `Call direction: ${direction || 'unknown'}. OUTBOUND means a Budget Blinds team member placed this call. INBOUND means the other party called Budget Blinds.`
+    : `Call direction: ${direction || 'unknown'} (OUTBOUND = a Budget Blinds team member placed this call to ${who}; INBOUND = ${who} called Budget Blinds). Never describe an outbound call as something the other party initiated.`;
+  const partyLine = classified.type === 'internal'
+    ? `Other party: ${classified.partyName || 'a Budget Blinds team member (name unknown)'}. Fixed call type: Internal team. Do not call them the customer.`
+    : classified.type === 'vendor'
+      ? `Other party: ${classified.partyName || 'a vendor or supplier'}. Fixed call type: Vendor. Do not call them the customer.`
+      : 'Call type: not yet determined. Choose it from the transcript and put it on the first line.';
+  return [
+    'Fixed facts (do not change these):',
+    partyLine,
+    directionLine,
+    answeredFactLine(answered, twoSided),
+    `Team member path (in order, if transferred/parked): ${(csrPath || []).join(' -> ') || 'unknown'}`,
+    `Phone number: ${driveClient.formatPhoneForDisplay(externalNumber)}`,
+    callParties.systemRecordingPromptLine(),
+    direction !== 'OUTBOUND' && externalName
+      ? `Caller ID on file for this number (a carrier/line label, not necessarily a person's name): ${externalName}`
+      : null,
+    `Call started: ${driveClient.formatPacific(callCreated)}`,
+    `Call ended: ${driveClient.formatPacific(callEnded)}`,
+    formatHoldContextLine(detectHoldPeriods(rows)),
+  ].filter(Boolean);
+}
+
+function buildSummaryMessages({
+  legRecords, csrPath, externalName, externalNumber, direction, callCreated, callEnded, answered, contactName, otherParty,
+}) {
     const guard = applyCardGuard(legRecords);
     const rows = allTranscriptRows(guard.legRecords);
     const conversationText = buildConversationText(rows);
     const twoSided = rowsAreTwoSidedConversation(rows);
-    const contextLines = [
-          'Fixed facts (do not change these):',
-          `Call direction: ${direction || 'unknown'} (OUTBOUND = a Budget Blinds team member placed this call to the customer; INBOUND = the customer called Budget Blinds - never describe an outbound call as something the customer did)`,
-          answeredFactLine(answered, twoSided),
-          `Team member path (in order, if transferred/parked): ${(csrPath || []).join(' -> ') || 'unknown'}`,
-          'Commercial roles (do not reverse): the team member sends any service order or warranty paperwork; the customer signs it and pays.',
-          `Customer phone number: ${driveClient.formatPhoneForDisplay(externalNumber)}`,
-          callParties.systemRecordingPromptLine(),
-          direction !== 'OUTBOUND' && externalName
-            ? `Caller ID on file for this number (a carrier/line label, not necessarily a person's name - see instructions above): ${externalName}`
-            : null,
-          `Call started: ${driveClient.formatPacific(callCreated)}`,
-          `Call ended: ${driveClient.formatPacific(callEnded)}`,
-          formatHoldContextLine(detectHoldPeriods(rows)),
-    ].filter(Boolean);
+    const classified = callType.classifyCall({
+      rows,
+      legRecords: guard.legRecords,
+      externalNumber,
+      externalName,
+      contactName,
+      otherParty,
+      csrPath,
+      roster: roster.getRoster(),
+    });
+    const contextLines = classified.type === 'customer'
+      ? customerContextLines({
+        direction, answered, twoSided, csrPath, externalNumber, externalName, callCreated, callEnded, rows,
+      })
+      : typedContextLines({
+        classified, direction, answered, twoSided, csrPath, externalNumber, externalName, callCreated, callEnded, rows,
+      });
     return {
-          system: SYSTEM_PROMPT,
+          system: systemPromptFor(classified.type),
           user: `${contextLines.join('\n')}\n\nTranscript:\n${conversationText}`,
           conversationText,
+          callType: classified.type,
+          callTypeLabel: classified.label,
+          partyName: classified.partyName,
+          callTypeSource: classified.source,
     };
 }
 
-// Sends the assembled call context to OpenAI and returns the formatted summary.
+// Heymarket POST /v1/contact/get returns HTTP 400 for these numbers, and logging
+// that failure on every call drowned out real errors. Coworker names already come
+// from the GoTo caller-id name, a roster phone or extension, or a contact name
+// the caller passes in. This does not call Heymarket.
+async function lookupContactName() {
+  return null;
+}
+
+function summaryResult(summary, callTypeName) {
+  const type = callTypeName || 'customer';
+  return {
+    summary,
+    callType: type,
+    callTypeLabel: callType.labelFor(type),
+  };
+}
+
+// Sends the assembled call context to OpenAI and returns { summary, callType, callTypeLabel }.
 // Throws on failure - the caller (src/interactions.js) catches and logs so a
 // summarization failure never crashes the webhook handler.
-async function summarizeInteraction({ legRecords, csrPath, externalName, externalNumber, direction, callCreated, callEnded, answered }) {
+async function summarizeInteraction({
+  legRecords, csrPath, externalName, externalNumber, direction, callCreated, callEnded, answered, contactName, otherParty,
+}) {
     const guard = applyCardGuard(legRecords);
+    const namedContact = contactName || await lookupContactName(externalNumber);
 
     const built = buildSummaryMessages({
-          legRecords: guard.legRecords, csrPath, externalName, externalNumber, direction, callCreated, callEnded, answered,
+          legRecords: guard.legRecords,
+          csrPath,
+          externalName,
+          externalNumber,
+          direction,
+          callCreated,
+          callEnded,
+          answered,
+          contactName: namedContact,
+          otherParty,
     });
 
   // A call with genuinely no transcript text has no real content for a model to
   // summarize - see buildNoTranscriptSummary above and header comment item 10 for why
   // this is built directly in code instead of asking OpenAI to describe it.
   if (!built.conversationText) {
-        return buildNoTranscriptSummary({ csrPath, externalNumber, direction, callCreated, answered });
+        const summary = buildNoTranscriptSummary({
+          csrPath, externalNumber, direction, callCreated, answered,
+          callType: built.callType,
+          partyName: built.partyName,
+        });
+        return summaryResult(summary, callType.callTypeForNote(built.callType, summary));
   }
 
   const userPrompt = built.user;
@@ -761,7 +943,10 @@ async function summarizeInteraction({ legRecords, csrPath, externalName, externa
   // before ever reaching Heymarket or the Doc.
   summary = summary.replace(/^\s*(CONSULTATION BOOKING|SERVICE\/SUPPORT ISSUE|GENERAL INQUIRY)\s*[-:]\s*/i, '');
 
-  return summary;
+  const callTypeName = callType.callTypeForNote(built.callType, summary);
+  summary = callType.stripCallTypeLine(summary);
+
+  return summaryResult(summary, callTypeName);
 }
 
 module.exports = {
@@ -770,4 +955,6 @@ module.exports = {
   formatLegTranscript,
   buildNoTranscriptSummary,
   buildSummaryMessages,
+  lookupContactName,
+  formatCallNote: callType.formatCallNote,
 };
