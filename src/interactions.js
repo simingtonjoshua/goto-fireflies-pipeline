@@ -530,6 +530,7 @@ function recordLegState(conversationSpaceId, {
                           leg.externalNumber = null;
                           leg.externalName = null;
                           leg.externalConflict = false;
+                          leg.callerNumbers = [];
                           leg.csrChain = [];
                           leg.customerAnswered = false;
                           leg.explicitlyUnanswered = false;
@@ -794,6 +795,7 @@ function recordRecordingLink(conversationSpaceId, recordingId, driveLink, folder
             if (folder && folder.id) {
                           leg.folderId = folder.id;
                           leg.folderLink = folder.webViewLink;
+                          if (folder.name) leg.folderName = folder.name;
             }
             if (!options || options.schedule !== false) scheduleFinalize(groupKeyFor(conversationSpaceId));
 }
@@ -960,8 +962,9 @@ function describeGroup(groupKey) {
             let externalNumber = externalConflict ? null : (numbers[0] || null);
             const substantive = legRecords.some((leg) => legIsSubstantive(leg));
             // A direct DID or forwarded inbound often has no call-state caller.
-            // Call history and the STARTING originator still carried it. Post that
-            // number for a real conversation instead of leaving the note unsent.
+            // Call history, the STARTING originator, and the call events report
+            // (ACTIVE states this webhook does not receive) still carried it. Post
+            // that number for a real conversation instead of leaving the note unsent.
             // A greeting with no conversation keeps the missing-number review.
             if (direction === 'INBOUND' && substantive) {
                           const recovered = callParties.uniqueExternalNumbers(
@@ -1106,6 +1109,10 @@ function scheduleFinalize(groupKey) {
                                           scheduleFinalize(groupKey);
                                           return;
                           }
+                          recoverMissingNumbers(groupKey).catch((err) => {
+                                          console.error(`Call events report number recovery failed for ${groupKey}: ${err.message}`);
+                          }).then(() => {
+                          if (closeTimers.has(groupKey)) return;
                           const described = describeGroup(groupKey);
                           if (described.legRecords.length) {
                                           const plan = planForGroup(groupKey, described);
@@ -1118,6 +1125,7 @@ function scheduleFinalize(groupKey) {
                           finalizeInteraction(groupKey).catch((err) =>
                                           console.error(`Error finalizing interaction ${groupKey}:`, err)
                                                                   );
+                          });
             }, FINALIZE_QUIET_MS);
             closeTimers.set(groupKey, timer);
 }
@@ -1247,6 +1255,114 @@ function applyFoundAnswerer(leg, found, source) {
             }, { requireAnswered: false, source });
 }
 
+// Reports already fetched for this process. A 404 is not recorded, so the next
+// quiet period can try again once GoTo has finished the report. A report that
+// came back is recorded so a second pass does not fetch it again.
+const fetchedReportIds = new Set();
+const reportAssociations = new Map();
+
+function reportBodyOf(report) {
+            if (!report || typeof report !== 'object') return null;
+            if (report.callStates || report.participants || report.caller || report.direction || report.associatedConversations) {
+                          return report;
+            }
+            if (report.content && typeof report.content === 'object') return report.content;
+            return report;
+}
+
+function rememberReportShape(id, report) {
+            if (!id || !report) return;
+            fetchedReportIds.add(id);
+            const body = reportBodyOf(report);
+            const associated = [...new Set(((body && body.associatedConversations) || []).filter(Boolean))];
+            if (associated.length) reportAssociations.set(id, associated);
+}
+
+function legNeedsReportNumber(leg) {
+            if (!leg) return false;
+            if ((leg.callerNumbers || []).length) return false;
+            if (leg.direction === 'OUTBOUND') return !leg.externalNumber;
+            if (leg.externalNumber && !leg.externalConflict) return false;
+            return true;
+}
+
+// Inbound numbers stay on callerNumbers until describeGroup, which only promotes
+// one number onto a conversation that has real speech. A greeting keeps the
+// missing-number review. Outbound callees are the customer, so they are stored
+// directly. A second, different number is the existing conflict path.
+function applyReportCustomerNumber(leg, report) {
+            if (!leg || !report) return null;
+            const found = callParties.customerNumberFromReport(report, roster.getRoster());
+            if (!found || !found.number) return null;
+            const already = callParties.sameCustomer(leg.externalNumber, found.number)
+                          || (leg.callerNumbers || []).some((number) => callParties.sameCustomer(number, found.number));
+            if (leg.direction === 'OUTBOUND') {
+                          if (leg.externalNumber && !callParties.sameCustomer(leg.externalNumber, found.number)) return null;
+                          setExternalNumber(leg, found.number);
+                          if (found.name && !leg.externalName) leg.externalName = found.name;
+                          if (!already) {
+                                          console.log(`Outbound number recovered from call events report for conversation ${leg.conversationSpaceId}.`);
+                          }
+                          return found.number;
+            }
+            rememberCallerNumber(leg, found.number);
+            if (found.name && !leg.externalName) leg.externalName = found.name;
+            if (!already) {
+                          console.log(`Inbound caller recovered from call events report for conversation ${leg.conversationSpaceId}.`);
+            }
+            return found.number;
+}
+
+function applyReportToNeedyLegs(ids, report) {
+            for (const id of ids) {
+                          const leg = legs.get(id);
+                          if (!leg || !legNeedsReportNumber(leg)) continue;
+                          applyReportCustomerNumber(leg, report);
+            }
+}
+
+// Call-state STARTING/ENDING often never carries the outside number; ACTIVE does,
+// and the call events report is the copy of those states. Follow associated
+// conversations (queue, transfer) because the number can sit on the other leg.
+async function recoverMissingNumbers(groupKey) {
+            const ids = [...conversationSpaceIdsFor(groupKey)];
+            if (!ids.some((id) => legNeedsReportNumber(legs.get(id)))) return;
+            const fetchReport = callReportFetcher || gotoClient.fetchCallEventsReport;
+            const queue = [];
+            for (const id of ids) {
+                          if (legNeedsReportNumber(legs.get(id)) && !fetchedReportIds.has(id)) queue.push(id);
+                          for (const associated of reportAssociations.get(id) || []) {
+                                          if (!fetchedReportIds.has(associated)) queue.push(associated);
+                          }
+            }
+            const seen = new Set();
+            let fetches = 0;
+            while (queue.length && fetches < 8) {
+                          const id = queue.shift();
+                          if (!id || seen.has(id)) continue;
+                          seen.add(id);
+                          if (fetchedReportIds.has(id)) {
+                                          for (const associated of reportAssociations.get(id) || []) queue.push(associated);
+                                          continue;
+                          }
+                          let report = null;
+                          try {
+                                          report = await fetchReport(id);
+                          } catch (err) {
+                                          console.error(`Call events report for ${id} failed: ${err.message}`);
+                                          continue;
+                          }
+                          fetches += 1;
+                          if (!report) continue;
+                          rememberReportShape(id, report);
+                          for (const associated of reportAssociations.get(id) || []) queue.push(associated);
+                          const own = legs.get(id);
+                          if (own) applyReportCustomerNumber(own, report);
+                          applyReportToNeedyLegs(ids, report);
+                          if (!ids.some((legId) => legNeedsReportNumber(legs.get(legId)))) return;
+            }
+}
+
 // Call Events Report is the primary inbound answerer. The webhook ENDING event
 // does not include participants, and this subscription does not receive ACTIVE,
 // which is where the answering extension is CONNECTED. Transcript self-intro
@@ -1272,6 +1388,7 @@ async function loadInboundAnswerers(groupKey) {
                                           continue;
                           }
                           if (!report) continue;
+                          rememberReportShape(id, report);
                           recordCallReport(id, report);
                           const body = report.callStates || report.participants ? report : (report.content || report);
                           for (const associated of body.associatedConversations || []) {
@@ -1296,6 +1413,9 @@ async function loadInboundAnswerers(groupKey) {
                                           continue;
                           }
                           if (!report) continue;
+                          rememberReportShape(id, report);
+                          const inboundLeg = legs.get(inboundId);
+                          if (inboundLeg) applyReportCustomerNumber(inboundLeg, report);
                           const answerers = callParties.answerersFromCallReport(report, book);
                           const leg = legs.get(inboundId);
                           if (!leg || !answerers.length) continue;
@@ -1307,6 +1427,8 @@ async function loadInboundAnswerers(groupKey) {
 function recordCallReport(conversationSpaceId, report) {
             const leg = legs.get(conversationSpaceId);
             if (!leg || !report) return [];
+            rememberReportShape(conversationSpaceId, report);
+            applyReportCustomerNumber(leg, report);
             const groupKey = groupKeyFor(conversationSpaceId);
             if (leg.direction === 'OUTBOUND' && !groupLooksInbound(groupKey)) return [];
             const book = roster.getRoster();
@@ -1345,6 +1467,7 @@ function applyTranscriptAnswerers(groupKey) {
 
 async function attributeInboundAnswerers(groupKey) {
             await loadInboundAnswerers(groupKey);
+            await recoverMissingNumbers(groupKey);
             applyTranscriptAnswerers(groupKey);
 }
 
@@ -1368,6 +1491,8 @@ async function finalizeInteraction(groupKey) {
                           scheduleFinalize(groupKey);
                           return;
             }
+            const missingNumberWarning = callParties.missingInboundNumberWarning(described);
+            if (missingNumberWarning) console.warn(missingNumberWarning);
             if (plan.suppressSibling) markSuppressed(plan.suppressSibling, { skipArtifacts: Boolean(plan.skipSiblingArtifacts) });
             console.log(`Team member source: ${described.teamMemberSource || 'none'}`);
             if (plan.action === 'post' || (plan.action === 'suppress' && /duplicate|overlapping/i.test(plan.reason))) {
@@ -1423,6 +1548,16 @@ async function finalizeInteraction(groupKey) {
                 try {
                                 const topFolderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
                                 const folderName = driveClient.buildCallFolderName({ callCreated, direction, externalNumber });
+                                // The recording is archived before the call events report is read, so its
+                                // folder can still say "unknown number". Rename that folder so the doc and
+                                // the audio stay together once the outside number is known.
+                                if (existingFolderLeg?.folderId && existingFolderLeg.folderName && existingFolderLeg.folderName !== folderName) {
+                                                try {
+                                                                await driveClient.renameFolder(existingFolderLeg.folderId, folderName);
+                                                } catch (err) {
+                                                                console.error(`Error renaming call folder ${existingFolderLeg.folderId} for interaction ${groupKey}: ${err.message}`);
+                                                }
+                                }
                                 const folder = await driveClient.getOrCreateCallFolder(topFolderId, folderName);
                                 folderLink = folder.webViewLink;
 
@@ -1553,6 +1688,8 @@ function resetForTests() {
             recentlyFinalizedConversationSpaceIds.clear();
             recentlyFinalizedByExternalNumber.clear();
             pendingHistory.length = 0;
+            fetchedReportIds.clear();
+            reportAssociations.clear();
 }
 
 function peekLeg(conversationSpaceId) {

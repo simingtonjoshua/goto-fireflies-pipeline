@@ -209,15 +209,39 @@ function usableCustomerNumber(number, roster) {
   return rosterApi.digitsOnly(number).length >= 10;
 }
 
+// Call-state webhooks put caller/callee on type. The call events report's
+// callStates wrap the same fields under type.phoneNumber. type.number is the
+// DID that was dialed (or our outbound caller-id) whenever caller/callee is set.
+function phoneBlock(participant) {
+  const type = typeOf(participant);
+  const nested = type.phoneNumber && typeof type.phoneNumber === 'object' ? type.phoneNumber : null;
+  if (!nested) return type;
+  return {
+    ...type,
+    ...nested,
+    caller: nested.caller || type.caller,
+    callee: nested.callee || type.callee,
+    number: nested.number || type.number,
+    name: nested.name || type.name,
+  };
+}
+
+function stringNumber(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  return text || null;
+}
+
 function pickExternalFromParticipants({ direction, participants, dialString, roster }) {
   const candidates = [];
   for (const participant of participants) {
     const kind = participantKind(participant);
     if (kind !== 'PHONE_NUMBER' && kind !== 'PHONE_NUMBER_UNKNOWN') continue;
-    const type = typeOf(participant);
-    if (type.caller?.number) candidates.push({ number: type.caller.number, name: type.caller.name || null, role: 'caller' });
-    if (type.callee?.number) candidates.push({ number: type.callee.number, name: type.callee.name || null, role: 'callee' });
-    if (type.number) candidates.push({ number: type.number, name: type.name || null, role: 'number' });
+    const block = phoneBlock(participant);
+    if (block.caller?.number) candidates.push({ number: block.caller.number, name: block.caller.name || null, role: 'caller' });
+    if (block.callee?.number) candidates.push({ number: block.callee.number, name: block.callee.name || null, role: 'callee' });
+    if (stringNumber(block.number)) candidates.push({ number: block.number, name: block.name || null, role: 'number' });
   }
   const usable = (candidate) => usableCustomerNumber(candidate.number, roster);
   if (direction === 'OUTBOUND') {
@@ -247,15 +271,18 @@ function originatorCustomerNumber(participants, roster) {
   for (const participant of participants || []) {
     if (!participantIsOriginator(participant)) continue;
     const type = typeOf(participant);
-    const callerObject = type.caller && typeof type.caller === 'object' ? type.caller.number : null;
+    const block = phoneBlock(participant);
+    const callerObject = block.caller && typeof block.caller === 'object' ? block.caller.number : null;
     const candidates = [
       callerObject,
-      typeof type.caller === 'string' ? type.caller : null,
+      typeof block.caller === 'string' ? block.caller : null,
       type.callerNumber,
+      block.callerNumber,
       type.ani,
-      type.phoneNumber,
+      typeof type.phoneNumber === 'string' ? type.phoneNumber : null,
       participant.callerNumber,
-      participant.phoneNumber,
+      typeof participant.phoneNumber === 'string' ? participant.phoneNumber : null,
+      !block.caller && !block.callee ? block.number : null,
     ];
     for (const candidate of candidates) {
       if (usableCustomerNumber(candidate, roster)) return candidate;
@@ -1344,6 +1371,99 @@ function answerersFromCallReport(report, roster = rosterApi.getRoster()) {
   return [];
 }
 
+function cleanExternalName(name) {
+  const text = String(name || '').trim();
+  if (!text) return null;
+  if (/^(unknown|anonymous|restricted|unavailable|private)$/i.test(text)) return null;
+  if (rosterApi.digitsOnly(text).length >= 10) return null;
+  return text;
+}
+
+function pushReportNumber(bucket, number, name, roster) {
+  if (!usableCustomerNumber(number, roster)) return;
+  bucket.push({ number: stringNumber(number) || number, name: cleanExternalName(name) });
+}
+
+// The live webhook is STARTING and ENDING. ENDING participants are empty, and the
+// outside party's number is often only on an ACTIVE state. That state is in the
+// call events report, which this service already fetches to name the answerer.
+// Summary participants keep caller/callee on type. callStates nest them under
+// type.phoneNumber. On either shape, type.number (or phoneNumber.number) is the
+// dialed DID or our outbound caller-id when caller or callee is also present.
+// Report summaries put the outside party on the top-level caller.number and the
+// DID on caller.type.number.
+function customerNumberFromReport(report, roster = rosterApi.getRoster()) {
+  const body = reportBody(report);
+  if (!body) return { number: null, name: null, direction: null };
+  const direction = normalizeDirection(body.direction || (body.metadata && body.metadata.direction));
+  const callers = [];
+  const callees = [];
+  const parties = [];
+
+  const topCaller = body.caller && typeof body.caller === 'object' ? body.caller : null;
+  if (topCaller) {
+    pushReportNumber(callers, topCaller.number, topCaller.name, roster);
+    const nested = topCaller.type && typeof topCaller.type === 'object' ? topCaller.type : null;
+    if (nested && nested.caller) pushReportNumber(callers, nested.caller.number, nested.caller.name, roster);
+    if (nested && nested.callee) pushReportNumber(callees, nested.callee.number, nested.callee.name, roster);
+  }
+  const topCallee = body.callee && typeof body.callee === 'object' ? body.callee : null;
+  if (topCallee) pushReportNumber(callees, topCallee.number, topCallee.name, roster);
+  const dialString = body.dialString || (body.metadata && body.metadata.dialString);
+  if (direction !== 'INBOUND') pushReportNumber(callees, dialString, null, roster);
+
+  const participants = [...(body.participants || [])];
+  for (const state of body.callStates || []) {
+    for (const participant of state.participants || []) participants.push(participant);
+  }
+  for (const participant of participants) {
+    const kind = participantKind(participant);
+    if (kind !== 'PHONE_NUMBER' && kind !== 'PHONE_NUMBER_UNKNOWN') continue;
+    const block = phoneBlock(participant);
+    const caller = block.caller && typeof block.caller === 'object' ? block.caller : null;
+    const callee = block.callee && typeof block.callee === 'object' ? block.callee : null;
+    if (caller) pushReportNumber(callers, caller.number, caller.name, roster);
+    if (callee) pushReportNumber(callees, callee.number, callee.name, roster);
+    // No separate caller/callee: the participant number is the outside party
+    // (the shape some report states use). When caller/callee exist, that
+    // number is the DID or our caller-id and must not be the customer.
+    if (!caller && !callee) {
+      pushReportNumber(parties, block.number, block.name, roster);
+      if (participant.number && participant.number !== block.number) {
+        pushReportNumber(parties, participant.number, participant.name, roster);
+      }
+    }
+  }
+
+  const uniqueOf = (bucket) => uniqueExternalNumbers(bucket.map((item) => item.number));
+  let chosen = [];
+  if (direction === 'OUTBOUND') chosen = uniqueOf(callees);
+  else if (direction === 'INBOUND') chosen = uniqueOf(callers);
+  else chosen = uniqueExternalNumbers([...callers, ...callees].map((item) => item.number));
+  if (chosen.length !== 1 && direction !== 'OUTBOUND') {
+    const party = uniqueOf(parties);
+    if (chosen.length === 0 && party.length === 1) chosen = party;
+  }
+  if (chosen.length !== 1) return { number: null, name: null, direction };
+  const number = chosen[0];
+  const named = [...callers, ...callees, ...parties].find((item) => item.name && sameCustomer(item.number, number));
+  return { number, name: named ? named.name : null, direction };
+}
+
+// A real inbound conversation (the customer said something that is not a
+// recording) that still has no number after every GoTo source was checked.
+function missingInboundNumberWarning(described, roster = rosterApi.getRoster()) {
+  if (!described || described.direction !== 'INBOUND' || described.externalNumber) return null;
+  const spoke = (described.legRecords || []).some((leg) => {
+    const texts = speakerTexts(leg, roster);
+    return Boolean(texts && texts.customerText && texts.customerText.trim());
+  });
+  if (!spoke) return null;
+  const ids = [...(described.conversationSpaceIds || [])].filter(Boolean);
+  if (!ids.length) return null;
+  return `WARNING: inbound interaction has customer speech but no phone number conversationSpaceId=${ids.join(',')}`;
+}
+
 function uniqueExternalNumbers(numbers) {
   const seen = new Map();
   for (const number of numbers) {
@@ -1366,6 +1486,8 @@ module.exports = {
   callIsFragment,
   answererFromTranscript,
   answerersFromCallReport,
+  customerNumberFromReport,
+  missingInboundNumberWarning,
   teamChannelAnswerer,
   outboundIntroAnswerer,
   postingPlan,
