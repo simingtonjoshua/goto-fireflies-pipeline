@@ -399,7 +399,11 @@ async function archiveToDrive(recordingId, buffer, contentType, meta, options) {
                   console.log(`Archived recording ${recordingId} to Google Drive folder "${folderName}": ${webViewLink}`);
 
           if (meta.conversationSpaceId) {
-                      interactions.recordRecordingLink(meta.conversationSpaceId, recordingId, webViewLink, folder, options);
+                      interactions.recordRecordingLink(meta.conversationSpaceId, recordingId, webViewLink, {
+                                  id: folder.id,
+                                  webViewLink: folder.webViewLink,
+                                  name: folderName,
+                      }, options);
           } else {
                       console.log(
                                     `Recording ${recordingId} archived to Drive but has no known conversationSpaceId yet - the link won't be attached to an interaction (same "orphan recording" case handleTranscriptReady logs).`
