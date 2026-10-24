@@ -216,8 +216,9 @@
 // mention it when present.
 // 13) CALL TYPE (team and vendor calls were still written as customer calls). The
 // prompt below stays the customer prompt. classifyCall (src/callType.js) picks
-// internal, vendor, or undecided first; those calls get their own instructions
-// and the note/doc gain a "Call type" line. Customer calls keep this prompt.
+// internal or vendor only on a strong signal; everything else, including an
+// unclear commerce word, keeps this prompt. The note and doc gain a "Call type"
+// line. Other/unknown from the model is written as Customer.
 
 const fetch = require('node-fetch');
 const driveClient = require('./driveClient');
@@ -225,7 +226,6 @@ const callParties = require('./callParties');
 const roster = require('./roster');
 const cardRedact = require('./cardRedact');
 const callType = require('./callType');
-const heymarketClient = require('./heymarketClient');
 
 const OPENAI_URL = 'https://api.openai.com/v1/chat/completions';
 const MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
@@ -858,16 +858,12 @@ function buildSummaryMessages({
     };
 }
 
-async function lookupContactName(phoneNumber) {
-  if (!phoneNumber) return null;
-  if (!process.env.HEYMARKET_API_SECRET_ID || !process.env.HEYMARKET_API_SECRET_KEY) return null;
-  try {
-    const contact = await heymarketClient.getContactByPhone(phoneNumber);
-    return callType.contactName(contact);
-  } catch (err) {
-    console.error('Call-type contact lookup failed. Continuing without the contact name.');
-    return null;
-  }
+// Heymarket POST /v1/contact/get returns HTTP 400 for these numbers, and logging
+// that failure on every call drowned out real errors. Coworker names already come
+// from the GoTo caller-id name, a roster phone or extension, or a contact name
+// the caller passes in. This does not call Heymarket.
+async function lookupContactName() {
+  return null;
 }
 
 function summaryResult(summary, callTypeName) {
@@ -910,7 +906,7 @@ async function summarizeInteraction({
           callType: built.callType,
           partyName: built.partyName,
         });
-        return summaryResult(summary, built.callType);
+        return summaryResult(summary, callType.callTypeForNote(built.callType, summary));
   }
 
   const userPrompt = built.user;
@@ -947,10 +943,7 @@ async function summarizeInteraction({
   // before ever reaching Heymarket or the Doc.
   summary = summary.replace(/^\s*(CONSULTATION BOOKING|SERVICE\/SUPPORT ISSUE|GENERAL INQUIRY)\s*[-:]\s*/i, '');
 
-  let callTypeName = built.callType === 'unknown' ? 'customer' : built.callType;
-  if (built.callType === 'unknown') {
-    callTypeName = callType.parseCallTypeLine(summary) || 'customer';
-  }
+  const callTypeName = callType.callTypeForNote(built.callType, summary);
   summary = callType.stripCallTypeLine(summary);
 
   return summaryResult(summary, callTypeName);
@@ -962,5 +955,6 @@ module.exports = {
   formatLegTranscript,
   buildNoTranscriptSummary,
   buildSummaryMessages,
+  lookupContactName,
   formatCallNote: callType.formatCallNote,
 };

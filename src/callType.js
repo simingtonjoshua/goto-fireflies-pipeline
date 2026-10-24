@@ -1,16 +1,21 @@
 // Decides who a call was with before the summary is written.
 //
 // Strong signals, in order: a roster extension, a phone learned from GoTo's user
-// record or a private roster file, GoTo's own party name, then a Heymarket contact
-// whose display name matches a roster full name. The transcript is the fallback:
-// the other party introducing themselves as a roster member, talking about "the
-// customer" as someone else, or a vendor company introduction / vendor phone menu.
-// A customer or prospect is the default, and that path keeps the existing prompt.
+// record or a private roster file, GoTo's own party name, then a contact name
+// passed in whose display name matches a roster full name. The transcript is a
+// fallback only when the signal is strong: the other party uses a roster full
+// name, two distinct first-person coworker signals, a real
+// "this is <Name> from/with <Company>" introduction, or a specific vendor menu.
+// One mention of "the customer", "our customer", "the homeowner", or "on the
+// install" is not an internal call. "Calling from", "here with", a street, a
+// place, "my cell", and "my husband" are not a vendor. Order words such as
+// backorder, purchase order, and order desk stay on the customer prompt.
+// A customer or prospect is the default.
 //
 // Personal numbers are not stored in git. Vendors are not a phone directory —
 // they are recognized from what was said.
 
-const BUSINESS_NAME = /budget\s*(?:blinds|lines|minds|binds|lions|blends|blind)\b/i;
+const BUSINESS_NAME = /budget\s*(?:blinds|brinds|lines|minds|binds|lions|blends|blind)\b/i;
 
 const GENERIC_PARTY_NAME = /^(wireless caller|unknown|unavailable|private|anonymous|toll free call|toll free|caller|no name|restricted|cid unavailable)$/i;
 
@@ -18,11 +23,37 @@ const VENDOR_IVR = /\b(dedicated support line|estimated wait time|save your plac
 
 const VENDOR_REACHED = /\byou have reached\b[\s\S]{0,80}\bsupport\b/i;
 
-const VENDOR_HINT = /\b(back\s?orders?|purchase orders?|po\s*(?:number|#)|accounts payable|accounts receivable|order desk)\b/i;
+// "This is <Person> from/with <Company>" only. "I'm calling from…", "here with…",
+// and "at <street>" are customer speech and are not matched here.
+const COMPANY_INTRO = /\bthis is\s+([a-z][a-z']+(?:\s+[a-z][a-z']+){0,2})\s+(?:from|with)\s+([a-z0-9][a-z0-9&.'’ -]{1,60})/gi;
 
-const STAFF_TALK = /\b(?:the|our|that|this)\s+(?:customer|client|homeowner)\b|\b(?:heading|going|on my way)\s+to\s+the\s+(?:job|install|measure)\b|\b(?:on|at)\s+the\s+(?:install|measure)\b/i;
+const NOT_A_PERSON = new Set([
+  'calling', 'here', 'just', 'now', 'still', 'also', 'someone', 'somebody', 'there', 'this',
+]);
 
-const COMPANY_INTRO = /\b(?:this is|i'm|i am|my name is)\s+[a-z][a-z']+(?:\s+[a-z][a-z']+){0,2}\s+(?:from|with|at)\s+([a-z0-9][a-z0-9&.' -]{1,60})/gi;
+const PERSONAL_COMPANY = /^(my|our|his|her|their|the|a|an)\b|\b(cell|cellphone|mobile|phone|husband|wife|spouse|mom|dad|mother|father|boyfriend|girlfriend|friend|neighbor|neighbour)\b/i;
+
+const STREET_ADDRESS = /^\d|\b(street|st|avenue|ave|road|rd|drive|dr|lane|ln|boulevard|blvd|court|ct|circle|cir|place|pl|terrace|ter|parkway|pkwy|highway|hwy)\b/i;
+
+const PLACE_LAST_WORD = /^(grove|heights|hills|creek|valley|beach|springs|village|ridge|acres|meadows|falls|lake|lakes|landing|harbor|harbour|island|islands|ranch|estates|manor|woods|junction|crossing|prairie|mesa|canyon|bluff|bluffs|shore|shores|county|parish|gardens|garden|park)$/i;
+
+const PLACE_NAMES = new Set([
+  'sacramento', 'roseville', 'folsom', 'davis', 'auburn', 'rocklin', 'lincoln', 'woodland',
+  'galt', 'lodi', 'stockton', 'modesto', 'tracy', 'manteca', 'carmichael', 'orangevale',
+  'antelope', 'natomas', 'reno', 'sparks', 'tahoe', 'california', 'elk grove',
+  'rancho cordova', 'citrus heights', 'fair oaks', 'granite bay', 'el dorado hills',
+  'west sacramento', 'north highlands', 'rio linda', 'elverta', 'cameron park',
+  'placerville', 'loomis',
+]);
+
+// First-person coworker logistics. "The customer", "our customer", "the homeowner",
+// and "on the install" are not in this list: an outside caller says those about
+// their own job. Two different signals are required. One is still a customer call.
+const STRONG_STAFF_SIGNALS = [
+  /\b(?:i'm|i am|we're|we are)\s+(?:heading|going|on my way)\s+to\s+(?:the\s+)?(?:job|install|measure)\b/i,
+  /\b(?:i'll|i will|we'll|we will)\s+(?:meet you|see you|be there)\s+(?:at|for)\s+the\s+(?:job|install|measure)\b/i,
+  /\b(?:bring|bringing|grab|grabbing)\s+the\s+(?:paperwork|invoice|samples)\b/i,
+];
 
 const CALL_TYPE_LABELS = {
   customer: 'Customer',
@@ -98,18 +129,47 @@ function joined(rows) {
   return (rows || []).map((row) => row.text || '').join('\n');
 }
 
+function plausiblePerson(name) {
+  const words = String(name || '').trim().split(/\s+/).filter(Boolean);
+  if (!words.length || words.length > 3) return false;
+  return words.every((word) => (
+    /^[a-z][a-z']+$/i.test(word) && !NOT_A_PERSON.has(word.toLowerCase())
+  ));
+}
+
+function isPlace(text) {
+  const normalized = String(text || '').toLowerCase().replace(/\./g, '').replace(/\s+/g, ' ').trim();
+  if (!normalized) return false;
+  const last = normalized.split(' ').pop();
+  if (PLACE_LAST_WORD.test(last)) return true;
+  if (PLACE_NAMES.has(normalized)) return true;
+  const stripped = normalized.replace(/^(north|south|east|west|greater|downtown)\s+/, '');
+  return stripped !== normalized && PLACE_NAMES.has(stripped);
+}
+
+function plausibleCompany(company) {
+  const text = String(company || '').replace(/\s+/g, ' ').trim();
+  const words = text.split(' ').filter(Boolean);
+  if (words.length < 2 || words.length > 4) return false;
+  if (BUSINESS_NAME.test(text)) return false;
+  if (PERSONAL_COMPANY.test(text)) return false;
+  if (STREET_ADDRESS.test(text)) return false;
+  if (isPlace(text)) return false;
+  return true;
+}
+
 function companyFrom(text) {
-  const found = [];
   const re = new RegExp(COMPANY_INTRO.source, 'gi');
   let match = re.exec(text);
   while (match) {
-    let company = String(match[1] || '').split(/[.,!?;]/)[0];
+    const person = String(match[1] || '').trim();
+    let company = String(match[2] || '').split(/[.,!?;]/)[0];
     company = company.split(/\b(?:and|to|about|regarding|calling|for)\b/i)[0];
     company = company.trim().split(/\s+/).slice(0, 4).join(' ');
-    if (company && !BUSINESS_NAME.test(company)) found.push(company);
+    if (plausiblePerson(person) && plausibleCompany(company)) return company;
     match = re.exec(text);
   }
-  return found[0] || null;
+  return null;
 }
 
 function transcriptTeam(externalText, teamText, book) {
@@ -130,15 +190,15 @@ function transcriptTeam(externalText, teamText, book) {
 
 function staffTalk(text) {
   const cleaned = String(text || '').replace(/\b(?:i am|i'm)\s+the\s+customer\b/gi, '');
-  return STAFF_TALK.test(cleaned);
+  const hits = STRONG_STAFF_SIGNALS.filter((pattern) => pattern.test(cleaned)).length;
+  return hits >= 2;
 }
 
 function vendorIvr(rows) {
   const text = joined(rows);
-  if (VENDOR_IVR.test(text) || VENDOR_REACHED.test(text)) return true;
-  // "Thank you for calling Hunter Douglas" is a vendor menu. Our own greeting
-  // says Budget Blinds and stays a customer call.
-  return /\bthank you for calling\b/i.test(text) && !BUSINESS_NAME.test(text);
+  // A "thank you for calling …" greeting is not a vendor menu. A garbled
+  // "Thank you for calling Budget Brinds of Sacramento" is still our customer line.
+  return VENDOR_IVR.test(text) || VENDOR_REACHED.test(text);
 }
 
 function otherPartyOf(legRecords, explicit) {
@@ -202,10 +262,6 @@ function classifyCall({
   }
   if (staffTalk(externalText)) return result('internal', 'transcript-staff', null);
 
-  if (VENDOR_HINT.test(externalText) || VENDOR_HINT.test(teamText)) {
-    return result('unknown', 'transcript-hint', null);
-  }
-
   return result('customer', 'default', null);
 }
 
@@ -224,6 +280,18 @@ function stripCallTypeLine(summary) {
   return String(summary || '').replace(/^\s*call type\s*:\s*[^\n]*\n*/i, '').trim();
 }
 
+// Ambiguous calls stay Customer. Other and unknown from the model are Customer.
+// A decided internal or vendor classification is kept. Vendor or internal is
+// taken from the model only when this call was not already classified.
+function callTypeForNote(classifiedType, summary) {
+  if (classifiedType === 'customer' || classifiedType === 'internal' || classifiedType === 'vendor') {
+    return classifiedType;
+  }
+  const parsed = parseCallTypeLine(summary);
+  if (parsed === 'internal' || parsed === 'vendor') return parsed;
+  return 'customer';
+}
+
 function formatCallNote({ summary, callTypeLabel, folderLink }) {
   const lines = [`Call type: ${callTypeLabel || CALL_TYPE_LABELS.other}`, '', String(summary || '').trim()];
   if (folderLink) lines.push('', `Call recording & transcript: ${folderLink}`);
@@ -235,6 +303,7 @@ module.exports = {
   contactName,
   parseCallTypeLine,
   stripCallTypeLine,
+  callTypeForNote,
   formatCallNote,
   labelFor,
   CALL_TYPE_LABELS,

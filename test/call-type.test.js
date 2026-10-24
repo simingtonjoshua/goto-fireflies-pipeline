@@ -266,7 +266,7 @@ describe('call type classification', () => {
     const menu = messages({
       transcript: {
         results: [
-          { transcript: 'Thank you for calling Hunter Douglas.', channel: 1, startTimeMs: 0 },
+          { transcript: 'You have reached Hunter Douglas support. This is a dedicated support line. Your estimated wait time is five minutes.', channel: 1, startTimeMs: 0 },
           { transcript: 'I am waiting on the order desk.', channel: 0, startTimeMs: 8000 },
         ],
       },
@@ -286,7 +286,7 @@ describe('call type classification', () => {
     assert.equal(ourGreeting.callType, 'customer');
   });
 
-  it('uses the transcript when a coworker talks about a customer or introduces a full name', () => {
+  it('keeps one outside mention of the customer as a customer call, and uses a roster full name', () => {
     roster.resetRosterForTests();
     const staff = messages({
       externalName: 'WIRELESS CALLER',
@@ -297,8 +297,8 @@ describe('call type classification', () => {
         ],
       },
     });
-    assert.equal(staff.callType, 'internal');
-    assert.equal(staff.callTypeSource, 'transcript-staff');
+    assert.equal(staff.callType, 'customer');
+    assert.match(staff.system, /You summarize customer phone calls/);
 
     const introduced = messages({
       transcript: {
@@ -312,7 +312,7 @@ describe('call type classification', () => {
     assert.equal(introduced.partyName, 'James Bullock');
   });
 
-  it('asks the model to decide when the transcript only hints at a vendor', () => {
+  it('keeps purchase-order talk on the customer prompt', () => {
     roster.resetRosterForTests();
     const built = messages({
       transcript: {
@@ -322,12 +322,23 @@ describe('call type classification', () => {
         ],
       },
     });
-    assert.equal(built.callType, 'unknown');
-    assert.match(built.system, /Call type: Vendor/);
-    assert.match(built.system, /Call type: Internal team/);
+    assert.equal(built.callType, 'customer');
+    assert.equal(built.callTypeLabel, 'Customer');
     assert.match(built.system, /You summarize customer phone calls/);
+    assert.doesNotMatch(built.system, /Decide the call type/);
+    assert.match(built.user, /Customer phone number/);
+    assert.doesNotMatch(built.user, /Call type: not yet determined/);
     assert.equal(callType.parseCallTypeLine('Call type: Vendor\n\nThe rep confirmed the backorder.'), 'vendor');
     assert.equal(callType.parseCallTypeLine('Call type: Other\n\nUnclear.'), 'other');
+    assert.equal(callType.callTypeForNote('unknown', 'Call type: Other\n\nUnclear.'), 'customer');
+    assert.equal(callType.callTypeForNote('unknown', 'Call type: unknown\n\nUnclear.'), 'customer');
+    assert.equal(callType.callTypeForNote('customer', 'Call type: Other\n\nThe backorder on my shades.'), 'customer');
+    const note = callType.formatCallNote({
+      summary: callType.stripCallTypeLine('Call type: Other\n\nUnclear.'),
+      callTypeLabel: callType.labelFor(callType.callTypeForNote('unknown', 'Call type: Other\n\nUnclear.')),
+    });
+    assert.match(note, /^Call type: Customer\n\nUnclear\.$/);
+    assert.doesNotMatch(note, /Other/);
     assert.equal(
       callType.stripCallTypeLine('Call type: Internal team\n\nJames and Joshua compared the invoice.'),
       'James and Joshua compared the invoice.',
@@ -379,5 +390,101 @@ describe('call type classification', () => {
     assert.match(html, /<b>Call type:<\/b> Internal team/);
     assert.match(html, /<h2>Summary<\/h2>/);
     assert.match(html, /Joshua and James compared an invoice\./);
+  });
+
+  it('classifies an outside caller as internal only with two coworker signals', () => {
+    roster.resetRosterForTests();
+    const built = messages({
+      externalName: 'WIRELESS CALLER',
+      transcript: {
+        results: [
+          { transcript: 'Where are you?', channel: 0, startTimeMs: 0 },
+          { transcript: 'I am heading to the install. I will meet you at the measure.', channel: 1, startTimeMs: 2000 },
+        ],
+      },
+    });
+    assert.equal(built.callType, 'internal');
+    assert.equal(built.callTypeSource, 'transcript-staff');
+    assert.match(built.system, /internal phone calls/i);
+  });
+});
+
+describe('ordinary customer phrasing stays a customer call', () => {
+  const phrases = [
+    "I'm calling from my cell",
+    'I am here with my husband',
+    "I'm John at 4521 Oak Street",
+    'Hi this is Mary from Elk Grove',
+    'Thank you for calling Budget Brinds of Sacramento',
+    'the backorder on my shades',
+    'the purchase order on my shades',
+    'please check the order desk for my shades',
+    'our customer wants shutters',
+    'is somebody on the install tomorrow',
+    'the homeowner is ready for the measure',
+  ];
+
+  for (const phrase of phrases) {
+    it(`keeps the customer prompt for: ${phrase}`, () => {
+      roster.resetRosterForTests();
+      const built = messages({
+        externalName: 'WIRELESS CALLER',
+        transcript: {
+          results: [
+            { transcript: phrase, channel: 1, startTimeMs: 0 },
+            { transcript: 'I can help with that.', channel: 0, startTimeMs: 2000 },
+          ],
+        },
+      });
+      assert.equal(built.callType, 'customer', phrase);
+      assert.equal(built.callTypeLabel, 'Customer');
+      assert.equal(built.callTypeSource, 'default');
+      assert.match(built.system, /You summarize customer phone calls/);
+      assert.doesNotMatch(built.system, /Decide the call type/);
+      assert.match(built.user, /Customer phone number/);
+      assert.match(built.user, /to the customer/);
+      assert.doesNotMatch(built.user, /Fixed call type/);
+      assert.doesNotMatch(built.user, /Call type: not yet determined/);
+    });
+  }
+
+  it('does not call Heymarket or log when resolving a contact name', async () => {
+    const http = require('http');
+    const https = require('https');
+    const saved = {
+      id: process.env.HEYMARKET_API_SECRET_ID,
+      key: process.env.HEYMARKET_API_SECRET_KEY,
+    };
+    const originalHttp = http.request;
+    const originalHttps = https.request;
+    const originalError = console.error;
+    const errors = [];
+    let requests = 0;
+    process.env.HEYMARKET_API_SECRET_ID = 'test-secret-id';
+    process.env.HEYMARKET_API_SECRET_KEY = 'test-secret-key';
+    console.error = (...args) => {
+      errors.push(args.map((part) => String(part)).join(' '));
+    };
+    http.request = function (...args) {
+      requests += 1;
+      return originalHttp.apply(this, args);
+    };
+    https.request = function (...args) {
+      requests += 1;
+      return originalHttps.apply(this, args);
+    };
+    try {
+      assert.equal(await openaiClient.lookupContactName(CUSTOMER), null);
+      assert.equal(requests, 0);
+      assert.deepEqual(errors, []);
+    } finally {
+      http.request = originalHttp;
+      https.request = originalHttps;
+      console.error = originalError;
+      if (saved.id === undefined) delete process.env.HEYMARKET_API_SECRET_ID;
+      else process.env.HEYMARKET_API_SECRET_ID = saved.id;
+      if (saved.key === undefined) delete process.env.HEYMARKET_API_SECRET_KEY;
+      else process.env.HEYMARKET_API_SECRET_KEY = saved.key;
+    }
   });
 });
