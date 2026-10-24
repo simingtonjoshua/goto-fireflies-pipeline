@@ -396,6 +396,7 @@ function applyHistory(leg, analysis, options = {}) {
                           setExternalNumber(leg, analysis.externalNumber, { caller: inboundCaller });
             }
             if (!leg.externalName && analysis.externalName) leg.externalName = analysis.externalName;
+            if (analysis.otherParty) leg.otherParty = analysis.otherParty;
             if (analysis.answered) {
                           leg.sawAnswer = true;
                           leg.explicitlyUnanswered = false;
@@ -529,6 +530,7 @@ function recordLegState(conversationSpaceId, {
                           leg.extraLegIds = new Set();
                           leg.externalNumber = null;
                           leg.externalName = null;
+                          leg.otherParty = null;
                           leg.externalConflict = false;
                           leg.callerNumbers = [];
                           leg.csrChain = [];
@@ -988,6 +990,7 @@ function describeGroup(groupKey) {
                           externalNumber,
                           externalConflict,
                           externalName: legRecords.find((leg) => leg.externalName)?.externalName,
+                          otherParty: legRecords.map((leg) => leg.otherParty).find((party) => party && (party.name || party.extension)) || null,
                           direction,
                           callCreated,
                           callEnded,
@@ -1155,14 +1158,17 @@ function escapeHtml(text) {
 // inbound calls, and only as a clearly separate line - never presented as if it were the
 // customer's name, and never shown at all for outbound calls (where that metadata
 // describes our own line, not the customer's).
-function buildTranscriptDocHtml({ externalName, externalNumber, direction, csrPath, callCreated, callEnded, summaryText, legRecords }) {
+function buildTranscriptDocHtml({ externalName, externalNumber, direction, csrPath, callCreated, callEnded, summaryText, legRecords, callTypeLabel }) {
             const metaRows = [['Phone number', escapeHtml(driveClient.formatPhoneForDisplay(externalNumber))]];
             if (direction !== 'OUTBOUND' && externalName) {
                           metaRows.push(['Caller ID', escapeHtml(externalName)]);
             }
             metaRows.push(
                           ['Direction', escapeHtml(direction || 'unknown')],
-                          ['Team Member(s)', escapeHtml((csrPath || []).join(' → ') || 'unknown')],
+                          ['Team Member(s)', escapeHtml((csrPath || []).join(' → ') || 'unknown')]
+                        );
+            if (callTypeLabel) metaRows.push(['Call type', escapeHtml(callTypeLabel)]);
+            metaRows.push(
                           ['Call started', escapeHtml(driveClient.formatPacific(callCreated))],
                           ['Call ended', escapeHtml(driveClient.formatPacific(callEnded))]
                         );
@@ -1475,7 +1481,7 @@ async function finalizeInteraction(groupKey) {
             await attributeInboundAnswerers(groupKey);
             const described = describeGroup(groupKey);
             const {
-                          conversationSpaceIds, legRecords, csrPath, externalNumber, externalName,
+                          conversationSpaceIds, legRecords, csrPath, externalNumber, externalName, otherParty,
                           direction, callCreated, callEnded, answered,
             } = described;
 
@@ -1525,7 +1531,7 @@ async function finalizeInteraction(groupKey) {
             try {
                           const cardFlagged = legRecords.some((leg) => leg.cardFlagged);
                           await releaseHeldAudio(conversationSpaceIds, cardFlagged);
-                          const summaryText = await openaiClient.summarizeInteraction({
+                          const summaryResult = await openaiClient.summarizeInteraction({
                                           legRecords,
                                           csrPath,
                                           externalName,
@@ -1534,7 +1540,10 @@ async function finalizeInteraction(groupKey) {
                                           callCreated,
                                           callEnded,
                                           answered,
+                                          otherParty,
                           });
+                          const summaryText = summaryResult.summary;
+                          const callTypeLabel = summaryResult.callTypeLabel;
 
               // Find-or-create the same per-call subfolder server.js's archiveToDrive already
               // created (or will create) for this call's recording - both sides compute the
@@ -1570,6 +1579,7 @@ async function finalizeInteraction(groupKey) {
                                     callEnded,
                                     summaryText,
                                     legRecords,
+                                    callTypeLabel,
                   });
                                 await driveClient.createTranscriptDoc(folder.id, `${folderName} - Call Summary & Transcript`, docHtml);
                                 console.log(`Created transcript Doc for interaction ${groupKey} in folder ${folder.id}.`);
@@ -1577,11 +1587,11 @@ async function finalizeInteraction(groupKey) {
                                 console.error(`Error creating transcript Doc for interaction ${groupKey}:`, err);
                 }
 
-              const noteLines = [summaryText];
-                if (folderLink) {
-                                noteLines.push('', `Call recording & transcript: ${folderLink}`);
-                }
-                const noteText = noteLines.join('\n');
+              const noteText = openaiClient.formatCallNote({
+                                summary: summaryText,
+                                callTypeLabel,
+                                folderLink,
+              });
 
                           if (plan.action === 'post' && externalNumber) {
                                           await heymarketClient.postPrivateNote(externalNumber, noteText, direction);

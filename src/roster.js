@@ -29,10 +29,44 @@ function last10(value) {
   return digits.slice(-10);
 }
 
+// "Bullock, James" and extra spaces still match the roster's "James Bullock".
+function normalizePartyName(value) {
+  let text = String(value || '').trim().replace(/\s+/g, ' ');
+  if (!text) return '';
+  const comma = text.match(/^([A-Za-z][A-Za-z']+),\s*([A-Za-z][A-Za-z']+(?:\s+[A-Za-z][A-Za-z']+)*)$/);
+  if (comma) text = `${comma[2]} ${comma[1]}`;
+  return text.toLowerCase();
+}
+
+function collectUserPhones(user) {
+  const values = [];
+  const push = (value) => {
+    if (value == null) return;
+    if (typeof value === 'object') {
+      push(value.number);
+      push(value.phoneNumber);
+      push(value.directNumber);
+      push(value.callerId);
+      return;
+    }
+    values.push(value);
+  };
+  if (!user || typeof user !== 'object') return values;
+  push(user.mobile);
+  push(user.mobilePhone);
+  push(user.directNumber);
+  for (const key of ['lines', 'extensions', 'phoneNumbers', 'phones']) {
+    for (const item of user[key] || []) push(item);
+  }
+  return values;
+}
+
 class Roster {
   constructor(config = {}, systemNumbers = []) {
+    this.people = [];
     this.byExtension = new Map();
     this.byUserKey = new Map();
+    this.byPhone = new Map();
     this.firstNames = [];
     this.systemNumbers = new Set();
     for (const raw of systemNumbers) {
@@ -50,18 +84,43 @@ class Roster {
       heymarketUserId: person.heymarketUserId || null,
       recordedGreeting: Boolean(person.recordedGreeting),
       userKey: person.userKey || null,
+      phones: new Set(),
     };
+    this.people.push(entry);
     if (extension) this.byExtension.set(extension, entry);
     if (entry.userKey) this.byUserKey.set(String(entry.userKey), entry);
+    for (const raw of person.phones || []) this.rememberPhone(entry, raw);
     const first = String(person.name || '').trim().split(/\s+/)[0];
     if (first && !this.firstNames.includes(first)) this.firstNames.push(first);
     if (first === 'Joshua' && !this.firstNames.includes('Josh')) this.firstNames.push('Josh');
+  }
+
+  // A 10-digit DID or cell learned from GoTo (or a private roster file) is a team
+  // line. Extensions and the published system numbers are not stored here. Nothing
+  // is written back to the config file — the repo is public.
+  rememberPhone(entry, number) {
+    if (!entry) return false;
+    const digits = digitsOnly(number);
+    if (!digits || digits.length <= 6) return false;
+    const ten = last10(number);
+    if (!ten || this.isSystemNumber(number)) return false;
+    if (!entry.phones) entry.phones = new Set();
+    entry.phones.add(ten);
+    this.byPhone.set(ten, entry);
+    return true;
+  }
+
+  personByPhone(number) {
+    const ten = last10(number);
+    if (!ten) return null;
+    return this.byPhone.get(ten) || null;
   }
 
   // Link a GoTo users-API record to a configured extension. Does not invent people
   // the config doesn't list — an unknown line stays unresolved until it's added.
   // A 403 from GET /users/v1/users leaves this empty. Call history and call-state
   // can still name the person by extension without a userKey.
+  // Any 10-digit number on that same user record is remembered as their phone.
   indexApiUser(user) {
     const userKey = user && (user.userKey || user.key);
     if (!userKey || !user) return false;
@@ -70,6 +129,7 @@ class Roster {
     if (Array.isArray(user.extensions)) lines.push(...user.extensions);
     if (user.extensionNumber || user.extension) lines.push(user);
     let linked = false;
+    const linkedEntries = [];
     for (const line of lines) {
       const raw = line && typeof line === 'object'
         ? (line.number || line.extensionNumber || line.extension)
@@ -79,19 +139,62 @@ class Roster {
       if (!known) continue;
       known.userKey = String(userKey);
       this.byUserKey.set(String(userKey), known);
+      if (!linkedEntries.includes(known)) linkedEntries.push(known);
       linked = true;
+    }
+    if (linked) {
+      for (const value of collectUserPhones(user)) {
+        for (const entry of linkedEntries) this.rememberPhone(entry, value);
+      }
     }
     return linked;
   }
 
   peopleNamed(name) {
-    const target = String(name || '').trim().toLowerCase();
+    const target = normalizePartyName(name);
     if (!target) return [];
     const matches = [];
-    for (const entry of this.byExtension.values()) {
-      if (String(entry.name || '').trim().toLowerCase() === target) matches.push(entry);
+    for (const entry of this.people) {
+      if (normalizePartyName(entry.name) === target) matches.push(entry);
     }
     return matches;
+  }
+
+  // Full name, including "Last, First" and a middle initial ("James C Bullock").
+  // A first name alone does not match. Two different people matching the same
+  // tokens do not match. Two extensions for one name (Amy) still match.
+  matchTeamName(name) {
+    const normalized = normalizePartyName(name);
+    if (!normalized) return null;
+    const exact = this.peopleNamed(normalized);
+    const chosen = exact.length ? exact : this.peopleMatchingTokens(normalized);
+    const distinct = new Set(chosen.map((entry) => String(entry.name || '').toLowerCase()));
+    if (distinct.size !== 1) return null;
+    return chosen[0];
+  }
+
+  peopleMatchingTokens(normalized) {
+    const tokens = normalized.split(' ').filter((token) => token.length > 1 && !/^(jr|sr|ii|iii|iv)$/.test(token));
+    if (tokens.length < 2) return [];
+    const found = [];
+    const seen = new Set();
+    for (const entry of this.people) {
+      const key = String(entry.name || '').toLowerCase();
+      if (seen.has(key)) continue;
+      const parts = normalizePartyName(entry.name).split(' ').filter(Boolean);
+      if (parts.length < 2) continue;
+      const first = parts[0];
+      const last = parts[parts.length - 1];
+      if (tokens.includes(first) && tokens.includes(last)) {
+        seen.add(key);
+        found.push(entry);
+      }
+    }
+    return found;
+  }
+
+  listPeople() {
+    return this.people.slice();
   }
 
   // Full-name match. Two extensions for one name (Amy's desk and home office)

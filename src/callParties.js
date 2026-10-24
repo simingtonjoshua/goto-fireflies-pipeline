@@ -561,6 +561,63 @@ function firstCustomerNumber(candidates, roster) {
   return null;
 }
 
+// The far end is a teammate when GoTo's party name or a learned phone matches the
+// roster. This does not change who is credited as the answering/placing line, and
+// it does not drop the number — the note still posts on that phone's thread.
+function teamMatchFromParty(party, roster) {
+  if (!party || !roster) return null;
+  const number = party.number || party.phoneNumber;
+  const byPhone = typeof roster.personByPhone === 'function' ? roster.personByPhone(number) : null;
+  if (byPhone) return { person: byPhone, matchedBy: 'phone' };
+  const byName = typeof roster.matchTeamName === 'function' ? roster.matchTeamName(party.name) : null;
+  if (byName) return { person: byName, matchedBy: 'name' };
+  return null;
+}
+
+function sameTeamMember(person, teamMember) {
+  if (!person || !teamMember) return false;
+  if (person.extension && teamMember.extension && person.extension === teamMember.extension) return true;
+  const left = String(person.name || '').trim().toLowerCase();
+  const right = String(teamMember.name || '').trim().toLowerCase();
+  return Boolean(left && right && left === right);
+}
+
+function otherPartyRecord(person, matchedBy) {
+  if (!person || (!person.name && !person.extension)) return null;
+  return {
+    name: person.name || null,
+    extension: person.extension || null,
+    matchedBy: matchedBy || null,
+  };
+}
+
+function otherPartyFromHistory({
+  caller, callee, callerIsInternal, calleeIsInternal, callerInfo, calleeInfo, teamMember, roster,
+}) {
+  if (callerIsInternal && calleeIsInternal) {
+    const callerIsCredited = sameTeamMember(
+      (callerInfo && callerInfo.person) || { name: caller.name, extension: callerInfo && callerInfo.extension },
+      teamMember,
+    );
+    const otherRaw = callerIsCredited ? callee : caller;
+    const info = callerIsCredited ? calleeInfo : callerInfo;
+    const matched = teamMatchFromParty(otherRaw, roster);
+    const person = (info && info.person) || (matched && matched.person) || {
+      name: otherRaw.name || null,
+      extension: (info && info.extension) || null,
+    };
+    const matchedBy = (info && info.extension) ? 'extension' : ((matched && matched.matchedBy) || 'name');
+    return otherPartyRecord(person, matchedBy);
+  }
+  const far = callerIsInternal && !calleeIsInternal
+    ? callee
+    : (!callerIsInternal && calleeIsInternal ? caller : null);
+  if (!far) return null;
+  const match = teamMatchFromParty(far, roster);
+  if (!match || sameTeamMember(match.person, teamMember)) return null;
+  return otherPartyRecord(match.person, match.matchedBy);
+}
+
 function analyzeCallHistory(content = {}, roster = rosterApi.getRoster()) {
   const caller = flattenParty(content.caller);
   const callee = flattenParty(content.callee);
@@ -669,6 +726,17 @@ function analyzeCallHistory(content = {}, roster = rosterApi.getRoster()) {
     }
     : null;
 
+  const otherParty = otherPartyFromHistory({
+    caller,
+    callee,
+    callerIsInternal,
+    calleeIsInternal,
+    callerInfo,
+    calleeInfo,
+    teamMember,
+    roster,
+  });
+
   return {
     legId: content.legId || null,
     originatorId: content.originatorId || null,
@@ -678,6 +746,7 @@ function analyzeCallHistory(content = {}, roster = rosterApi.getRoster()) {
     explicitlyUnanswered,
     answerTime: answerTime && answerTime !== true ? answerTime : null,
     teamMember,
+    otherParty,
     externalNumber,
     externalName,
     startTime: content.startTime || content.callCreated || content.timestamp || null,
