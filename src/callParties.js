@@ -239,9 +239,17 @@ function pickExternalFromParticipants({ direction, participants, dialString, ros
     const kind = participantKind(participant);
     if (kind !== 'PHONE_NUMBER' && kind !== 'PHONE_NUMBER_UNKNOWN') continue;
     const block = phoneBlock(participant);
-    if (block.caller?.number) candidates.push({ number: block.caller.number, name: block.caller.name || null, role: 'caller' });
-    if (block.callee?.number) candidates.push({ number: block.callee.number, name: block.callee.name || null, role: 'callee' });
-    if (stringNumber(block.number)) candidates.push({ number: block.number, name: block.name || null, role: 'number' });
+    const caller = block.caller && typeof block.caller === 'object' ? block.caller : null;
+    const callee = block.callee && typeof block.callee === 'object' ? block.callee : null;
+    if (caller?.number) candidates.push({ number: caller.number, name: caller.name || null, role: 'caller' });
+    if (callee?.number) candidates.push({ number: callee.number, name: callee.name || null, role: 'callee' });
+    // phoneNumber.number / type.number is the outside party only when this
+    // participant has no caller and no callee entry. When either entry exists,
+    // that number is the dialed DID or our caller-id, even if the entry itself
+    // has no number (blocked or anonymous).
+    if (!caller && !callee && stringNumber(block.number)) {
+      candidates.push({ number: block.number, name: block.name || null, role: 'number' });
+    }
   }
   const usable = (candidate) => usableCustomerNumber(candidate.number, roster);
   if (direction === 'OUTBOUND') {

@@ -83,6 +83,72 @@ describe('external number on call-state and the call events report', () => {
     assert.equal(roster.last10(analysis.externalNumber), DIALED);
   });
 
+  it('does not use the nested dialed DID when the caller entry has no number', () => {
+    const analysis = callParties.analyzeCallState(callState({
+      direction: 'INBOUND',
+      participants: [
+        {
+          participantId: 'cust',
+          originator: 'cust',
+          legId: 'leg-cust',
+          status: { value: 'CONNECTED' },
+          type: {
+            value: 'PHONE_NUMBER',
+            phoneNumber: {
+              number: `+1${DID}`,
+              name: 'Main',
+              caller: { name: 'Anonymous' },
+            },
+          },
+        },
+      ],
+    }), book);
+    assert.equal(analysis.externalNumber, null);
+    assert.equal(analysis.externalName, null);
+    assert.equal(analysis.originatorNumber, null);
+  });
+
+  it('does not use the nested dialed DID when the report caller entry has no number', () => {
+    const found = callParties.customerNumberFromReport({
+      direction: 'INBOUND',
+      caller: {
+        name: 'Anonymous',
+        type: { value: 'PHONE_NUMBER', number: `+1${DID}`, name: 'Main' },
+      },
+      participants: [
+        {
+          type: {
+            value: 'PHONE_NUMBER',
+            number: `+1${DID}`,
+            name: 'Main',
+            caller: { name: 'Anonymous' },
+          },
+        },
+      ],
+      callStates: [
+        {
+          sequenceNumber: 2,
+          type: 'ACTIVE',
+          participants: [
+            {
+              status: { value: 'CONNECTED' },
+              type: {
+                value: 'PHONE_NUMBER',
+                phoneNumber: {
+                  number: `+1${DID}`,
+                  name: 'Main',
+                  caller: { name: 'Anonymous' },
+                },
+              },
+            },
+          ],
+        },
+      ],
+    }, book);
+    assert.equal(found.number, null);
+    assert.equal(found.name, null);
+  });
+
   it('prefers the report summary caller over the DID on caller.type.number', () => {
     const found = callParties.customerNumberFromReport({
       direction: 'INBOUND',
