@@ -217,8 +217,14 @@
 // 13) CALL TYPE (team and vendor calls were still written as customer calls). The
 // prompt below stays the customer prompt. classifyCall (src/callType.js) picks
 // internal or vendor only on a strong signal; everything else, including an
-// unclear commerce word, keeps this prompt. The note and doc gain a "Call type"
-// line. Other/unknown from the model is written as Customer.
+// unclear commerce word, keeps this prompt. The doc keeps a "Call type" line.
+// Other/unknown from the model is written as Customer. The Heymarket note does
+// not include that line.
+// 14) TEAM CELL PHONES (2026-10-26). Designers and installers call in from personal
+// cells and were summarized as "the customer". TEAM_MEMBER_PHONES maps those
+// numbers to a name and role. That identity is a fixed fact in the prompt, the
+// outside-party transcript lines are labeled with it, and the note stays
+// summary + recording link only.
 
 const fetch = require('node-fetch');
 const driveClient = require('./driveClient');
@@ -584,7 +590,13 @@ function formatHoldContextLine(holds) {
 // 2026-07-21). Replaced the earlier three-rigid-category design: rather than picking
 // between fixed templates, the model just describes what happened, as accurately and
 // completely as the call warrants.
+// Spellings only. Do not put a sample call in the prompt — a concrete example has
+// been copied into real summaries before (see header item 5).
+const KNOWN_TEAM_NAME_RULE = 'Known team-member spellings, used only when Caller identity or the transcript identifies that same person (never rename a different speaker to one of these): Joshua Simington, Emily Kingdon, Will Maldonado, Heather Ubaldo, Jodi Grace, James Bullock. When this team\'s James is identified, his name is James Bullock.';
+
 const SYSTEM_PROMPT = `You summarize customer phone calls for a Budget Blinds franchise CRM. You will be given call metadata and a speaker-labeled transcript. Speaker labels are already assigned from the phone system's channel and participant data: a team member's name or "Team Member", "Customer", "Recording" (a known system greeting, hold message, or voicemail greeting), or "Channel N" when the phone system did not identify that side. Do not swap labels based on who spoke first, and do not rename a speaker from a word in the transcript. A "Recording" line is never a live person, even if the recording says someone's name.
+
+Do not assume the outside party is a customer. Use a Caller identity line when one is present: that name and role are who is on the phone, and you must not call them the customer. If no Caller identity is present, call the outside party the customer only when the call is actually a customer or prospect. A coworker (designer, installer, or office staff) calling from a customer's house is that coworker. The homeowner they mention is a third party who is not on the phone.
 
 The metadata includes fixed facts: direction, whether the call was answered, the team member names, and the customer phone number. Do not change those facts. If the Answered fact says the call was not answered, do not say the caller was connected to, reached, or spoke with a team member. If the Answered fact says the transcript is a two-sided conversation, describe that conversation and do not write that the call was not answered. If Answered is unknown, do not claim that the call was not answered.
 
@@ -593,6 +605,8 @@ Treat the speaker labels as ground truth. Do not swap who did something because 
 Each transcript line is prefixed with "[Ns]" - the number of seconds into the call that line started.
 
 Write a plain-language summary of what actually happened on this call - not a fixed template, just an accurate account of the conversation. Use as many or as few sentences as the call actually needs (a single short sentence is fine for a quick callback; a fuller paragraph is fine for a detailed booking or a complicated issue). Do not force the call into a category, and do not add a header or label announcing what "type" of call this was - just describe it. Do not open the summary with a raw transcript fragment or a quote of the first line. Start with a sentence about who called whom and what happened.
+
+Do not invent details, quotes, prices, products, addresses, appointments, or phone numbers that are not in the metadata or the transcript. Attribute each statement to the speaker who said it. Use a personal name only when the metadata or the transcript gives it.
 
 Never invent a team member's name from the company name. "Budget Blinds" and mishearings of it (Lines, Lions, Blends, Blind) are the business, not a person. If Team Member(s) is unknown, say "a team member".
 
@@ -614,26 +628,30 @@ IMPORTANT - a one-sided transcript is still a transcript: if the transcript is j
 
 IMPORTANT - vendor/solicitation calls are not customer calls: if the caller is clearly a vendor, salesperson, recruiter, advertiser, or other outside business calling to sell or pitch something TO Budget Blinds (rather than asking about window treatments themselves), do not refer to them as "the customer" anywhere in the summary. Identify the caller by their actual name and company if stated (e.g. "Natalie from Clear Channel Outdoor"), and describe plainly what they were soliciting and what was said - do not frame it as a customer inquiry.
 
-IMPORTANT - who called whom: the metadata includes this call's direction. OUTBOUND means a Budget Blinds team member placed this call to the customer's number - never describe an outbound call as something the customer initiated (e.g. never say "the customer called" for an outbound call). The first person in the team member path is the one who placed an outbound call. Later names are later hops, not the person who dialed. INBOUND means the customer called in to Budget Blinds. Also always use the times exactly as given in the metadata (they're already in the correct local time) - never do your own timezone conversion or restate a time differently than given.
+IMPORTANT - who called whom: the metadata includes this call's direction. OUTBOUND means a Budget Blinds team member placed this call to the other party's number - never describe an outbound call as something the other party initiated (e.g. never say "the customer called" for an outbound call). The first person in the team member path is the one who placed an outbound call. Later names are later hops, not the person who dialed. INBOUND means the outside party called Budget Blinds. Call that person the customer only when they are a customer or prospect, not when Caller identity names a team member. Also always use the times exactly as given in the metadata (they're already in the correct local time) - never do your own timezone conversion or restate a time differently than given.
 
 IMPORTANT - supplier/vendor support calls (the reverse case): sometimes this call is Budget Blinds contacting - or being contacted back by - an outside supplier or vendor's OWN support/order line about a problem with an order Budget Blinds placed with them (e.g. missing or incorrect parts in a shipment). In this scenario Budget Blinds is the one being served, not the customer described elsewhere in these instructions. Identify the external party by their real name and company if stated (e.g. "Jackie from Custom Browns Group"), describe the order/shipment problem as Budget Blinds' own issue rather than a customer's, and read the transcript literally to determine which side actually reported the problem - do not assume the external party is the one with the complaint just because that's the more common pattern; a Budget Blinds team member can be the one describing what's wrong with a shipment they received.
 
 IMPORTANT - automated systems are not customers: if the "Customer"-labeled channel is clearly an automated phone system, IVR menu, or hold-queue recording (menu options, "press one," hold-time announcements, a scripted greeting) rather than a live person, describe it as such (e.g. "an automated support line" or "the hold system") rather than treating it as a customer. This is common when a Budget Blinds team member calls an outside vendor's own support line, and there may be no real third-party "customer" on the call at all. Lines labeled Recording — "thank you for calling", "press one", "estimated wait time", "save your place in line", "welcome to Bright", "when you have finished recording, you may hang up" — are never the customer. A call that is a team member waiting on a vendor menu or hold queue is a hold call: say they were on hold, and do not say the customer explained the menu, the portal, or the wait time. Words the team member says to someone who is not on the phone, while that hold is playing, are still the team member on a hold call.
 
-IMPORTANT - hold time: if the metadata includes a "Hold periods detected" line, mention in the summary that the caller was placed on hold and roughly how long it lasted (e.g. "the customer was placed on hold for about 45 seconds while ___ checked on availability"). If that line is absent, don't mention holds at all - don't guess at a hold happening just because there was a pause in the transcript.`;
+IMPORTANT - hold time: if the metadata includes a "Hold periods detected" line, mention in the summary that the caller was placed on hold and roughly how long it lasted (e.g. "the customer was placed on hold for about 45 seconds while ___ checked on availability"). If that line is absent, don't mention holds at all - don't guess at a hold happening just because there was a pause in the transcript.
+
+${KNOWN_TEAM_NAME_RULE}`;
 
 // Used when the other party is a coworker. The customer prompt above is not sent.
-const INTERNAL_SYSTEM_PROMPT = `You summarize internal phone calls for a Budget Blinds franchise. The other party is a team member (designer, installer, or office staff), not a customer. Speaker labels are already assigned: a team member's name, "Customer" (that label is the other person on the phone — on this call they are a coworker, so never call them the customer), "Recording", or "Channel N". Do not swap labels based on who spoke first. A "Recording" line is never a live person.
+const INTERNAL_SYSTEM_PROMPT = `You summarize internal phone calls for a Budget Blinds franchise. The other party is a team member (designer, installer, or office staff), not a customer. Speaker labels are already assigned: a team member's name, the other party's name and role when known, otherwise "Customer" (on this call that label is a coworker, so never call them the customer), "Recording", or "Channel N". Do not swap labels based on who spoke first. A "Recording" line is never a live person.
 
-The metadata includes fixed facts: this is an internal team call, the direction, whether it was answered, the team member path, and the other party's name when known. Do not change those facts. Use the other party's name. If their name is unknown, say "a team member". Never invent a name from "Budget Blinds".
+The metadata includes fixed facts: this is an internal team call, the direction, whether it was answered, the team member path, and the Caller identity (name and role) when known. Do not change those facts. Use the Caller identity name and role. If their name is unknown, say "a team member". Never invent a name from "Budget Blinds". When a role is present, include it the first time you name that person, in the form "Name (role)".
 
-Write a plain-language summary of the conversation between coworkers. Use as many or as few sentences as the call needs. Do not open with a transcript quote. Start with who called whom and what they decided or discussed. Do not add a "Call type" line.
+Write a plain-language summary of the conversation between coworkers. Use as many or as few sentences as the call needs. Do not open with a transcript quote. Start with who called whom and what they decided or discussed. Do not add a "Call type" line or any other header or label.
 
-Do not frame this as a customer call. Do not say "the customer's needs", "the customer called", or give the person on the phone customer next steps. If they discuss a customer, that customer is a third party who is not on the call: name that person and what the team agreed to do for them. Appointments, measurements, installs, invoices, and paperwork can come up; attribute them to the customer being discussed, not to the coworker on the phone.
+Do not frame this as a customer call. Do not say "the customer's needs", "the customer called", or give the person on the phone customer next steps. If they discuss a customer, that customer is a third party who is not on the call: name that person and what the team agreed to do for them. Appointments, measurements, installs, invoices, and paperwork can come up; attribute them to the person the call says they belong to, not to the coworker on the phone unless the coworker is that person.
 
-Keep every concrete detail the call contained (dates, arrival windows, addresses, order or reference numbers, dollar amounts, product names). If a detail was not mentioned, leave it out. Only write a phone number that appears in the metadata or was spoken in the transcript. OUTBOUND means the first person in the team member path placed the call; do not describe it as the other party calling in. Use the times exactly as given.
+Do not invent details, quotes, prices, products, addresses, or appointments that were not said. Attribute each statement to the speaker who said it. Keep every concrete detail the call contained (dates, arrival windows, addresses, order or reference numbers, dollar amounts, product names). If a detail was not mentioned, leave it out. Only write a phone number that appears in the metadata or was spoken in the transcript. OUTBOUND means the first person in the team member path placed the call; do not describe it as the other party calling in. Use the times exactly as given.
 
-A one-sided transcript is still a transcript: summarize the message that was left. Only say a transcript was unavailable if there are no lines at all. If a "Hold periods detected" line is present, mention the hold and about how long it lasted. If that line is absent, do not mention a hold.`;
+A one-sided transcript is still a transcript: summarize the message that was left. Only say a transcript was unavailable if there are no lines at all. If a "Hold periods detected" line is present, mention the hold and about how long it lasted. If that line is absent, do not mention a hold.
+
+${KNOWN_TEAM_NAME_RULE}`;
 
 // Used when the other party is a vendor, supplier, or someone selling to the office.
 const VENDOR_SYSTEM_PROMPT = `You summarize vendor and supplier phone calls for a Budget Blinds franchise. The other party is a manufacturer, fabricator, sales rep, finance company, or other business — not a customer or prospect asking for window treatments. Speaker labels are already assigned: a team member's name, "Customer" (that label is the outside party — call them by name and company, never "the customer"), "Recording", or "Channel N". Do not swap labels. A "Recording" line is never a live person. A vendor menu, hold queue, or "dedicated support line" is the vendor's phone system.
@@ -642,7 +660,9 @@ The metadata call type is fixed. Do not change it. Do not add a "Call type" line
 
 Write a plain-language summary of the vendor conversation: orders, pricing, backorders, shipments, accounts, invoices, or what they were pitching. Name the person and company when stated. Budget Blinds is the customer of this vendor, so a missing or wrong shipment is Budget Blinds' issue with the vendor. Do not invent a homeowner, a consultation, or customer next steps unless a specific end customer was actually discussed as a third party.
 
-Keep every concrete detail (PO numbers, order numbers, dates, amounts, ETAs, product names). Do not invent a phone number. OUTBOUND means the team member placed the call to the vendor. Use the times exactly as given. A one-sided transcript, including a team member waiting on a vendor menu, is still a transcript: say they were on hold or left a message, and do not pretend the recording explained the order. If a "Hold periods detected" line is present, mention it. If it is absent, do not invent a hold.`;
+Keep every concrete detail (PO numbers, order numbers, dates, amounts, ETAs, product names). Do not invent a phone number or any other detail that was not said. Attribute each statement to the speaker who said it. OUTBOUND means the team member placed the call to the vendor. Use the times exactly as given. A one-sided transcript, including a team member waiting on a vendor menu, is still a transcript: say they were on hold or left a message, and do not pretend the recording explained the order. If a "Hold periods detected" line is present, mention it. If it is absent, do not invent a hold.
+
+${KNOWN_TEAM_NAME_RULE}`;
 
 const UNKNOWN_TYPE_RULES = `Decide the call type before you summarize. The first line of your reply must be exactly one of these four lines:
 Call type: Customer
@@ -698,8 +718,13 @@ function pathName(csrPath, which) {
     return name;
 }
 
+function namedParty(partyName, partyRole, fallback) {
+  if (!partyName) return fallback;
+  return partyRole ? `${partyName} (${partyRole})` : partyName;
+}
+
 function buildKnownPartyNoTranscriptSummary({
-  csrPath, externalNumber, direction, callCreated, answered, callType, partyName,
+  csrPath, externalNumber, direction, callCreated, answered, callType, partyName, partyRole,
 }) {
   const displayNumber = driveClient.formatPhoneForDisplay(externalNumber);
   const when = driveClient.formatPacific(callCreated);
@@ -708,7 +733,7 @@ function buildKnownPartyNoTranscriptSummary({
   const wasAnswered = answered === true;
   const answerUnknown = answered !== true && answered !== false;
   const other = callType === 'internal'
-    ? (partyName || 'another team member')
+    ? namedParty(partyName, partyRole, 'another team member')
     : (partyName || 'a vendor');
   const phrase = callType === 'internal' ? 'an internal call' : 'a vendor call';
 
@@ -724,7 +749,7 @@ function buildKnownPartyNoTranscriptSummary({
     return `No transcript was available for this call. ${placed}. The phone system does not show that the call was answered (no answer, a greeting, or voicemail).`;
   }
   if (direction === 'INBOUND') {
-    const caller = partyName || (callType === 'internal' ? 'A team member' : 'A vendor');
+    const caller = namedParty(partyName, partyRole, callType === 'internal' ? 'A team member' : 'A vendor');
     if (wasAnswered && lastTeamMember) {
       return `No transcript was available for this call. ${caller} called Budget Blinds on ${when} and the call was answered by ${lastTeamMember}, but no conversation audio or transcript was captured.`;
     }
@@ -736,10 +761,10 @@ function buildKnownPartyNoTranscriptSummary({
   return `No transcript was available for this call with ${other} at ${displayNumber} on ${when}.`;
 }
 
-function buildNoTranscriptSummary({ csrPath, externalNumber, direction, callCreated, answered, callType, partyName }) {
+function buildNoTranscriptSummary({ csrPath, externalNumber, direction, callCreated, answered, callType, partyName, partyRole }) {
     if (callType === 'internal' || callType === 'vendor') {
       return buildKnownPartyNoTranscriptSummary({
-        csrPath, externalNumber, direction, callCreated, answered, callType, partyName,
+        csrPath, externalNumber, direction, callCreated, answered, callType, partyName, partyRole,
       });
     }
     const displayNumber = driveClient.formatPhoneForDisplay(externalNumber);
@@ -781,7 +806,7 @@ function systemPromptFor(type) {
 function customerContextLines({ direction, answered, twoSided, csrPath, externalNumber, externalName, callCreated, callEnded, rows }) {
   return [
     'Fixed facts (do not change these):',
-    `Call direction: ${direction || 'unknown'} (OUTBOUND = a Budget Blinds team member placed this call to the customer; INBOUND = the customer called Budget Blinds - never describe an outbound call as something the customer did)`,
+    `Call direction: ${direction || 'unknown'} (OUTBOUND = a Budget Blinds team member placed this call to the customer; INBOUND = the outside party called Budget Blinds. Do not call them the customer when they are a coworker. Never describe an outbound call as something the customer did)`,
     answeredFactLine(answered, twoSided),
     `Team member path (in order, if transferred/parked): ${(csrPath || []).join(' -> ') || 'unknown'}`,
     'Commercial roles (do not reverse): the team member sends any service order or warranty paperwork; the customer signs it and pays.',
@@ -796,18 +821,31 @@ function customerContextLines({ direction, answered, twoSided, csrPath, external
   ].filter(Boolean);
 }
 
+function partyIdentity(classified) {
+  if (!classified || !classified.partyName) return null;
+  if (classified.type === 'internal' && classified.partyRole) {
+    return `${classified.partyName} (${classified.partyRole})`;
+  }
+  return classified.partyName;
+}
+
 function typedContextLines({ classified, direction, answered, twoSided, csrPath, externalNumber, externalName, callCreated, callEnded, rows }) {
-  const who = classified.partyName || (classified.type === 'vendor' ? 'the vendor' : 'the other team member');
+  const identity = partyIdentity(classified);
+  const who = identity || (classified.type === 'vendor' ? 'the vendor' : 'the other team member');
   const directionLine = classified.type === 'unknown'
     ? `Call direction: ${direction || 'unknown'}. OUTBOUND means a Budget Blinds team member placed this call. INBOUND means the other party called Budget Blinds.`
     : `Call direction: ${direction || 'unknown'} (OUTBOUND = a Budget Blinds team member placed this call to ${who}; INBOUND = ${who} called Budget Blinds). Never describe an outbound call as something the other party initiated.`;
   const partyLine = classified.type === 'internal'
-    ? `Other party: ${classified.partyName || 'a Budget Blinds team member (name unknown)'}. Fixed call type: Internal team. Do not call them the customer.`
+    ? `Other party: ${identity || 'a Budget Blinds team member (name unknown)'}. Fixed call type: Internal team. Do not call them the customer.`
     : classified.type === 'vendor'
       ? `Other party: ${classified.partyName || 'a vendor or supplier'}. Fixed call type: Vendor. Do not call them the customer.`
       : 'Call type: not yet determined. Choose it from the transcript and put it on the first line.';
+  const callerIdentityLine = classified.type === 'internal' && identity
+    ? `Caller identity: ${identity}. The outside party is this person, not a customer. Use this name${classified.partyRole ? ' and role' : ''}. A speech-to-text mishearing does not change it.`
+    : null;
   return [
     'Fixed facts (do not change these):',
+    callerIdentityLine,
     partyLine,
     directionLine,
     answeredFactLine(answered, twoSided),
@@ -823,12 +861,22 @@ function typedContextLines({ classified, direction, answered, twoSided, csrPath,
   ].filter(Boolean);
 }
 
+// The phone system still tags the outside party "Customer". Once we know that
+// party is a teammate or a named vendor, the lines the model reads use that
+// identity so it does not narrate them as the customer.
+function rowsForModel(rows, classified) {
+  const label = partyIdentity(classified);
+  if (!label || (classified.type !== 'internal' && classified.type !== 'vendor')) return rows;
+  return (rows || []).map((row) => (
+    row && row.label === 'Customer' ? { ...row, label } : row
+  ));
+}
+
 function buildSummaryMessages({
   legRecords, csrPath, externalName, externalNumber, direction, callCreated, callEnded, answered, contactName, otherParty,
 }) {
     const guard = applyCardGuard(legRecords);
     const rows = allTranscriptRows(guard.legRecords);
-    const conversationText = buildConversationText(rows);
     const twoSided = rowsAreTwoSidedConversation(rows);
     const classified = callType.classifyCall({
       rows,
@@ -840,6 +888,8 @@ function buildSummaryMessages({
       csrPath,
       roster: roster.getRoster(),
     });
+    const modelRows = rowsForModel(rows, classified);
+    const conversationText = buildConversationText(modelRows);
     const contextLines = classified.type === 'customer'
       ? customerContextLines({
         direction, answered, twoSided, csrPath, externalNumber, externalName, callCreated, callEnded, rows,
@@ -854,6 +904,7 @@ function buildSummaryMessages({
           callType: classified.type,
           callTypeLabel: classified.label,
           partyName: classified.partyName,
+          partyRole: classified.partyRole || null,
           callTypeSource: classified.source,
     };
 }
@@ -866,12 +917,14 @@ async function lookupContactName() {
   return null;
 }
 
-function summaryResult(summary, callTypeName) {
+function summaryResult(summary, callTypeName, extra = {}) {
   const type = callTypeName || 'customer';
   return {
     summary,
     callType: type,
     callTypeLabel: callType.labelFor(type),
+    partyName: extra.partyName || null,
+    partyRole: extra.partyRole || null,
   };
 }
 
@@ -905,8 +958,9 @@ async function summarizeInteraction({
           csrPath, externalNumber, direction, callCreated, answered,
           callType: built.callType,
           partyName: built.partyName,
+          partyRole: built.partyRole,
         });
-        return summaryResult(summary, callType.callTypeForNote(built.callType, summary));
+        return summaryResult(summary, callType.callTypeForNote(built.callType, summary), built);
   }
 
   const userPrompt = built.user;
@@ -944,9 +998,9 @@ async function summarizeInteraction({
   summary = summary.replace(/^\s*(CONSULTATION BOOKING|SERVICE\/SUPPORT ISSUE|GENERAL INQUIRY)\s*[-:]\s*/i, '');
 
   const callTypeName = callType.callTypeForNote(built.callType, summary);
-  summary = callType.stripCallTypeLine(summary);
+  summary = callType.stripSummaryHeaders(summary);
 
-  return summaryResult(summary, callTypeName);
+  return summaryResult(summary, callTypeName, built);
 }
 
 module.exports = {

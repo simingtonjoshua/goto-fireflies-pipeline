@@ -1158,7 +1158,7 @@ function escapeHtml(text) {
 // inbound calls, and only as a clearly separate line - never presented as if it were the
 // customer's name, and never shown at all for outbound calls (where that metadata
 // describes our own line, not the customer's).
-function buildTranscriptDocHtml({ externalName, externalNumber, direction, csrPath, callCreated, callEnded, summaryText, legRecords, callTypeLabel }) {
+function buildTranscriptDocHtml({ externalName, externalNumber, direction, csrPath, callCreated, callEnded, summaryText, legRecords, callTypeLabel, partyName, partyRole }) {
             const metaRows = [['Phone number', escapeHtml(driveClient.formatPhoneForDisplay(externalNumber))]];
             if (direction !== 'OUTBOUND' && externalName) {
                           metaRows.push(['Caller ID', escapeHtml(externalName)]);
@@ -1168,6 +1168,10 @@ function buildTranscriptDocHtml({ externalName, externalNumber, direction, csrPa
                           ['Team Member(s)', escapeHtml((csrPath || []).join(' → ') || 'unknown')]
                         );
             if (callTypeLabel) metaRows.push(['Call type', escapeHtml(callTypeLabel)]);
+            if (partyName) {
+                          const who = partyRole ? `${partyName} (${partyRole})` : partyName;
+                          metaRows.push(['Other party', escapeHtml(who)]);
+            }
             metaRows.push(
                           ['Call started', escapeHtml(driveClient.formatPacific(callCreated))],
                           ['Call ended', escapeHtml(driveClient.formatPacific(callEnded))]
@@ -1580,6 +1584,8 @@ async function finalizeInteraction(groupKey) {
                                     summaryText,
                                     legRecords,
                                     callTypeLabel,
+                                    partyName: summaryResult.partyName,
+                                    partyRole: summaryResult.partyRole,
                   });
                                 await driveClient.createTranscriptDoc(folder.id, `${folderName} - Call Summary & Transcript`, docHtml);
                                 console.log(`Created transcript Doc for interaction ${groupKey} in folder ${folder.id}.`);
@@ -1589,7 +1595,6 @@ async function finalizeInteraction(groupKey) {
 
               const noteText = openaiClient.formatCallNote({
                                 summary: summaryText,
-                                callTypeLabel,
                                 folderLink,
               });
 

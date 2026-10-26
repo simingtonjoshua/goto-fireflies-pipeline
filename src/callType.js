@@ -1,8 +1,9 @@
 // Decides who a call was with before the summary is written.
 //
 // Strong signals, in order: a roster extension, a phone learned from GoTo's user
-// record or a private roster file, GoTo's own party name, then a contact name
-// passed in whose display name matches a roster full name. The transcript is a
+// record, a private roster file, or TEAM_MEMBER_PHONES, GoTo's own party name,
+// then a contact name passed in whose display name matches a roster full name.
+// The transcript is a
 // fallback only when the signal is strong: the other party uses a roster full
 // name, two distinct first-person coworker signals, a real
 // "this is <Name> from/with <Company>" introduction, or a specific vendor menu.
@@ -70,13 +71,20 @@ function labelFor(type) {
   return CALL_TYPE_LABELS[type] || CALL_TYPE_LABELS.other;
 }
 
-function result(type, source, partyName) {
+function result(type, source, partyName, partyRole) {
+  const role = String(partyRole || '').trim();
   return {
     type,
     label: labelFor(type),
     source: source || null,
     partyName: partyName || null,
+    partyRole: role || null,
   };
+}
+
+function roleText(person) {
+  const role = person && String(person.role || '').trim();
+  return role || null;
 }
 
 function pathText(csrPath) {
@@ -222,29 +230,35 @@ function classifyCall({
   const book = roster;
   const path = csrPath || [];
   const knownOther = otherPartyOf(legRecords, otherParty);
+  const internal = (source, name, person) => result(
+    'internal',
+    source,
+    name,
+    roleText(person) || roleText(rosterMatch(name, book)),
+  );
 
   if (knownOther && !isCredited(knownOther.name, path)) {
-    return result('internal', knownOther.matchedBy || 'goto', knownOther.name || null);
+    return internal(knownOther.matchedBy || 'goto', knownOther.name || null);
   }
 
   if (book && typeof book.personByPhone === 'function') {
     const byPhone = book.personByPhone(externalNumber);
     if (byPhone && !isCredited(byPhone.name, path)) {
-      return result('internal', 'phone', byPhone.name || null);
+      return internal('phone', byPhone.name || null, byPhone);
     }
   }
 
   if (book && typeof book.personByExtension === 'function') {
     const byExtension = book.personByExtension(externalNumber);
     if (byExtension && !isCredited(byExtension.name, path)) {
-      return result('internal', 'extension', byExtension.name || null);
+      return internal('extension', byExtension.name || null, byExtension);
     }
   }
 
   for (const candidate of [namedContact, externalName]) {
     const person = rosterMatch(candidate, book);
     if (person && !isCredited(person.name, path)) {
-      return result('internal', candidate === namedContact ? 'contact-name' : 'caller-id-name', person.name);
+      return internal(candidate === namedContact ? 'contact-name' : 'caller-id-name', person.name, person);
     }
   }
 
@@ -258,9 +272,9 @@ function classifyCall({
 
   const named = transcriptTeam(externalText, teamText, book);
   if (named && !isCredited(named.name, path)) {
-    return result('internal', 'transcript-name', named.name);
+    return internal('transcript-name', named.name, named);
   }
-  if (staffTalk(externalText)) return result('internal', 'transcript-staff', null);
+  if (staffTalk(externalText)) return internal('transcript-staff', null);
 
   return result('customer', 'default', null);
 }
@@ -292,10 +306,30 @@ function callTypeForNote(classifiedType, summary) {
   return 'customer';
 }
 
-function formatCallNote({ summary, callTypeLabel, folderLink }) {
-  const lines = [`Call type: ${callTypeLabel || CALL_TYPE_LABELS.other}`, '', String(summary || '').trim()];
-  if (folderLink) lines.push('', `Call recording & transcript: ${folderLink}`);
-  return lines.join('\n');
+// Heymarket notes are the narrative plus the recording link. A "Call type:" line,
+// or an older category header, is removed wherever it was added. Call type stays
+// available to the sheet/doc through the classification result, not this string.
+function stripSummaryHeaders(summary) {
+  let text = String(summary || '').replace(/^\uFEFF/, '').trim();
+  let guard = 0;
+  while (text && guard < 6) {
+    guard += 1;
+    const next = text
+      .replace(/^\s*(?:\*\*|__)?\s*(?:call type|type|category|label)\s*:\s*[^\n]*\s*(?:\*\*|__)?\s*(?:\n+\s*)?/i, '')
+      .replace(/^\s*(?:\*\*|__)?\s*(?:CONSULTATION BOOKING|SERVICE\/SUPPORT ISSUE|GENERAL INQUIRY)\s*(?:\*\*|__)?\s*(?:[-:]\s*|\n+\s*)?/i, '')
+      .trim();
+    if (next === text) break;
+    text = next;
+  }
+  return text.replace(/\n+\s*(?:\*\*|__)?\s*call type\s*:\s*[^\n]*\s*$/i, '').trim();
+}
+
+function formatCallNote({ summary, folderLink } = {}) {
+  const body = stripSummaryHeaders(summary);
+  if (!folderLink) return body;
+  if (/call recording & transcript:/i.test(body)) return body;
+  if (!body) return `Call recording & transcript: ${folderLink}`;
+  return `${body}\n\nCall recording & transcript: ${folderLink}`;
 }
 
 module.exports = {
@@ -305,6 +339,7 @@ module.exports = {
   stripCallTypeLine,
   callTypeForNote,
   formatCallNote,
+  stripSummaryHeaders,
   labelFor,
   CALL_TYPE_LABELS,
 };

@@ -3,6 +3,12 @@
 // forwarded former-rep cell are NOT stored here — the repo is public. Set them in
 // SYSTEM_PHONE_NUMBERS so those lines are treated as system audio, not a person.
 //
+// Personal cells for designers, installers, and other staff who are not an extension
+// live in TEAM_MEMBER_PHONES (a JSON map of number -> {name, role}). Those numbers
+// are loaded into this roster at startup and are never written to the config file.
+// A phone-only person is not added to first-name lists used for channel correction:
+// "this is Will" from a designer calling in must not be treated as the answering line.
+//
 // GoTo userKey values are learned at runtime from GET /users/v1/users (cached on the
 // matching extension) and are never written back to the config file.
 
@@ -78,9 +84,11 @@ class Roster {
 
   addPerson(person) {
     const extension = normalizeExtension(person.extension);
+    const role = String(person.role || '').trim();
     const entry = {
       name: person.name,
       extension,
+      role: role || null,
       heymarketUserId: person.heymarketUserId || null,
       recordedGreeting: Boolean(person.recordedGreeting),
       userKey: person.userKey || null,
@@ -90,6 +98,10 @@ class Roster {
     if (extension) this.byExtension.set(extension, entry);
     if (entry.userKey) this.byUserKey.set(String(entry.userKey), entry);
     for (const raw of person.phones || []) this.rememberPhone(entry, raw);
+    // First names drive inbound channel correction ("this is Josh" is the answering
+    // line). A designer who only has a cell is the outside party, so their first
+    // name must not flip that channel.
+    if (!extension) return;
     const first = String(person.name || '').trim().split(/\s+/)[0];
     if (first && !this.firstNames.includes(first)) this.firstNames.push(first);
     if (first === 'Joshua' && !this.firstNames.includes('Josh')) this.firstNames.push('Josh');
@@ -252,7 +264,74 @@ function systemNumbersFromEnv() {
     .filter(Boolean);
 }
 
-let active = new Roster(loadConfigFromDisk(), systemNumbersFromEnv());
+// TEAM_MEMBER_PHONES is a JSON object keyed by phone number:
+// {"5555550100":{"name":"Alex Designer","role":"designer"}}
+// An array of {phone,name,role} is accepted too. Blank is unset. Invalid JSON is
+// ignored so a bad value cannot crash startup. Nothing is written to disk.
+function parseTeamMemberPhones(raw) {
+  const text = String(raw == null ? '' : raw).trim();
+  if (!text) return [];
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    console.error('TEAM_MEMBER_PHONES is not valid JSON. No team-member cell numbers were loaded.');
+    return [];
+  }
+  const items = [];
+  if (Array.isArray(parsed)) {
+    for (const item of parsed) {
+      if (!item || typeof item !== 'object') continue;
+      items.push({ phone: item.phone || item.number, name: item.name, role: item.role });
+    }
+  } else if (parsed && typeof parsed === 'object') {
+    for (const [phone, value] of Object.entries(parsed)) {
+      if (typeof value === 'string') items.push({ phone, name: value, role: null });
+      else if (value && typeof value === 'object') items.push({ phone, name: value.name, role: value.role });
+    }
+  }
+  const cleaned = [];
+  for (const item of items) {
+    const name = String(item.name || '').trim();
+    const phone = String(item.phone || '').trim();
+    const role = String(item.role || '').trim();
+    if (!name || !last10(phone)) continue;
+    cleaned.push({ phone, name, role: role || null });
+  }
+  return cleaned;
+}
+
+// Merges parsed TEAM_MEMBER_PHONES into a roster. An existing full name keeps its
+// extension and gains the cell. A new name is phone-only. Returns how many numbers
+// were stored.
+function applyTeamMemberPhones(book, entries) {
+  if (!book || typeof book.addPerson !== 'function') return 0;
+  let applied = 0;
+  for (const item of entries || []) {
+    const ten = last10(item.phone);
+    const name = String(item.name || '').trim();
+    const role = String(item.role || '').trim();
+    if (!ten || !name) continue;
+    if (typeof book.isSystemNumber === 'function' && book.isSystemNumber(ten)) continue;
+    const existing = typeof book.matchTeamName === 'function' ? book.matchTeamName(name) : null;
+    if (existing) {
+      if (role) existing.role = role;
+      if (book.rememberPhone(existing, ten)) applied += 1;
+      continue;
+    }
+    book.addPerson({ name, role: role || null, phones: [ten] });
+    if (book.personByPhone(ten)) applied += 1;
+  }
+  return applied;
+}
+
+function loadActiveRoster() {
+  const book = new Roster(loadConfigFromDisk(), systemNumbersFromEnv());
+  applyTeamMemberPhones(book, parseTeamMemberPhones(process.env.TEAM_MEMBER_PHONES));
+  return book;
+}
+
+let active = loadActiveRoster();
 
 function getRoster() {
   return active;
@@ -263,7 +342,7 @@ function setRosterForTests(roster) {
 }
 
 function resetRosterForTests() {
-  active = new Roster(loadConfigFromDisk(), systemNumbersFromEnv());
+  active = loadActiveRoster();
 }
 
 function createRoster(config, systemNumbers) {
@@ -292,4 +371,6 @@ module.exports = {
   normalizeExtension,
   digitsOnly,
   last10,
+  parseTeamMemberPhones,
+  applyTeamMemberPhones,
 };
