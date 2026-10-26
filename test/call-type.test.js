@@ -337,7 +337,8 @@ describe('call type classification', () => {
       summary: callType.stripCallTypeLine('Call type: Other\n\nUnclear.'),
       callTypeLabel: callType.labelFor(callType.callTypeForNote('unknown', 'Call type: Other\n\nUnclear.')),
     });
-    assert.match(note, /^Call type: Customer\n\nUnclear\.$/);
+    assert.equal(note, 'Unclear.');
+    assert.doesNotMatch(note, /Call type/);
     assert.doesNotMatch(note, /Other/);
     assert.equal(
       callType.stripCallTypeLine('Call type: Internal team\n\nJames and Joshua compared the invoice.'),
@@ -369,13 +370,14 @@ describe('call type classification', () => {
     assert.doesNotMatch(customer, /internal call/);
   });
 
-  it('adds the call type line to the note and the doc header', () => {
+  it('keeps the call type line off the note and on the doc header', () => {
     const note = openaiClient.formatCallNote({
       summary: 'Joshua and James compared an invoice for a customer.',
       callTypeLabel: 'Internal team',
       folderLink: 'https://drive.google.com/drive/folders/example',
     });
-    assert.match(note, /^Call type: Internal team\n\nJoshua and James compared an invoice for a customer\.\n\nCall recording & transcript: https:\/\/drive\.google\.com\/drive\/folders\/example$/);
+    assert.equal(note, 'Joshua and James compared an invoice for a customer.\n\nCall recording & transcript: https://drive.google.com/drive/folders/example');
+    assert.doesNotMatch(note, /Call type/);
 
     const html = interactions.buildTranscriptDocHtml({
       externalNumber: JAMES_CELL,

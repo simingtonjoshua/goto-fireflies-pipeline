@@ -139,3 +139,17 @@ GoTo webhook notification  ──►  this service
 
 `/admin/*` (`/admin/post-note`, `/admin/reprocess-call`, and the others) is on the public URL. Set `ADMIN_TOKEN` and send that value in the `X-Admin-Token` header, or as `Authorization: Bearer <token>`. If `ADMIN_TOKEN` is unset, the routes stay open and the process logs `ADMIN_TOKEN is not set. /admin routes are open until it is configured.`
 
+## Heymarket note text
+
+A private note is the summary narrative and, when a Drive folder exists, one final line: `Call recording & transcript: <link>`. It does not start with `Call type:` or any other header. Call type still goes on the transcript Google Doc. `/admin/post-note` and `/admin/reprocess-call` use the same formatter as the automatic pipeline.
+
+## Team member cell phones
+
+Office extensions live in `config/team-roster.json`. That file is public and has no phone numbers. Designers, installers, and other staff who call from a personal cell are set with `TEAM_MEMBER_PHONES`, a JSON object keyed by phone number:
+
+```json
+{"5555550100":{"name":"Alex Designer","role":"designer"}}
+```
+
+`name` and `role` are what the summary should say (`Will Maldonado (designer)` once that person's real cell is in the map). The value is read at startup and is never written back to git. See `.env.example`. Use placeholder numbers in the repo; put the real map in the host environment.
+

@@ -566,6 +566,14 @@ app.post('/admin/reprocess-call', async (req, res) => {
                               ['Direction', direction || 'unknown'],
                               ['Team Member(s)', csrPath.join(' → ') || 'unknown'],
                               ['Call type', callTypeLabel || 'Other'],
+                  );
+                  if (summaryResult.partyName) {
+                              const who = summaryResult.partyRole
+                                ? `${summaryResult.partyName} (${summaryResult.partyRole})`
+                                : summaryResult.partyName;
+                              metaRows.push(['Other party', who]);
+                  }
+                  metaRows.push(
                               ['Call started', driveClient.formatPacific(callCreated)],
                               ['Call ended', driveClient.formatPacific(callEnded)]
                             );
@@ -579,7 +587,6 @@ app.post('/admin/reprocess-call', async (req, res) => {
 
           const noteText = openaiClient.formatCallNote({
                       summary: summaryText,
-                      callTypeLabel,
                       folderLink: folder.webViewLink,
           });
                   await heymarketClient.postPrivateNote(externalNumber, noteText, direction);
@@ -609,7 +616,9 @@ app.post('/admin/post-note', async (req, res) => {
                   if (!externalNumber || !summaryText) {
                               return res.status(400).json({ error: 'externalNumber and summaryText are required' });
                   }
-                  const noteText = folderLink ? `${summaryText}\n\nCall recording & transcript: ${folderLink}` : summaryText;
+                  // Same body as the automatic pipeline: summary narrative, then the
+                  // recording link. A leading "Call type:" line is not posted.
+                  const noteText = openaiClient.formatCallNote({ summary: summaryText, folderLink });
                   await heymarketClient.postPrivateNote(externalNumber, noteText, direction);
                   console.log(`Admin: posted Heymarket private note for ${externalNumber} (no Doc created).`);
                   res.json({ ok: true });
@@ -657,7 +666,8 @@ app.listen(port, () => {
     ? 'TEAM_ROSTER_JSON'
     : (process.env.TEAM_ROSTER_PATH || 'config/team-roster.json');
   console.log(`GoTo Call Notes listening on :${port}`);
-  console.log(`Roster: ${extensions} extensions from ${source}.`);
+  const teamCells = book.byPhone ? book.byPhone.size : 0;
+  console.log(`Roster: ${extensions} extensions from ${source}. Team cell numbers: ${teamCells}.`);
   if (!extensions) {
     console.error('Roster is empty. A transcript introduction cannot be matched to a team member, so inbound Team Member(s) stays unknown.');
   }
