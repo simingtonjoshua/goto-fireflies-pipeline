@@ -45,7 +45,13 @@ const CONNECTED_STATUSES = new Set(['CONNECTED', 'ON_HOLD', 'HOLD', 'HELD']);
 // on a recording — not him picking up), business-hours messages, and IVR menus.
 const ALWAYS_SYSTEM = [
   /call may be recorded/i,
-  /currently assisting other callers/i,
+  /currently (?:assisting|helping) other (?:callers|customers)/i,
+  /\bwe apologize for the extended wait\b/i,
+  /\bour representatives are currently helping\b/i,
+  /\bwe will call you as soon as possible\b/i,
+  /\bif you have reached this (?:message|recording)\b/i,
+  /\byou have reached this (?:message|recording)\b/i,
+  /\bin order to most efficiently process your call\b/i,
   /please leave (your )?name/i,
   /please leave a (message|voicemail)/i,
   /hi there,\s+this is josh\b/i,
@@ -177,7 +183,23 @@ function isSystemRecordingUtterance(text, roster) {
 }
 
 function systemRecordingPromptLine() {
-  return 'System recordings (never a live person, even if a name is spoken): the "this call may be recorded" announcement, the "thank you for calling" / "it\'s a great day here" greeting, the "we are currently assisting other callers" queue message and its continuation ("your call is very important to us", "please stay on the line"), the "best in custom blinds" tagline, the after-hours greeting in Joshua\'s voice that asks the caller to leave their name, carrier voicemail prompts ("your call has been forwarded to voicemail", "automated voice messaging system", "mailbox is full", "at the tone, please record your message", "when you have finished recording, you may hang up"), the "no call parked on that extension" message, business-hours messages, IVR menus ("press 1", "press one"), vendor hold queues ("estimated wait time", "save your place in line", "welcome to Bright"), and prompts that ask the caller to enter a zip code.';
+  return 'System recordings (never a live person, even if a name is spoken): the "this call may be recorded" announcement, the "thank you for calling" / "it\'s a great day here" greeting, the "we are currently assisting other callers" queue message and its continuation ("your call is very important to us", "please stay on the line"), the "best in custom blinds" tagline, the queue apology ("we apologize for the extended wait", "our representatives are currently helping other customers", "we will call you as soon as possible"), the after-hours greeting in Joshua\'s voice that asks the caller to leave their name, "if you have reached this message", carrier voicemail prompts ("your call has been forwarded to voicemail", "automated voice messaging system", "mailbox is full", "at the tone, please record your message", "when you have finished recording, you may hang up", "please leave a message after the tone"), the "no call parked on that extension" message, business-hours messages, IVR menus ("press 1", "press one"), vendor hold queues ("estimated wait time", "save your place in line", "welcome to Bright"), and prompts that ask the caller to enter a zip code.';
+}
+
+// Queue and voicemail wording, used to tell a one-sided inbound message apart
+// from a live conversation. A courtesy "thank you" is not enough on its own.
+function isQueueOrVoicemailCue(text) {
+  const value = String(text || '');
+  return /\bleave (?:a |your )?(?:message|name)\b/i.test(value)
+    || /\bextended wait\b/i.test(value)
+    || /\b(?:assisting|helping) other (?:callers|customers)\b/i.test(value)
+    || /\bafter the tone\b/i.test(value)
+    || /\byou have reached\b/i.test(value)
+    || /\bvoicemail\b/i.test(value)
+    || /\bthis is josh\b/i.test(value)
+    || /\bplease stay on the line\b/i.test(value)
+    || /\bas soon as possible\b/i.test(value)
+    || /\bwe apologize\b/i.test(value);
 }
 
 function customerDialString(dialString, roster) {
@@ -1448,6 +1470,51 @@ function answerersFromCallReport(report, roster = rosterApi.getRoster()) {
   return [];
 }
 
+function reportStateType(state) {
+  const type = state && (state.type || state.action);
+  if (type && typeof type === 'object') return String(type.value || '');
+  return String(type || '');
+}
+
+function reportShowsVoicemail(body) {
+  if (!body || typeof body !== 'object') return false;
+  const states = Array.isArray(body.callStates) ? body.callStates : [];
+  for (const state of states) {
+    if (/VOICE[\s_]?MAIL/i.test(reportStateType(state))) return true;
+    if (state && (state.voicemailId || state.voicemailboxId)) return true;
+  }
+  const participants = [...(body.participants || [])];
+  for (const state of states) {
+    for (const participant of state.participants || []) participants.push(participant);
+  }
+  for (const participant of participants) {
+    if (/VOICE[\s_]?MAIL/i.test(String(participantKind(participant) || ''))) return true;
+  }
+  const disposition = String(body.disposition || body.callResult || body.result || '').toUpperCase();
+  return /VOICE[\s_]?MAIL/.test(disposition);
+}
+
+// Whether a roster person joined. answerersFromCallReport is the yes: a
+// CONNECTED roster line, or one summary line when the report has no states.
+// Anything else that saw a line (ringing phones, a queue line that is not a
+// person) or a voicemail event is a no. A later transcript introduction can
+// still name the answerer. An empty report stays unknown.
+function reportHumanAnswer(report, roster = rosterApi.getRoster()) {
+  const body = reportBody(report);
+  if (!body) return { answered: null, voicemail: false };
+  if (answerersFromCallReport(report, roster).length) return { answered: true, voicemail: false };
+  const states = Array.isArray(body.callStates) ? body.callStates : [];
+  let sawLine = false;
+  for (const state of states) {
+    for (const participant of state.participants || []) {
+      if (participantKind(participant) === 'LINE') sawLine = true;
+    }
+  }
+  const voicemail = reportShowsVoicemail(body);
+  if (voicemail || sawLine) return { answered: false, voicemail };
+  return { answered: null, voicemail: false };
+}
+
 function cleanExternalName(name) {
   const text = String(name || '').trim();
   if (!text) return null;
@@ -1558,7 +1625,9 @@ module.exports = {
   channelRole,
   channelRolesForLeg,
   isSystemRecordingUtterance,
+  isQueueOrVoicemailCue,
   systemRecordingPromptLine,
+  reportHumanAnswer,
   transcriptIsSubstantive,
   callIsFragment,
   answererFromTranscript,

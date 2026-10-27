@@ -467,10 +467,11 @@ function formatLegTranscript(leg) {
       + ` (direction ${leg.direction || 'unknown'}, recording ${leg.recordingId || 'n/a'}).`,
     );
   }
+  const closerIndexes = inboundRecordingCloserIndexes(utterances, assignment.roles, book, leg.direction);
 
-  return utterances.map((u) => {
+  return utterances.map((u, index) => {
     const seconds = Math.max(0, Math.round((u.startTimeMs - startMs) / 1000));
-    if (callParties.isSystemRecordingUtterance(u.text, book)) {
+    if (callParties.isSystemRecordingUtterance(u.text, book) || closerIndexes.has(index)) {
       return { seconds, label: 'Recording', text: u.text };
     }
     const role = Object.prototype.hasOwnProperty.call(assignment.roles, Number(u.channel))
@@ -598,7 +599,7 @@ const SYSTEM_PROMPT = `You summarize customer phone calls for a Budget Blinds fr
 
 Do not assume the outside party is a customer. Use a Caller identity line when one is present: that name and role are who is on the phone, and you must not call them the customer. If no Caller identity is present, call the outside party the customer only when the call is actually a customer or prospect. A coworker (designer, installer, or office staff) calling from a customer's house is that coworker. The homeowner they mention is a third party who is not on the phone.
 
-The metadata includes fixed facts: direction, whether the call was answered, the team member names, and the customer phone number. Do not change those facts. If the Answered fact says the call was not answered, do not say the caller was connected to, reached, or spoke with a team member. If the Answered fact says the transcript is a two-sided conversation, describe that conversation and do not write that the call was not answered. If Answered is unknown, do not claim that the call was not answered.
+The metadata includes fixed facts: direction, whether the call was answered, the team member names, and the customer phone number. Do not change those facts. If the Answered fact says no representative joined the call, describe the queue or voicemail and any message the caller left, including what they asked for and any callback number. Do not describe a live conversation with staff. If the Answered fact says the transcript is a two-sided conversation, describe that conversation and do not write that the call was not answered. If Answered is unknown, do not claim that the call was not answered.
 
 Treat the speaker labels as ground truth. Do not swap who did something because of who talked first, or because a line sounds like the other role, and do not rename a labeled speaker from a word in the transcript. Attribute each action to the labeled speaker who said they would do it. Do not invent a role-reversed commercial relationship: the labeled team member (Budget Blinds) sends the service order and warranty paperwork, and the customer signs it and pays. Never write that the customer will send a service order for a team member to sign or pay. Never describe the team member as the person whose product failed when the Customer lines are the ones describing that problem.
 
@@ -689,23 +690,82 @@ const UNKNOWN_SYSTEM_PROMPT = `${UNKNOWN_TYPE_RULES}${SYSTEM_PROMPT.replace(
 // guess at it (which produced two real bugs: describing an outbound call as something
 // the customer did, and restating a raw UTC timestamp as if it were the correct local
 // time).
+
+// "Thank you." at the end of a queue script is not a person joining the call.
+// The same words after a live team member has already spoken stay theirs.
+const RECORDING_CLOSER = /^\s*(?:thanks|thank you)[.!]?\s*$/i;
+
+function inboundRecordingCloserIndexes(utterances, roles, book, direction) {
+  if (direction === 'OUTBOUND') return new Set();
+  const system = utterances.map((utterance) => callParties.isSystemRecordingUtterance(utterance.text, book));
+  const closer = new Set();
+  const channels = [];
+  for (const utterance of utterances) {
+    const channel = Number(utterance.channel);
+    if (!channels.includes(channel)) channels.push(channel);
+  }
+  for (const channel of channels) {
+    if (roles[channel] === 'customer') continue;
+    let seenSystem = false;
+    let seenLive = false;
+    utterances.forEach((utterance, index) => {
+      if (Number(utterance.channel) !== channel) return;
+      if (system[index]) {
+        seenSystem = true;
+        return;
+      }
+      if (!seenLive && seenSystem && RECORDING_CLOSER.test(utterance.text)) {
+        closer.add(index);
+        return;
+      }
+      seenLive = true;
+    });
+  }
+  return closer;
+}
+
 function rowsAreTwoSidedConversation(rows) {
     const substantive = (rows || []).filter((row) => (
           row && row.label && row.label !== 'Recording' && String(row.text || '').trim()
           && !String(row.label).startsWith('Channel ')
+          && !(row.label !== 'Customer' && RECORDING_CLOSER.test(row.text))
     ));
     const customer = substantive.some((row) => row.label === 'Customer');
     const team = substantive.some((row) => row.label !== 'Customer');
     return customer && team;
 }
 
-function answeredFactLine(answered, twoSided) {
+function customerSpokeIn(rows) {
+  return (rows || []).some((row) => row && row.label === 'Customer' && String(row.text || '').trim());
+}
+
+// Inbound queue then voicemail: recordings plus the caller's message, and no
+// live staff speech. A real two-sided conversation is not this, and a call the
+// phone system says was answered is not this.
+function inboundVoicemailKind({ rows, direction, answered, reachedVoicemail }) {
+  if (answered === true || direction === 'OUTBOUND') return null;
+  if (rowsAreTwoSidedConversation(rows)) return null;
+  const customerSpoke = customerSpokeIn(rows);
+  const cued = (rows || []).some((row) => (
+    row && row.label === 'Recording' && callParties.isQueueOrVoicemailCue(row.text)
+  ));
+  if (!(reachedVoicemail || (customerSpoke && cued))) return null;
+  return customerSpoke ? 'message' : 'greeting';
+}
+
+function answeredFactLine(answered, twoSided, voicemailKind) {
+    if (voicemailKind === 'message') {
+          return 'Answered: no. No representative joined this call. The caller reached the queue and voicemail and left a message. Say that plainly, including what they asked for and any callback number they gave. Do not describe a live conversation with staff.';
+    }
+    if (voicemailKind === 'greeting') {
+          return 'Answered: no. No representative joined this call. The caller reached the queue or voicemail. Do not describe a live conversation with staff.';
+    }
     if (twoSided) {
           return 'Answered: the transcript is a two-sided conversation. Describe what was said. Do not write that the call was not answered.';
     }
     if (answered === true) return 'Answered: yes';
     if (answered === false) {
-          return 'Answered: no. The phone system shows the call was not answered, and there is no two-sided conversation. Do not say the caller was connected to, reached, or spoke with a team member.';
+          return 'Answered: no. The phone system shows no representative joined this call, and there is no two-sided conversation. Do not describe a live conversation with staff.';
     }
     return 'Answered: unknown. The phone system did not say whether the call was answered. Do not claim that the call was not answered.';
 }
@@ -803,11 +863,11 @@ function systemPromptFor(type) {
   return SYSTEM_PROMPT;
 }
 
-function customerContextLines({ direction, answered, twoSided, csrPath, externalNumber, externalName, callCreated, callEnded, rows }) {
+function customerContextLines({ direction, answered, twoSided, voicemailKind, csrPath, externalNumber, externalName, callCreated, callEnded, rows }) {
   return [
     'Fixed facts (do not change these):',
     `Call direction: ${direction || 'unknown'} (OUTBOUND = a Budget Blinds team member placed this call to the customer; INBOUND = the outside party called Budget Blinds. Do not call them the customer when they are a coworker. Never describe an outbound call as something the customer did)`,
-    answeredFactLine(answered, twoSided),
+    answeredFactLine(answered, twoSided, voicemailKind),
     `Team member path (in order, if transferred/parked): ${(csrPath || []).join(' -> ') || 'unknown'}`,
     'Commercial roles (do not reverse): the team member sends any service order or warranty paperwork; the customer signs it and pays.',
     `Customer phone number: ${driveClient.formatPhoneForDisplay(externalNumber)}`,
@@ -829,7 +889,7 @@ function partyIdentity(classified) {
   return classified.partyName;
 }
 
-function typedContextLines({ classified, direction, answered, twoSided, csrPath, externalNumber, externalName, callCreated, callEnded, rows }) {
+function typedContextLines({ classified, direction, answered, twoSided, voicemailKind, csrPath, externalNumber, externalName, callCreated, callEnded, rows }) {
   const identity = partyIdentity(classified);
   const who = identity || (classified.type === 'vendor' ? 'the vendor' : 'the other team member');
   const directionLine = classified.type === 'unknown'
@@ -848,7 +908,7 @@ function typedContextLines({ classified, direction, answered, twoSided, csrPath,
     callerIdentityLine,
     partyLine,
     directionLine,
-    answeredFactLine(answered, twoSided),
+    answeredFactLine(answered, twoSided, voicemailKind),
     `Team member path (in order, if transferred/parked): ${(csrPath || []).join(' -> ') || 'unknown'}`,
     `Phone number: ${driveClient.formatPhoneForDisplay(externalNumber)}`,
     callParties.systemRecordingPromptLine(),
@@ -873,11 +933,12 @@ function rowsForModel(rows, classified) {
 }
 
 function buildSummaryMessages({
-  legRecords, csrPath, externalName, externalNumber, direction, callCreated, callEnded, answered, contactName, otherParty,
+  legRecords, csrPath, externalName, externalNumber, direction, callCreated, callEnded, answered, reachedVoicemail, contactName, otherParty,
 }) {
     const guard = applyCardGuard(legRecords);
     const rows = allTranscriptRows(guard.legRecords);
     const twoSided = rowsAreTwoSidedConversation(rows);
+    const voicemailKind = inboundVoicemailKind({ rows, direction, answered, reachedVoicemail });
     const classified = callType.classifyCall({
       rows,
       legRecords: guard.legRecords,
@@ -892,10 +953,10 @@ function buildSummaryMessages({
     const conversationText = buildConversationText(modelRows);
     const contextLines = classified.type === 'customer'
       ? customerContextLines({
-        direction, answered, twoSided, csrPath, externalNumber, externalName, callCreated, callEnded, rows,
+        direction, answered, twoSided, voicemailKind, csrPath, externalNumber, externalName, callCreated, callEnded, rows,
       })
       : typedContextLines({
-        classified, direction, answered, twoSided, csrPath, externalNumber, externalName, callCreated, callEnded, rows,
+        classified, direction, answered, twoSided, voicemailKind, csrPath, externalNumber, externalName, callCreated, callEnded, rows,
       });
     return {
           system: systemPromptFor(classified.type),
@@ -906,7 +967,27 @@ function buildSummaryMessages({
           partyName: classified.partyName,
           partyRole: classified.partyRole || null,
           callTypeSource: classified.source,
+          voicemail: Boolean(voicemailKind),
     };
+}
+
+// Last-resort rewrite when the model still describes a queue or voicemail as a
+// live conversation. Answered calls are left unchanged.
+function guardVoicemailSummary(summary, options = {}) {
+  if (!options.voicemail) return String(summary || '').trim();
+  let text = String(summary || '').trim();
+  text = text.replace(/\b(?:was|were|got|been)\s+connected to (?:a |the )?(?:budget blinds )?team member\b/gi, 'reached the voicemail');
+  text = text.replace(/\bconnected to (?:a |the )?(?:budget blinds )?team member\b/gi, 'reached the voicemail');
+  text = text.replace(/\banswered by (?:a |the )?(?:budget blinds )?team member\b/gi, 'reached the voicemail');
+  text = text.replace(/\bspoke with (?:a |the )?(?:budget blinds )?team member\b/gi, 'left a message');
+  text = text.replace(/\bspeaking with (?:a |the )?(?:budget blinds )?team member\b/gi, 'leaving a message');
+  text = text.replace(/\bthe team member then started to respond\b/gi, 'the recording continued');
+  text = text.replace(/\b(?:a|the) team member's message\b/gi, 'the recorded greeting');
+  text = text.replace(/\b([A-Z][a-z]+(?: [A-Z][a-z]+)?) from Budget Blinds answered(?: the call)?\b/g, 'The caller reached the voicemail');
+  if (!/\b(voicemail|left a message|reached the queue)\b/i.test(text)) {
+    text = `The caller reached the queue and voicemail and left a message. ${text}`.trim();
+  }
+  return text;
 }
 
 // Heymarket POST /v1/contact/get returns HTTP 400 for these numbers, and logging
@@ -932,7 +1013,7 @@ function summaryResult(summary, callTypeName, extra = {}) {
 // Throws on failure - the caller (src/interactions.js) catches and logs so a
 // summarization failure never crashes the webhook handler.
 async function summarizeInteraction({
-  legRecords, csrPath, externalName, externalNumber, direction, callCreated, callEnded, answered, contactName, otherParty,
+  legRecords, csrPath, externalName, externalNumber, direction, callCreated, callEnded, answered, reachedVoicemail, contactName, otherParty,
 }) {
     const guard = applyCardGuard(legRecords);
     const namedContact = contactName || await lookupContactName(externalNumber);
@@ -946,6 +1027,7 @@ async function summarizeInteraction({
           callCreated,
           callEnded,
           answered,
+          reachedVoicemail,
           contactName: namedContact,
           otherParty,
     });
@@ -999,6 +1081,7 @@ async function summarizeInteraction({
 
   const callTypeName = callType.callTypeForNote(built.callType, summary);
   summary = callType.stripSummaryHeaders(summary);
+  summary = guardVoicemailSummary(summary, { voicemail: built.voicemail });
 
   return summaryResult(summary, callTypeName, built);
 }
@@ -1009,6 +1092,7 @@ module.exports = {
   formatLegTranscript,
   buildNoTranscriptSummary,
   buildSummaryMessages,
+  guardVoicemailSummary,
   lookupContactName,
   formatCallNote: callType.formatCallNote,
 };
