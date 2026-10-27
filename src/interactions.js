@@ -537,6 +537,7 @@ function recordLegState(conversationSpaceId, {
                           leg.customerAnswered = false;
                           leg.explicitlyUnanswered = false;
                           leg.sawAnswer = false;
+                          leg.reachedVoicemail = false;
                           leg.teamMemberSource = null;
                           leg.dialString = null;
                           leg.direction = null;
@@ -954,6 +955,7 @@ function describeGroup(groupKey) {
             const explicitNo = !explicitYes && legRecords.some((leg) => leg.explicitlyUnanswered);
             // No answer field and no CONNECTED party is unknown, not "the call was not answered".
             const answered = explicitYes ? true : (explicitNo ? false : null);
+            const reachedVoicemail = !explicitYes && legRecords.some((leg) => leg.reachedVoicemail);
             const hasTranscript = legRecords.some((leg) => {
                           const transcript = leg.transcript;
                           if (!transcript) return false;
@@ -1005,6 +1007,7 @@ function describeGroup(groupKey) {
                             ? (legRecords.map((leg) => leg.teamMemberSource).find(Boolean) || 'none')
                             : 'none',
                           answered,
+                          reachedVoicemail,
             };
 }
 
@@ -1255,6 +1258,9 @@ function transcriptAnswererFor(leg, book, inboundGroup) {
 function applyFoundAnswerer(leg, found, source) {
             const book = roster.getRoster();
             leg.csrChain = (leg.csrChain || []).filter((entry) => isRosterChainEntry(entry, book));
+            leg.sawAnswer = true;
+            leg.explicitlyUnanswered = false;
+            leg.reachedVoicemail = false;
             considerTeamMember(leg, {
                           name: found.name,
                           extension: found.extension,
@@ -1434,6 +1440,22 @@ async function loadInboundAnswerers(groupKey) {
             }
 }
 
+function applyReportOutcome(leg, report) {
+            if (!leg || !report) return;
+            const outcome = callParties.reportHumanAnswer(report, roster.getRoster());
+            if (!outcome) return;
+            if (outcome.answered === true) {
+                          leg.sawAnswer = true;
+                          leg.explicitlyUnanswered = false;
+                          leg.reachedVoicemail = false;
+                          return;
+            }
+            if (outcome.voicemail) leg.reachedVoicemail = true;
+            if (outcome.answered === false && !leg.sawAnswer && !leg.customerAnswered) {
+                          leg.explicitlyUnanswered = true;
+            }
+}
+
 function recordCallReport(conversationSpaceId, report) {
             const leg = legs.get(conversationSpaceId);
             if (!leg || !report) return [];
@@ -1443,6 +1465,7 @@ function recordCallReport(conversationSpaceId, report) {
             if (leg.direction === 'OUTBOUND' && !groupLooksInbound(groupKey)) return [];
             const book = roster.getRoster();
             if ((leg.csrChain || []).some((entry) => isRosterChainEntry(entry, book))) return [];
+            applyReportOutcome(leg, report);
             const answerers = callParties.answerersFromCallReport(report, book);
             for (const found of answerers) applyFoundAnswerer(leg, found, 'call events report');
             if (answerers.length) {
@@ -1486,7 +1509,7 @@ async function finalizeInteraction(groupKey) {
             const described = describeGroup(groupKey);
             const {
                           conversationSpaceIds, legRecords, csrPath, externalNumber, externalName, otherParty,
-                          direction, callCreated, callEnded, answered,
+                          direction, callCreated, callEnded, answered, reachedVoicemail,
             } = described;
 
             if (!legRecords.length) {
@@ -1544,6 +1567,7 @@ async function finalizeInteraction(groupKey) {
                                           callCreated,
                                           callEnded,
                                           answered,
+                                          reachedVoicemail,
                                           otherParty,
                           });
                           const summaryText = summaryResult.summary;
