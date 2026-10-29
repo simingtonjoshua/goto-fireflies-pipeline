@@ -254,6 +254,8 @@ let onFinalized = () => {};
 let audioUploader = null;
 // Tests inject this. Production uses GET /call-events-report/v1/reports/{id}.
 let callReportFetcher = null;
+// Tests inject this. Production uses GoTo's transcriptions endpoint.
+let transcriptFetcher = null;
 
 function setOnFinalized(fn) {
             onFinalized = typeof fn === 'function' ? fn : () => {};
@@ -750,6 +752,28 @@ function recordCallParkingEvent(payload) {
 // if this conversationSpaceId has no live leg AND was recently finalized, this transcript
 // missed the window entirely - log it and drop it rather than building a new, mostly-
 // empty phantom interaction with no customer info attached.
+function transcriptHasLines(transcript) {
+            if (!transcript) return false;
+            if (typeof transcript === 'string') return transcript.trim().length > 0;
+            const items = Array.isArray(transcript)
+                          ? transcript
+                          : (transcript.results || transcript.items || transcript.transcriptions || []);
+            return Array.isArray(items) && items.some((item) => item && String(item.transcript || item.text || '').trim());
+}
+
+function attachTranscript(leg, recordingId, transcript) {
+            const redacted = cardRedact.redactTranscript(transcript);
+            leg.recordingId = recordingId || leg.recordingId;
+            leg.transcriptReceived = true;
+            leg.cardMasked = redacted.masked;
+            leg.cardReview = false;
+            leg.cardFlagged = redacted.masked;
+            leg.transcript = redacted.transcript;
+            if (redacted.masked) console.log(`Card data masked on conversation ${leg.conversationSpaceId}.`);
+            if (leg.pendingTranscriptIds && recordingId) leg.pendingTranscriptIds.delete(recordingId);
+            return redacted;
+}
+
 function recordTranscript(conversationSpaceId, recordingId, transcript) {
             if (!legs.has(conversationSpaceId) && wasRecentlyFinalized(conversationSpaceId)) {
                           console.log(
@@ -757,16 +781,8 @@ function recordTranscript(conversationSpaceId, recordingId, transcript) {
                                         );
                           return;
             }
-            const redacted = cardRedact.redactTranscript(transcript);
             const leg = getOrCreateLeg(conversationSpaceId);
-            leg.recordingId = recordingId;
-            leg.transcriptReceived = true;
-            leg.cardMasked = redacted.masked;
-            leg.cardReview = false;
-            leg.cardFlagged = redacted.masked;
-            leg.transcript = redacted.transcript;
-            if (redacted.masked) console.log(`Card data masked on conversation ${conversationSpaceId}.`);
-            leg.pendingTranscriptIds.delete(recordingId);
+            attachTranscript(leg, recordingId, transcript);
             const groupKey = groupKeyFor(conversationSpaceId);
             scheduleFinalize(groupKey);
             const flagged = groupIsCardFlagged(conversationSpaceId);
@@ -1498,14 +1514,99 @@ function applyTranscriptAnswerers(groupKey) {
             }
 }
 
+// Outbound STARTING often lists every device on the dialer's extension as
+// RINGING, with an originator id that matches none of them, and ENDING
+// participants are empty. Call history may also miss the leg. The call events
+// report (the same one inbound answerers use) has the CONNECTED line or the
+// caller extension / user. Transcript self-intro runs first so a clear
+// "this is Emily with Budget Blinds" is not renamed by a different line on
+// the report. The report fills a leg that is still unnamed.
+async function loadOutboundDialers(groupKey) {
+            if (groupLooksInbound(groupKey)) return;
+            const book = roster.getRoster();
+            const fetchReport = callReportFetcher || gotoClient.fetchCallEventsReport;
+            for (const id of conversationSpaceIdsFor(groupKey)) {
+                          const leg = legs.get(id);
+                          if (!leg || leg.direction !== 'OUTBOUND') continue;
+                          if ((leg.csrChain || []).some((entry) => isRosterChainEntry(entry, book))) continue;
+                          let report = null;
+                          try {
+                                          report = await fetchReport(id);
+                          } catch (err) {
+                                          console.error(`Call events report for ${id} failed: ${err.message}`);
+                                          continue;
+                          }
+                          if (!report) continue;
+                          rememberReportShape(id, report);
+                          applyReportCustomerNumber(leg, report);
+                          const dialers = callParties.dialersFromCallReport(report, book);
+                          if (!dialers.length) continue;
+                          leg.csrChain = (leg.csrChain || []).filter((entry) => isRosterChainEntry(entry, book));
+                          leg.teamMemberSource = null;
+                          for (const found of dialers) {
+                                          considerTeamMember(leg, {
+                                                          name: found.name,
+                                                          extension: found.extension,
+                                                          userKey: found.userKey,
+                                                          answered: false,
+                                                          connected: false,
+                                                          answerTime: found.answerTime,
+                                          }, { requireAnswered: false, source: 'call events report' });
+                          }
+                          console.log(
+                                          `Outbound dialer from call events report: ${dialers.map((entry) => roster.formatTeamMember(entry)).join(' -> ')} conversation=${id}`,
+                          );
+            }
+}
+
 async function attributeInboundAnswerers(groupKey) {
             await loadInboundAnswerers(groupKey);
             await recoverMissingNumbers(groupKey);
             applyTranscriptAnswerers(groupKey);
+            await loadOutboundDialers(groupKey);
+}
+
+// A recording reached Drive and GoTo never delivered a transcript. Log it and
+// try the transcriptions endpoint once before the note is posted.
+async function recoverMissingTranscripts(groupKey) {
+            const fetchTranscript = transcriptFetcher || gotoClient.fetchTranscript;
+            let recovered = false;
+            for (const id of conversationSpaceIdsFor(groupKey)) {
+                          const leg = legs.get(id);
+                          if (!leg || leg.transcript || leg.transcriptRetryAttempted) continue;
+                          const recordingId = leg.recordingId || [...(leg.pendingTranscriptIds || [])][0] || null;
+                          const hasAudio = Boolean(leg.driveLink || leg.recordingId || (leg.pendingAudio && leg.pendingAudio.length));
+                          if (!hasAudio && !recordingId) continue;
+                          if (!hasAudio) continue;
+                          leg.transcriptRetryAttempted = true;
+                          if (!recordingId) {
+                                          console.log(`WARNING: a recording exists but the GoTo transcript never arrived for conversation ${id}, and there is no recording id to retry.`);
+                                          continue;
+                          }
+                          console.log(`WARNING: recording ${recordingId} exists but the GoTo transcript never arrived for conversation ${id}. Retrying once.`);
+                          try {
+                                          const transcript = await fetchTranscript(recordingId);
+                                          if (!transcriptHasLines(transcript)) {
+                                                          console.log(`WARNING: transcript retry for recording ${recordingId} returned no transcript.`);
+                                                          continue;
+                                          }
+                                          attachTranscript(leg, recordingId, transcript);
+                                          recovered = true;
+                                          console.log(`Transcript retry succeeded for recording ${recordingId} conversation ${id}.`);
+                          } catch (err) {
+                                          console.log(`WARNING: transcript retry for recording ${recordingId} failed: ${err.message}`);
+                          }
+            }
+            return recovered;
 }
 
 async function finalizeInteraction(groupKey) {
             await attributeInboundAnswerers(groupKey);
+            const recoveredTranscript = await recoverMissingTranscripts(groupKey);
+            if (recoveredTranscript) {
+                          applyTranscriptAnswerers(groupKey);
+                          await loadOutboundDialers(groupKey);
+            }
             const described = describeGroup(groupKey);
             const {
                           conversationSpaceIds, legRecords, csrPath, externalNumber, externalName, otherParty,
@@ -1558,6 +1659,12 @@ async function finalizeInteraction(groupKey) {
             try {
                           const cardFlagged = legRecords.some((leg) => leg.cardFlagged);
                           await releaseHeldAudio(conversationSpaceIds, cardFlagged);
+                          for (const record of legRecords) {
+                                          const live = legs.get(record.conversationSpaceId);
+                                          if (!live) continue;
+                                          if (live.driveLink) record.driveLink = live.driveLink;
+                                          if (live.recordingId) record.recordingId = live.recordingId;
+                          }
                           const summaryResult = await openaiClient.summarizeInteraction({
                                           legRecords,
                                           csrPath,
@@ -1714,12 +1821,17 @@ function setCallReportFetcherForTests(fn) {
             callReportFetcher = typeof fn === 'function' ? fn : null;
 }
 
+function setTranscriptFetcherForTests(fn) {
+            transcriptFetcher = typeof fn === 'function' ? fn : null;
+}
+
 function resetForTests() {
             for (const timer of closeTimers.values()) clearTimeout(timer);
             closeTimers.clear();
             parkedOrphans.clear();
             audioUploader = null;
             callReportFetcher = null;
+            transcriptFetcher = null;
             legs.clear();
             legIdToConversation.clear();
             originatorForConversation.clear();
@@ -1765,6 +1877,8 @@ module.exports = {
             buildTranscriptDocHtml,
             recordCallReport,
             setCallReportFetcherForTests,
+            setTranscriptFetcherForTests,
+            recoverMissingTranscripts,
             describeForTests: describeGroup,
             parkOrphanTranscript,
             attachParkedOrphan,
