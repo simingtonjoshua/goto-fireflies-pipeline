@@ -82,7 +82,6 @@ const ALWAYS_SYSTEM = [
   /\bcalendar syncing with\b/i,
   /\btransition to bright\b/i,
   /\bwhen you have finished recording,\s+you may hang up\b/i,
-  /\byou have reached the\b/i,
   /\bdedicated support line\b/i,
   /\byour call may be monitored\b/i,
   /\bthis call may be monitored\b/i,
@@ -108,6 +107,26 @@ const SCRIPT_UNLESS_LIVE = [
   /\bit'?s a (?:great|good) day here\b/i,
   /\bthat'?s a (?:great|good) day here\b/i,
 ];
+
+// Too broad to stay a prompt once a person is on the line: "I think you have
+// reached the wrong franchise" is Jessica talking, not the IVR. The dedicated
+// support-line pattern above still catches the real prompt.
+const UNTIL_LIVE_SYSTEM = [
+  /\byou have reached the\b/i,
+];
+
+// Mid-sentence pieces of a queue or IVR prompt. GoTo splits one recorded
+// sentence across utterances; the continuation is not a person joining.
+const PROMPT_CONTINUATIONS = [
+  /^\s*line assisting another customer\b/i,
+  /^\s*telephone number and zip code\b/i,
+  /^\s*and we will (?:return your (?:phone )?call|call you) as soon as\b/i,
+  /^\s*possible[.!]?\s*$/i,
+  /^\s*of an order\b/i,
+  /^\s*(?:thanks|thank you)[.!]?\s*$/i,
+];
+
+const CONTINUATION_GAP_MS = 20 * 1000;
 
 const SIBLING_WINDOW_MS = 2 * 60 * 1000;
 const ANNOUNCEMENT_HOLD_MS = 2 * 60 * 1000;
@@ -172,14 +191,46 @@ function mentionsLivePerson(text, roster) {
   });
 }
 
+function matchesAny(patterns, value) {
+  return patterns.some((pattern) => pattern.test(value));
+}
+
+// A scripted prompt. Still a recording after a live person has answered.
+// "you have reached the" by itself is not in this set.
+function isKnownPromptPhrase(text, roster) {
+  const value = String(text || '');
+  if (!value.trim()) return false;
+  if (matchesAny(ALWAYS_SYSTEM, value)) return true;
+  if (matchesAny(SCRIPT_UNLESS_LIVE, value) && !mentionsLivePerson(value, roster)) return true;
+  return false;
+}
+
 function isSystemRecordingUtterance(text, roster) {
   const value = String(text || '');
   if (!value.trim()) return false;
-  if (ALWAYS_SYSTEM.some((pattern) => pattern.test(value))) return true;
-  if (SCRIPT_UNLESS_LIVE.some((pattern) => pattern.test(value)) && !mentionsLivePerson(value, roster)) {
-    return true;
-  }
-  return false;
+  if (isKnownPromptPhrase(value, roster)) return true;
+  return matchesAny(UNTIL_LIVE_SYSTEM, value);
+}
+
+function looksLikeLiveTurn(text, roster) {
+  const value = String(text || '');
+  if (mentionsLivePerson(value, roster)) return true;
+  return /\b(?:this is|i'm|i am|my name is|speaking)\b/i.test(value);
+}
+
+// The next utterance on the same channel continues the prompt that just played:
+// it starts a new sentence in lowercase, or it finishes a known prompt phrase,
+// and it is not a person introducing themselves.
+function continuesRecordingPrompt(previous, current, roster) {
+  if (!previous || !current) return false;
+  const text = String(current.text || '').trim();
+  if (!text) return false;
+  const gap = (Number(current.startTimeMs) || 0) - (Number(previous.startTimeMs) || 0);
+  if (!Number.isFinite(gap) || gap < 0 || gap > CONTINUATION_GAP_MS) return false;
+  if (matchesAny(PROMPT_CONTINUATIONS, text)) return true;
+  if (!/^[a-z]/.test(text)) return false;
+  if (looksLikeLiveTurn(text, roster)) return false;
+  return true;
 }
 
 function systemRecordingPromptLine() {
@@ -345,8 +396,12 @@ function participantIsOriginator(participant) {
 function lineFromParticipant(participant, roster) {
   const type = typeOf(participant);
   const nested = type.line && typeof type.line === 'object' ? type.line : {};
-  const extension = extensionFromType(type, roster);
-  const userKey = type.userKey || nested.userKey || type.userId || participant.userKey || participant.userId || null;
+  const userObj = [type.user, participant && participant.user].find((value) => value && typeof value === 'object') || {};
+  const extension = extensionFromType(type, roster)
+    || roster.extensionFrom(userObj.extensionNumber)
+    || roster.extensionFrom(userObj.extension);
+  const userKey = type.userKey || nested.userKey || userObj.userKey || userObj.key || type.userId
+    || participant.userKey || participant.userId || null;
   const byKey = userKey ? roster.personByUserKey(userKey) : null;
   const byExtension = roster.personByExtension(extension);
   const known = byKey || byExtension;
@@ -430,10 +485,24 @@ function analyzeCallState(payload, roster = rosterApi.getRoster()) {
 
   // One non-system LINE on an outbound STARTING event is the person who dialed,
   // even when GoTo's originator id is the session rather than that device, and
-  // even while the line is still RINGING. Extra ringing devices stay excluded.
+  // even while the line is still RINGING. Extra ringing devices of other people
+  // stay excluded. Joshua's desk and softphone often both appear, with the
+  // originator id equal to neither participant: that is still one dialer.
   if (direction === 'OUTBOUND') {
-    const human = lines.filter((line) => !line.isSystem && (line.name || line.extension));
+    const human = lines.filter((line) => !line.isSystem && (line.name || line.extension || line.userKey));
+    const identityOf = (line) => {
+      if (line.extension) return `ext:${line.extension}`;
+      const named = line.name && (roster.personByName(line.name) || roster.primaryByName(line.name));
+      if (named && named.extension) return `ext:${named.extension}`;
+      if (line.userKey) return `user:${line.userKey}`;
+      if (line.name) return `name:${String(line.name).trim().toLowerCase()}`;
+      return null;
+    };
     if (human.length === 1 && !human[0].isOriginator) human[0].isOriginator = true;
+    else if (human.length > 1 && !human.some((line) => line.isOriginator)) {
+      const ids = human.map(identityOf).filter(Boolean);
+      if (ids.length === human.length && new Set(ids).size === 1) human[0].isOriginator = true;
+    }
   }
 
   const participantLegIds = [];
@@ -703,12 +772,17 @@ function analyzeCallHistory(content = {}, roster = rosterApi.getRoster()) {
     matchedBy = 'userKey';
   } else if (legDirection === 'OUTBOUND') {
     // Desk history often shows the person's name with a caller-id DID, and the
-    // users API may 403 before userKey can be linked. A unique roster name is enough.
+    // users API may 403 before userKey can be linked. A unique roster name is
+    // enough. A cell learned from the users API is the same person.
     const byName = roster.personByName(caller.name);
-    if (byName) {
-      person = byName;
-      extension = byName.extension;
-      matchedBy = 'name';
+    const byPhone = typeof roster.personByPhone === 'function'
+      ? roster.personByPhone(caller.number || caller.phoneNumber)
+      : null;
+    const found = byName || byPhone;
+    if (found) {
+      person = found;
+      extension = found.extension;
+      matchedBy = byName ? 'name' : 'phone';
     }
   } else if (!person && (legDirection === 'INBOUND' || !legDirection)) {
     // Inbound history often names the answerer on the callee and puts the office
@@ -910,7 +984,31 @@ function textHasTeamSelfIdentification(text, leg, roster) {
   // No name on the leg: any roster first name still counts when the business
   // (or "on behalf of") follows within a few words.
   if (!credited.length && rosterIntroNearBusiness(value, roster)) return true;
+  // Outbound only: "It's Josh actually" is the dialer. The same words on an
+  // inbound call can be the customer talking about Josh, so they do not flip.
+  if ((leg && leg.direction) === 'OUTBOUND' && outboundDialerSelfId(value, leg, roster)) return true;
   return false;
+}
+
+function spokenSelfId(text, names) {
+  const value = String(text || '');
+  if (!value.trim() || !names || !names.length) return false;
+  return names.some((name) => new RegExp(
+    `\\b(?:this is|i'm|i am|my name is|it(?:'s| is))\\s+${escapeRegExp(name)}\\b(?!['’])`,
+    'i',
+  ).test(value));
+}
+
+// "It's Josh actually" / "this is Joshua" on an outbound leg. When the dialer is
+// already named, only that person's introduction moves the team channel — a
+// coworker answering "this is James" stays the far end. When the dialer is
+// unknown, any roster self-introduction is the person who placed the call.
+// "I'm calling for Emily" does not match. Greetings and prompts are removed
+// by the caller before this runs.
+function outboundDialerSelfId(text, leg, roster) {
+  const credited = teamIntroNames(leg);
+  if (credited.length) return spokenSelfId(text, credited);
+  return spokenSelfId(text, rosterIntroNames(roster));
 }
 
 // The live open greeting proves which inbound channel is the company side.
@@ -1187,11 +1285,30 @@ function personFromOutboundIntro(text, roster) {
   return personFromIntroTokens(roster, tokens);
 }
 
+// "It's Josh actually" names the dialer even when the business name is not in
+// that sentence. "I'm calling for Emily" does not.
+function personFromSpokenSelfId(text, roster) {
+  let best = null;
+  for (const name of rosterIntroNames(roster)) {
+    const pattern = new RegExp(
+      `\\b(?:this is|i'm|i am|my name is|it(?:'s| is))\\s+${escapeRegExp(name)}\\b(?!['’])`,
+      'ig',
+    );
+    let match = pattern.exec(text);
+    while (match) {
+      if (!best || match.index < best.index) best = { index: match.index, name };
+      match = pattern.exec(text);
+    }
+  }
+  if (!best) return null;
+  return personFromIntroTokens(roster, [best.name]);
+}
+
 function outboundIntroAnswerer(leg, roster = rosterApi.getRoster()) {
   if (!leg || leg.direction !== 'OUTBOUND') return null;
   const texts = speakerTexts(leg, roster);
   if (!texts || !texts.teamText) return null;
-  return personFromOutboundIntro(texts.teamText, roster);
+  return personFromOutboundIntro(texts.teamText, roster) || personFromSpokenSelfId(texts.teamText, roster);
 }
 
 function last10(value) {
@@ -1494,6 +1611,35 @@ function reportShowsVoicemail(body) {
   return /VOICE[\s_]?MAIL/.test(disposition);
 }
 
+// Who placed an outbound call, from the call events report. The webhook is
+// STARTING and ENDING; ENDING participants are empty, and a session originator
+// id often matches none of the ringing devices. The report's CONNECTED line,
+// or the caller extension / user on the summary, is the dialer. Inbound reports
+// are not read here — those stay on answerersFromCallReport.
+function dialersFromCallReport(report, roster = rosterApi.getRoster()) {
+  const body = reportBody(report);
+  if (!body) return [];
+  const direction = normalizeDirection(body.direction || (body.metadata && body.metadata.direction));
+  if (direction !== 'OUTBOUND') return [];
+  const connected = answerersFromCallReport(report, roster);
+  if (connected.length === 1) return connected;
+  if (connected.length > 1) {
+    const ids = new Set(connected.map((line) => line.extension || line.name));
+    if (ids.size === 1) return [connected[0]];
+  }
+  const caller = analyzeCallHistory({
+    direction: 'OUTBOUND',
+    caller: body.caller,
+    callee: body.callee,
+    userKey: body.userKey || body.userId,
+    dialString: body.dialString,
+  }, roster);
+  if (caller.teamMember && (caller.teamMember.name || caller.teamMember.extension)) {
+    return [caller.teamMember];
+  }
+  return [];
+}
+
 // Whether a roster person joined. answerersFromCallReport is the yes: a
 // CONNECTED roster line, or one summary line when the report has no states.
 // Anything else that saw a line (ringing phones, a queue line that is not a
@@ -1625,6 +1771,8 @@ module.exports = {
   channelRole,
   channelRolesForLeg,
   isSystemRecordingUtterance,
+  isKnownPromptPhrase,
+  continuesRecordingPrompt,
   isQueueOrVoicemailCue,
   systemRecordingPromptLine,
   reportHumanAnswer,
@@ -1632,6 +1780,7 @@ module.exports = {
   callIsFragment,
   answererFromTranscript,
   answerersFromCallReport,
+  dialersFromCallReport,
   customerNumberFromReport,
   missingInboundNumberWarning,
   teamChannelAnswerer,

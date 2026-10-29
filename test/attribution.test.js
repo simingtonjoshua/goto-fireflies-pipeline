@@ -821,12 +821,17 @@ describe('speaker labels and summary facts', () => {
     ]);
   });
 
-  it('does not treat a customer asking for staff, a bare first name, or an open greeting as the team intro', () => {
+  it('does not treat a customer asking for staff or an open greeting as the team intro', () => {
     const asking = outboundUnknown("I'm calling for Emily. Is Emily available?");
     assert.deepEqual(asking.map((row) => row.label), ['Team Member', 'Customer']);
 
+    // "this is Joshua" with no business name used to stay on the customer channel.
+    // On an outbound call that is the dialer, and the "Hello?" that answered is the far end.
     const bare = outboundUnknown('Hey, this is Joshua. I am returning your call about the shade.');
-    assert.deepEqual(bare.map((row) => row.label), ['Team Member', 'Customer']);
+    assert.deepEqual(bare.map((row) => row.label), ['Customer', 'Team Member']);
+
+    const itsJosh = outboundUnknown("It's Josh actually, is this Jerry?");
+    assert.deepEqual(itsJosh.map((row) => row.label), ['Customer', 'Team Member']);
 
     const greeting = outboundUnknown("It's a great day here at Budget Blinds, this is Emily.");
     assert.deepEqual(greeting.map((row) => row.label), ['Team Member', 'Customer']);
@@ -2650,5 +2655,366 @@ describe('Oct 20 inbound answerer from the call events report', () => {
     const described = interactions.describeForTests('conv-1020-fail');
     assert.deepEqual(described.csrPath, ['Joshua Simington (00003)']);
     assert.equal(described.teamMemberSource, 'transcript introduction');
+  });
+});
+
+describe('2026-10-28 outbound dialer, prompt fragments, and missing transcript', () => {
+  const book = roster.createRoster(ROSTER_CONFIG, [OFFICE]);
+
+  beforeEach(() => {
+    interactions.resetForTests();
+    roster.setRosterForTests(book);
+  });
+
+  after(() => {
+    interactions.resetForTests();
+    roster.resetRosterForTests();
+  });
+
+  function jerryTranscript() {
+    return {
+      results: [
+        { transcript: 'James?', channel: 0, startTimeMs: 0 },
+        { transcript: "It's Josh actually, is this Jerry?", channel: 1, startTimeMs: 1000 },
+        { transcript: 'Oh, Josh. Yeah, hi.', channel: 0, startTimeMs: 3000 },
+        { transcript: "Jerry, I'm just touching bases with you", channel: 1, startTimeMs: 5000 },
+        { transcript: 'on behalf of James though.', channel: 1, startTimeMs: 7000 },
+      ],
+    };
+  }
+
+  it('keeps an outbound far-end answer as the customer when the dialer says it is Josh', () => {
+    const rows = openaiClient.formatLegTranscript({
+      direction: 'OUTBOUND',
+      csrChain: [],
+      transcript: jerryTranscript(),
+    });
+    assert.deepEqual(rows.map((row) => row.label), [
+      'Customer',
+      'Team Member',
+      'Customer',
+      'Team Member',
+      'Team Member',
+    ]);
+    assert.equal(rows[0].text, 'James?');
+    assert.match(rows[1].text, /It's Josh actually/);
+
+    const named = openaiClient.formatLegTranscript({
+      direction: 'OUTBOUND',
+      csrChain: [{ name: 'Joshua Simington', extension: '00003' }],
+      transcript: jerryTranscript(),
+    });
+    assert.deepEqual(named.map((row) => row.label), [
+      'Customer',
+      'Joshua Simington',
+      'Customer',
+      'Joshua Simington',
+      'Joshua Simington',
+    ]);
+
+    const built = openaiClient.buildSummaryMessages({
+      legRecords: [{
+        direction: 'OUTBOUND',
+        csrChain: [{ name: 'Joshua Simington', extension: '00003' }],
+        transcript: jerryTranscript(),
+      }],
+      csrPath: ['Joshua Simington (00003)'],
+      externalNumber: '9165489035',
+      direction: 'OUTBOUND',
+      callCreated: '2026-10-28T19:09:00.000Z',
+      callEnded: '2026-10-28T19:12:00.000Z',
+      answered: true,
+    });
+    assert.match(built.user, /Call direction: OUTBOUND/);
+    assert.match(built.user, /Never describe an outbound call as something the customer did/);
+    assert.match(built.user, /\[0s\] Customer: James\?/);
+    assert.match(built.user, /\[1s\] Joshua Simington: It's Josh actually/);
+    assert.doesNotMatch(built.user, /Team Member: James\?/);
+  });
+
+  it('credits both of Joshua\'s ringing devices as one outbound dialer, and not two different people', () => {
+    const samePerson = callParties.analyzeCallState(callState({
+      conversationSpaceId: '8fe2067d-4092-3162-b673-d7b0540f2482',
+      direction: 'OUTBOUND',
+      callCreated: '2026-10-28T19:09:00.000Z',
+      participants: [
+        line({ id: 'desk', extension: '00003', name: 'Joshua Simington', status: 'RINGING', originator: 'session-not-a-device' }),
+        line({ id: 'softphone', extension: '00003', name: 'Joshua Simington', status: 'RINGING', originator: 'session-not-a-device' }),
+      ],
+    }), book);
+    assert.equal(samePerson.lines.some((entry) => entry.isOriginator), true);
+    interactions.recordLegState('conv-josh-devices', {
+      lines: samePerson.lines,
+      direction: 'OUTBOUND',
+      directionSource: 'metadata',
+      externalNumber: '9165489035',
+      callCreated: '2026-10-28T19:09:00.000Z',
+    });
+    const leg = interactions.peekLeg('conv-josh-devices');
+    assert.deepEqual(names(leg), ['Joshua Simington (00003)']);
+    assert.equal(leg.teamMemberSource, 'STARTING originator');
+
+    const twoPeople = callParties.analyzeCallState(callState({
+      conversationSpaceId: '72576f95-2c2b-34ba-b301-d936c8d3dbd9',
+      direction: 'OUTBOUND',
+      callCreated: '2026-10-28T22:44:00.000Z',
+      participants: [
+        line({ id: 'josh', extension: '00003', name: 'Joshua Simington', status: 'RINGING', originator: 'session-not-a-device' }),
+        line({ id: 'emily', extension: '00006', name: 'Emily Kingdon', status: 'RINGING', originator: 'session-not-a-device' }),
+      ],
+    }), book);
+    assert.equal(twoPeople.lines.some((entry) => entry.isOriginator), false);
+    interactions.recordLegState('conv-two-ringing', {
+      lines: twoPeople.lines,
+      direction: 'OUTBOUND',
+      directionSource: 'metadata',
+      externalNumber: '8662607521',
+      callCreated: '2026-10-28T22:44:00.000Z',
+    });
+    assert.deepEqual(names(interactions.peekLeg('conv-two-ringing')), []);
+  });
+
+  it('names an outbound dialer from the caller extension or the call events report', async () => {
+    book.rememberPhone(book.personByExtension('00003'), '9165550144');
+    const fromPhone = callParties.analyzeCallHistory({
+      direction: 'OUTBOUND',
+      caller: { number: '9165550144' },
+      callee: { number: '9165489035', name: 'Jerry' },
+    }, book);
+    assert.equal(fromPhone.teamMember.name, 'Joshua Simington');
+    assert.equal(fromPhone.teamMember.extension, '00003');
+    assert.equal(fromPhone.teamMember.matchedBy, 'phone');
+
+    const fromCaller = callParties.dialersFromCallReport({
+      direction: 'OUTBOUND',
+      caller: { name: 'Joshua Simington', number: OFFICE, extensionNumber: '00003' },
+      callee: { number: '9165489035', name: 'Jerry' },
+    }, book);
+    assert.equal(fromCaller[0].name, 'Joshua Simington');
+    assert.equal(fromCaller[0].extension, '00003');
+
+    const connected = callParties.dialersFromCallReport({
+      direction: 'OUTBOUND',
+      callStates: [
+        {
+          sequenceNumber: 2,
+          timestamp: '2026-10-28T19:09:04.000Z',
+          participants: [
+            {
+              status: { value: 'CONNECTED' },
+              type: { value: 'LINE', extensionNumber: '00003', name: 'Joshua Simington' },
+            },
+            {
+              status: { value: 'CONNECTED' },
+              type: { value: 'PHONE_NUMBER', callee: { number: '9165489035' } },
+            },
+          ],
+        },
+        { sequenceNumber: 3, type: 'ENDING', participants: [] },
+      ],
+    }, book);
+    assert.deepEqual(connected.map((entry) => entry.name), ['Joshua Simington']);
+    assert.deepEqual(callParties.dialersFromCallReport({ direction: 'INBOUND', caller: { name: 'Emily Kingdon', extensionNumber: '00006' } }, book), []);
+
+    const fetched = [];
+    interactions.setCallReportFetcherForTests(async (id) => {
+      fetched.push(id);
+      return {
+        direction: 'OUTBOUND',
+        caller: { name: 'Joshua Simington', extensionNumber: '00003', number: OFFICE },
+        callee: { number: '8662607521', name: 'Hunter Douglas' },
+      };
+    });
+    interactions.recordLegState('conv-josh-report', {
+      legId: 'leg-josh-report',
+      lines: [],
+      direction: 'OUTBOUND',
+      directionSource: 'metadata',
+      externalNumber: '8662607521',
+      callCreated: '2026-10-28T22:44:00.000Z',
+      callEnded: '2026-10-28T23:32:00.000Z',
+    });
+    interactions.recordTranscript('conv-josh-report', 'rec-josh-report', {
+      results: [
+        { transcript: 'Thank you for calling Hunter Douglas.', channel: 1, startTimeMs: 0 },
+        { transcript: 'I need a status on the shade order.', channel: 0, startTimeMs: 8000 },
+      ],
+    });
+    await interactions.attributeInboundAnswerers('conv-josh-report');
+    const described = interactions.describeForTests('conv-josh-report');
+    assert.deepEqual(fetched, ['conv-josh-report']);
+    assert.deepEqual(described.csrPath, ['Joshua Simington (00003)']);
+    assert.equal(described.teamMemberSource, 'call events report');
+
+    interactions.recordLegState('conv-josh-said', {
+      legId: 'leg-josh-said',
+      lines: [],
+      direction: 'OUTBOUND',
+      directionSource: 'metadata',
+      externalNumber: '9165489035',
+      callCreated: '2026-10-28T19:09:00.000Z',
+    });
+    interactions.recordTranscript('conv-josh-said', 'rec-josh-said', jerryTranscript());
+    interactions.setCallReportFetcherForTests(async () => {
+      throw new Error('report should not be required once Josh introduced himself');
+    });
+    await interactions.attributeInboundAnswerers('conv-josh-said');
+    const spoken = interactions.describeForTests('conv-josh-said');
+    assert.deepEqual(spoken.csrPath, ['Joshua Simington (00003)']);
+    assert.equal(spoken.teamMemberSource, 'outbound introduction');
+  });
+
+  it('labels queue and IVR prompt fragments as Recording, and keeps a live answer', () => {
+    const queue = openaiClient.formatLegTranscript({
+      direction: 'INBOUND',
+      csrChain: [],
+      transcript: {
+        results: [
+          { transcript: 'Thank you for calling Budget Blinds.', channel: 1, startTimeMs: 0 },
+          { transcript: 'Our normal business hours are Monday through Friday, 9am to 5pm, excluding holidays.', channel: 1, startTimeMs: 2000 },
+          { transcript: 'If you have reached this message during normal business hours, we are likely on the other', channel: 1, startTimeMs: 8000 },
+          { transcript: 'line assisting another customer.', channel: 1, startTimeMs: 12000 },
+          { transcript: 'Please leave your name.', channel: 1, startTimeMs: 15000 },
+          { transcript: 'telephone number and zip code and we will return your phone call as soon as', channel: 1, startTimeMs: 16000 },
+          { transcript: 'possible.', channel: 1, startTimeMs: 19000 },
+        ],
+      },
+    });
+    assert.deepEqual(queue.map((row) => row.label), queue.map(() => 'Recording'));
+
+    const ivr = openaiClient.formatLegTranscript({
+      direction: 'OUTBOUND',
+      csrChain: [{ name: 'Joshua Simington', extension: '00003' }],
+      transcript: {
+        results: [
+          { transcript: 'This call may be monitored to check the status', channel: 1, startTimeMs: 5000 },
+          { transcript: 'of an order.', channel: 1, startTimeMs: 11000 },
+          { transcript: 'For customer and technical support, press one.', channel: 1, startTimeMs: 14000 },
+        ],
+      },
+    });
+    assert.deepEqual(ivr.map((row) => row.label), ['Recording', 'Recording', 'Recording']);
+
+    const jessica = openaiClient.formatLegTranscript({
+      direction: 'INBOUND',
+      csrChain: [{ name: 'Emily Kingdon', extension: '00006', answered: true }],
+      transcript: {
+        results: [
+          { transcript: 'This is Jessica.', channel: 1, startTimeMs: 58000 },
+          { transcript: 'I think you have reached the wrong franchise, the wrong branch.', channel: 1, startTimeMs: 75000 },
+          { transcript: 'I think you want the Sacramento location. I can give you their phone number.', channel: 1, startTimeMs: 80000 },
+        ],
+      },
+    });
+    assert.deepEqual(jessica.map((row) => row.label), [
+      'Emily Kingdon',
+      'Emily Kingdon',
+      'Emily Kingdon',
+    ]);
+    assert.equal(jessica.some((row) => row.label === 'Recording'), false);
+  });
+
+  it('says the recording is in Drive when audio exists and no transcript does', async () => {
+    const withAudio = openaiClient.buildNoTranscriptSummary({
+      csrPath: ['Emily Kingdon (00006)'],
+      externalNumber: '9164127218',
+      direction: 'INBOUND',
+      callCreated: '2026-10-28T16:57:00.000Z',
+      answered: true,
+      hasRecording: true,
+    });
+    assert.match(withAudio, /answered by Emily Kingdon/);
+    assert.match(withAudio, /No transcript was available; the recording is in the Drive folder\./);
+    assert.doesNotMatch(withAudio, /no conversation audio/);
+
+    const withoutAudio = openaiClient.buildNoTranscriptSummary({
+      csrPath: ['Emily Kingdon (00006)'],
+      externalNumber: '9257193810',
+      direction: 'INBOUND',
+      callCreated: '2026-10-28T18:10:00.000Z',
+      answered: true,
+    });
+    assert.match(withoutAudio, /no conversation audio or transcript was captured/);
+    assert.doesNotMatch(withoutAudio, /recording is in the Drive folder/);
+
+    const outboundAudio = openaiClient.buildNoTranscriptSummary({
+      csrPath: ['Joshua Simington (00003)'],
+      externalNumber: '8662607521',
+      direction: 'OUTBOUND',
+      callCreated: '2026-10-28T22:44:00.000Z',
+      answered: true,
+      hasRecording: true,
+      callType: 'vendor',
+      partyName: 'Hunter Douglas',
+    });
+    assert.match(outboundAudio, /No transcript was available; the recording is in the Drive folder\./);
+    assert.doesNotMatch(outboundAudio, /no conversation audio/);
+
+    const fetched = [];
+    interactions.setTranscriptFetcherForTests(async (id) => {
+      fetched.push(id);
+      return {
+        results: [
+          { transcript: 'This is Emily, how can I help you?', channel: 1, startTimeMs: 0 },
+          { transcript: 'I need a measurement.', channel: 0, startTimeMs: 2000 },
+        ],
+      };
+    });
+    interactions.recordLegState('conv-retry', {
+      legId: 'leg-retry',
+      lines: [{ extension: '00006', name: 'Emily Kingdon', connected: true, answered: true }],
+      direction: 'INBOUND',
+      directionSource: 'metadata',
+      externalNumber: '9164127218',
+      callCreated: '2026-10-28T16:57:00.000Z',
+      callEnded: '2026-10-28T17:00:00.000Z',
+    });
+    interactions.recordRecordingLink('conv-retry', 'rec-retry', 'https://drive.google.com/file/d/example', {
+      id: 'folder-retry',
+      webViewLink: 'https://drive.google.com/drive/folders/example',
+      name: 'folder',
+    });
+    const logs = [];
+    const original = console.log;
+    console.log = (...args) => logs.push(args.join(' '));
+    let recovered = false;
+    try {
+      recovered = await interactions.recoverMissingTranscripts('conv-retry');
+    } finally {
+      console.log = original;
+    }
+    assert.equal(recovered, true);
+    assert.deepEqual(fetched, ['rec-retry']);
+    assert.match(logs.join('\n'), /recording rec-retry exists but the GoTo transcript never arrived/);
+    assert.equal(interactions.peekLeg('conv-retry').transcriptReceived, true);
+
+    interactions.setTranscriptFetcherForTests(async () => null);
+    interactions.recordLegState('conv-retry-empty', {
+      legId: 'leg-retry-empty',
+      lines: [],
+      direction: 'INBOUND',
+      directionSource: 'metadata',
+      externalNumber: '9257193810',
+      callCreated: '2026-10-28T18:10:00.000Z',
+      callEnded: '2026-10-28T18:11:00.000Z',
+    });
+    interactions.recordRecordingLink('conv-retry-empty', 'rec-empty', 'https://drive.google.com/file/d/empty', {
+      id: 'folder-empty',
+      webViewLink: 'https://drive.google.com/drive/folders/empty',
+    });
+    const emptyLogs = [];
+    console.log = (...args) => emptyLogs.push(args.join(' '));
+    let second = false;
+    let third = true;
+    try {
+      second = await interactions.recoverMissingTranscripts('conv-retry-empty');
+      third = await interactions.recoverMissingTranscripts('conv-retry-empty');
+    } finally {
+      console.log = original;
+    }
+    assert.equal(second, false);
+    assert.equal(third, false);
+    assert.match(emptyLogs.join('\n'), /returned no transcript/);
+    assert.equal(interactions.peekLeg('conv-retry-empty').transcript, null);
   });
 });

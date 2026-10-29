@@ -449,6 +449,46 @@ function chainClaimsSpokenName(csrChain, text) {
   });
 }
 
+function roleOnChannel(assignment, channel, leg) {
+  return Object.prototype.hasOwnProperty.call(assignment.roles, Number(channel))
+    ? assignment.roles[Number(channel)]
+    : callParties.channelRole(channel, leg);
+}
+
+// Known prompts stay Recording. A continuation of the prompt on that same
+// channel (lowercase fragment, or "line assisting another customer") inherits
+// Recording. Once a live team member has spoken on the channel, only a known
+// prompt is relabeled — "you have reached the wrong franchise" stays theirs.
+function recordingIndexesFor(utterances, assignment, book, leg, closerIndexes) {
+  const recording = new Set();
+  const live = new Set();
+  const last = new Map();
+  utterances.forEach((utterance, index) => {
+    const channel = Number(utterance.channel);
+    const role = roleOnChannel(assignment, channel, leg);
+    const known = callParties.isKnownPromptPhrase(utterance.text, book);
+    const system = callParties.isSystemRecordingUtterance(utterance.text, book);
+    const previous = last.get(channel);
+    const continuation = !live.has(channel)
+      && previous
+      && previous.recording
+      && callParties.continuesRecordingPrompt(previous.utterance, utterance, book);
+    const asRecording = known
+      || closerIndexes.has(index)
+      || role === 'system'
+      || (!live.has(channel) && system)
+      || continuation;
+    if (asRecording) {
+      recording.add(index);
+      last.set(channel, { recording: true, utterance });
+      return;
+    }
+    last.set(channel, { recording: false, utterance });
+    if (role === 'team') live.add(channel);
+  });
+  return recording;
+}
+
 // Labels start from GoTo's channel and participant data (callParties.channelRole).
 // A team self-introduction that contradicts that map corrects the whole channel
 // (callParties.channelRolesForLeg). Talk order is not a role. A known greeting,
@@ -468,15 +508,14 @@ function formatLegTranscript(leg) {
     );
   }
   const closerIndexes = inboundRecordingCloserIndexes(utterances, assignment.roles, book, leg.direction);
+  const recordingIndexes = recordingIndexesFor(utterances, assignment, book, leg, closerIndexes);
 
   return utterances.map((u, index) => {
     const seconds = Math.max(0, Math.round((u.startTimeMs - startMs) / 1000));
-    if (callParties.isSystemRecordingUtterance(u.text, book) || closerIndexes.has(index)) {
+    if (recordingIndexes.has(index)) {
       return { seconds, label: 'Recording', text: u.text };
     }
-    const role = Object.prototype.hasOwnProperty.call(assignment.roles, Number(u.channel))
-      ? assignment.roles[Number(u.channel)]
-      : callParties.channelRole(u.channel, leg);
+    const role = roleOnChannel(assignment, u.channel, leg);
     let label;
     const loneName = role === 'customer'
       && leg.direction === 'OUTBOUND'
@@ -783,8 +822,19 @@ function namedParty(partyName, partyRole, fallback) {
   return partyRole ? `${partyName} (${partyRole})` : partyName;
 }
 
+function recordingCaptured(hasRecording) {
+  return Boolean(hasRecording);
+}
+
+function answeredAudioSentence(hasRecording) {
+  if (recordingCaptured(hasRecording)) {
+    return 'No transcript was available; the recording is in the Drive folder.';
+  }
+  return null;
+}
+
 function buildKnownPartyNoTranscriptSummary({
-  csrPath, externalNumber, direction, callCreated, answered, callType, partyName, partyRole,
+  csrPath, externalNumber, direction, callCreated, answered, callType, partyName, partyRole, hasRecording,
 }) {
   const displayNumber = driveClient.formatPhoneForDisplay(externalNumber);
   const when = driveClient.formatPacific(callCreated);
@@ -801,6 +851,10 @@ function buildKnownPartyNoTranscriptSummary({
     const who = originator || 'A Budget Blinds team member';
     const placed = `${who} placed ${phrase} to ${other} at ${displayNumber} on ${when}`;
     if (wasAnswered) {
+      const audio = answeredAudioSentence(hasRecording);
+      if (audio) {
+        return `No transcript was available for this call. ${placed}, and the phone system shows the call was answered. ${audio}`;
+      }
       return `No transcript was available for this call. ${placed}, and the phone system shows the call was answered, but no conversation audio or transcript was captured.`;
     }
     if (answerUnknown) {
@@ -811,6 +865,10 @@ function buildKnownPartyNoTranscriptSummary({
   if (direction === 'INBOUND') {
     const caller = namedParty(partyName, partyRole, callType === 'internal' ? 'A team member' : 'A vendor');
     if (wasAnswered && lastTeamMember) {
+      const audio = answeredAudioSentence(hasRecording);
+      if (audio) {
+        return `No transcript was available for this call. ${caller} called Budget Blinds on ${when} and the call was answered by ${lastTeamMember}. ${audio}`;
+      }
       return `No transcript was available for this call. ${caller} called Budget Blinds on ${when} and the call was answered by ${lastTeamMember}, but no conversation audio or transcript was captured.`;
     }
     if (answerUnknown) {
@@ -821,10 +879,10 @@ function buildKnownPartyNoTranscriptSummary({
   return `No transcript was available for this call with ${other} at ${displayNumber} on ${when}.`;
 }
 
-function buildNoTranscriptSummary({ csrPath, externalNumber, direction, callCreated, answered, callType, partyName, partyRole }) {
+function buildNoTranscriptSummary({ csrPath, externalNumber, direction, callCreated, answered, callType, partyName, partyRole, hasRecording }) {
     if (callType === 'internal' || callType === 'vendor') {
       return buildKnownPartyNoTranscriptSummary({
-        csrPath, externalNumber, direction, callCreated, answered, callType, partyName, partyRole,
+        csrPath, externalNumber, direction, callCreated, answered, callType, partyName, partyRole, hasRecording,
       });
     }
     const displayNumber = driveClient.formatPhoneForDisplay(externalNumber);
@@ -837,6 +895,10 @@ function buildNoTranscriptSummary({ csrPath, externalNumber, direction, callCrea
   if (direction === 'OUTBOUND') {
         const who = originator || 'A Budget Blinds team member';
         if (wasAnswered) {
+              const audio = answeredAudioSentence(hasRecording);
+              if (audio) {
+                    return `No transcript was available for this call. ${who} placed an outbound call to ${displayNumber} on ${when}, and the phone system shows the call was answered. ${audio}`;
+              }
               return `No transcript was available for this call. ${who} placed an outbound call to ${displayNumber} on ${when}, and the phone system shows the call was answered, but no conversation audio or transcript was captured.`;
         }
         if (answerUnknown) {
@@ -846,6 +908,10 @@ function buildNoTranscriptSummary({ csrPath, externalNumber, direction, callCrea
   }
     if (direction === 'INBOUND') {
           if (wasAnswered && lastTeamMember) {
+                const audio = answeredAudioSentence(hasRecording);
+                if (audio) {
+                      return `No transcript was available for this call. ${displayNumber} called Budget Blinds on ${when} and the call was answered by ${lastTeamMember}. ${audio}`;
+                }
                 return `No transcript was available for this call. ${displayNumber} called Budget Blinds on ${when} and the call was answered by ${lastTeamMember}, but no conversation audio or transcript was captured.`;
           }
           if (answerUnknown) {
@@ -1036,11 +1102,13 @@ async function summarizeInteraction({
   // summarize - see buildNoTranscriptSummary above and header comment item 10 for why
   // this is built directly in code instead of asking OpenAI to describe it.
   if (!built.conversationText) {
+        const hasRecording = (guard.legRecords || []).some((leg) => leg && (leg.driveLink || leg.recordingId));
         const summary = buildNoTranscriptSummary({
           csrPath, externalNumber, direction, callCreated, answered,
           callType: built.callType,
           partyName: built.partyName,
           partyRole: built.partyRole,
+          hasRecording,
         });
         return summaryResult(summary, callType.callTypeForNote(built.callType, summary), built);
   }
