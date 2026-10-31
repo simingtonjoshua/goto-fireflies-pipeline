@@ -437,6 +437,38 @@ function ownerFromParticipant(participant, roster) {
   return null;
 }
 
+// Outbound call-state sometimes has no LINE at all. The PHONE_NUMBER caller is
+// our caller-id: a roster full name, or a cell learned for that person. Two
+// different people on the caller side stay unnamed.
+function outboundCallerIdentity(participants, roster) {
+  let found = null;
+  for (const participant of participants || []) {
+    const kind = participantKind(participant);
+    if (kind !== 'PHONE_NUMBER' && kind !== 'PHONE_NUMBER_UNKNOWN') continue;
+    const block = phoneBlock(participant);
+    const caller = block.caller && typeof block.caller === 'object' ? block.caller : null;
+    if (!caller) continue;
+    const byName = typeof roster.matchTeamName === 'function' ? roster.matchTeamName(caller.name) : null;
+    const byPhone = typeof roster.personByPhone === 'function' ? roster.personByPhone(caller.number) : null;
+    const person = byName || byPhone;
+    if (!person || (!person.name && !person.extension)) continue;
+    if (found && (found.name !== person.name || found.extension !== person.extension)) return null;
+    found = {
+      participantId: participant.participantId || participant.id || null,
+      legId: participant.legId || null,
+      extension: person.extension || null,
+      userKey: person.userKey || null,
+      name: person.name || null,
+      status: null,
+      isOriginator: true,
+      isSystem: false,
+      connected: false,
+      matchedBy: byName ? 'caller-id' : 'phone',
+    };
+  }
+  return found;
+}
+
 function analyzeCallState(payload, roster = rosterApi.getRoster()) {
   const content = payload?.content || {};
   const metadata = content.metadata || {};
@@ -488,6 +520,10 @@ function analyzeCallState(payload, roster = rosterApi.getRoster()) {
   // even while the line is still RINGING. Extra ringing devices of other people
   // stay excluded. Joshua's desk and softphone often both appear, with the
   // originator id equal to neither participant: that is still one dialer.
+  // A leg that never lists a LINE can still name the dialer: the PHONE_NUMBER
+  // caller is the desk caller-id (roster name, or a learned cell) and the callee
+  // is the customer. That is the no-transcript outbound shape where the outside
+  // number is known and no extension was on the call-state.
   if (direction === 'OUTBOUND') {
     const human = lines.filter((line) => !line.isSystem && (line.name || line.extension || line.userKey));
     const identityOf = (line) => {
@@ -502,6 +538,10 @@ function analyzeCallState(payload, roster = rosterApi.getRoster()) {
     else if (human.length > 1 && !human.some((line) => line.isOriginator)) {
       const ids = human.map(identityOf).filter(Boolean);
       if (ids.length === human.length && new Set(ids).size === 1) human[0].isOriginator = true;
+    }
+    if (human.length === 0) {
+      const caller = outboundCallerIdentity(participants, roster);
+      if (caller) lines.push(caller);
     }
   }
 
@@ -1304,6 +1344,11 @@ function personFromSpokenSelfId(text, roster) {
   return personFromIntroTokens(roster, [best.name]);
 }
 
+// "My name is Emily" / "this is Joshua". Not "I'm calling for Emily".
+function speakerFromSelfIntroduction(text, roster = rosterApi.getRoster()) {
+  return personFromSpokenSelfId(text, roster);
+}
+
 function outboundIntroAnswerer(leg, roster = rosterApi.getRoster()) {
   if (!leg || leg.direction !== 'OUTBOUND') return null;
   const texts = speakerTexts(leg, roster);
@@ -1611,6 +1656,26 @@ function reportShowsVoicemail(body) {
   return /VOICE[\s_]?MAIL/.test(disposition);
 }
 
+function rosterLinesOnReport(body, roster) {
+  if (!body) return [];
+  const participants = [...(body.participants || [])];
+  for (const state of body.callStates || []) {
+    for (const participant of state.participants || []) participants.push(participant);
+  }
+  const found = [];
+  const seen = new Set();
+  for (const participant of participants) {
+    if (participantKind(participant) !== 'LINE') continue;
+    const line = rosterLineFromFields(reportLineFields(participant), roster);
+    if (!line) continue;
+    const key = line.extension || line.name;
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    found.push({ ...line, answered: false });
+  }
+  return found;
+}
+
 // Who placed an outbound call, from the call events report. The webhook is
 // STARTING and ENDING; ENDING participants are empty, and a session originator
 // id often matches none of the ringing devices. The report's CONNECTED line,
@@ -1637,6 +1702,10 @@ function dialersFromCallReport(report, roster = rosterApi.getRoster()) {
   if (caller.teamMember && (caller.teamMember.name || caller.teamMember.extension)) {
     return [caller.teamMember];
   }
+  // Never connected (no answer, no transcript): the only roster line on the
+  // report is still the person who dialed. Two different lines stay unnamed.
+  const present = rosterLinesOnReport(body, roster);
+  if (present.length === 1) return [present[0]];
   return [];
 }
 
@@ -1785,6 +1854,7 @@ module.exports = {
   missingInboundNumberWarning,
   teamChannelAnswerer,
   outboundIntroAnswerer,
+  speakerFromSelfIntroduction,
   postingPlan,
   callIdVersion,
   uniqueExternalNumbers,

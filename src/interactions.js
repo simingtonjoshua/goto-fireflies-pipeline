@@ -312,6 +312,7 @@ function considerTeamMember(leg, member, { requireAnswered, source }) {
 function lineSource(line) {
             if (!line) return null;
             if (line.matchedBy === 'userKey') return 'roster userKey';
+            if (line.matchedBy === 'caller-id' || line.matchedBy === 'phone') return 'outbound caller id';
             if (line.isOriginator) return 'STARTING originator';
             return null;
 }
@@ -1514,6 +1515,17 @@ function applyTranscriptAnswerers(groupKey) {
             }
 }
 
+// The leg is already known outbound. A call events report that omits direction
+// still has the caller or the ringing line; don't throw that dialer away.
+function reportWithKnownOutboundDirection(report) {
+            const body = reportBodyOf(report);
+            if (!body) return report;
+            const raw = body.direction || (body.metadata && body.metadata.direction);
+            if (raw && String(raw).trim()) return report;
+            if (body === report) return { ...report, direction: 'OUTBOUND' };
+            return { content: { ...body, direction: 'OUTBOUND' } };
+}
+
 // Outbound STARTING often lists every device on the dialer's extension as
 // RINGING, with an originator id that matches none of them, and ENDING
 // participants are empty. Call history may also miss the leg. The call events
@@ -1539,7 +1551,7 @@ async function loadOutboundDialers(groupKey) {
                           if (!report) continue;
                           rememberReportShape(id, report);
                           applyReportCustomerNumber(leg, report);
-                          const dialers = callParties.dialersFromCallReport(report, book);
+                          const dialers = callParties.dialersFromCallReport(reportWithKnownOutboundDirection(report), book);
                           if (!dialers.length) continue;
                           leg.csrChain = (leg.csrChain || []).filter((entry) => isRosterChainEntry(entry, book));
                           leg.teamMemberSource = null;
