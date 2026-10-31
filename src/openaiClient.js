@@ -408,30 +408,79 @@ function extractSelfStatedTeamMemberName(utterances, roles) {
 // "Channel N" when we can't infer roles at all (see inferChannelRoles). Shared by
 // buildConversationText (what gets sent to the model) and formatTranscriptForDoc (what
 // gets written into the Google Doc), so both always show the exact same labeling.
-// Picks the team member name active at one utterance's moment in time, using
-// leg.csrChain's ordered enteredAt timestamps - rather than assuming a WHOLE leg's
-// transcript belongs to whichever team member is LAST in the chain. This matters for a
-// warm transfer/park handoff that happens WITHIN a single leg (same conversationSpaceId
-// / same recording) - recordLegState() in interactions.js pushes a new csrChain entry
-// (instead of overwriting) specifically to preserve this kind of in-leg handoff, so a
-// leg's csrChain CAN have more than one entry, and picking only the last one mislabels
-// the earlier team member's own lines with the later team member's name. Utterance
-// startTimeMs is relative to the start of the leg's own recording (GoTo's documented
-// transcript schema), so this anchors that offset to the leg's callCreated timestamp to
-// compare against each csrChain entry's own (absolute) enteredAt time. Falls back to
-// the simple last-entry behavior when there's only one entry (the common case) or when
-// callCreated is missing and there's no reliable anchor to compare against.
-function teamMemberNameForUtterance(csrChain, leg, utterance) {
+function chainInTimeOrder(csrChain) {
+  return [...(csrChain || [])].sort((a, b) => String(a.enteredAt || '').localeCompare(String(b.enteredAt || '')));
+}
+
+function enteredAtMs(entry) {
+  if (!entry || !entry.enteredAt) return null;
+  const ms = new Date(entry.enteredAt).getTime();
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function legStartMsOf(leg) {
+  if (!leg || !leg.callCreated) return null;
+  const ms = new Date(leg.callCreated).getTime();
+  return Number.isFinite(ms) ? ms : null;
+}
+
+// Picks the team member name active at one utterance's moment in time.
+// Inbound: walk enteredAt. A warm transfer inside one leg pushes another csrChain
+// entry instead of overwriting, and a line is attributed to the last member who
+// had already joined. One entry, or a missing callCreated, uses the last entry.
+// Outbound is different. The dialer is the earliest chain entry (the first name
+// on the team-member path). A later name that GoTo listed before anyone on the
+// team side had spoken is not a handoff — 2026-10-30, Emily Kingdon -> Joshua
+// Simington, both already on the chain when Emily said "my name is Emily", and
+// the old walk labeled every team line with the chain tail. A later member is
+// used only once their enteredAt is after that first team utterance.
+function outboundTeamMemberName(csrChain, leg, utterance, firstTeamAbsMs) {
+  const ordered = chainInTimeOrder(csrChain);
+  const dialer = ordered[0];
+  if (!dialer) return null;
+  const legStartMs = legStartMsOf(leg);
+  if (legStartMs == null) return dialer.name;
+  const utteranceAbsMs = legStartMs + (Number(utterance.startTimeMs) || 0);
+  let active = dialer;
+  for (const entry of ordered.slice(1)) {
+    const enteredMs = enteredAtMs(entry);
+    if (enteredMs == null || firstTeamAbsMs == null) continue;
+    if (!(enteredMs > firstTeamAbsMs)) continue;
+    if (enteredMs <= utteranceAbsMs) active = entry;
+  }
+  return active.name;
+}
+
+// A self-introduction beats chain order. It stays in effect until a later chain
+// member joins after that sentence (a real handoff) or a newer introduction.
+function nameAfterOutboundIntro(csrChain, leg, utterance, introName, introAbsMs) {
+  if (!introName) return null;
+  const legStartMs = legStartMsOf(leg);
+  const utteranceAbsMs = legStartMs == null ? null : legStartMs + (Number(utterance.startTimeMs) || 0);
+  if (legStartMs == null || introAbsMs == null || utteranceAbsMs == null) return introName;
+  let handoff = null;
+  for (const entry of chainInTimeOrder(csrChain).slice(1)) {
+    const enteredMs = enteredAtMs(entry);
+    if (enteredMs == null || !(enteredMs > introAbsMs)) continue;
+    if (enteredMs <= utteranceAbsMs) handoff = entry;
+  }
+  return handoff ? handoff.name : introName;
+}
+
+function teamMemberNameForUtterance(csrChain, leg, utterance, firstTeamAbsMs) {
   if (!csrChain.length) return null;
+  if ((leg && leg.direction) === 'OUTBOUND' && csrChain.length > 1) {
+    return outboundTeamMemberName(csrChain, leg, utterance, firstTeamAbsMs);
+  }
   if (csrChain.length === 1) return csrChain[0].name;
 
-  const legStartMs = leg.callCreated ? new Date(leg.callCreated).getTime() : null;
+  const legStartMs = legStartMsOf(leg);
   if (legStartMs == null) return csrChain[csrChain.length - 1].name;
 
   const utteranceAbsMs = legStartMs + (utterance.startTimeMs || 0);
   let active = csrChain[0];
   for (const entry of csrChain) {
-    const enteredMs = entry.enteredAt ? new Date(entry.enteredAt).getTime() : null;
+    const enteredMs = enteredAtMs(entry);
     if (enteredMs != null && enteredMs <= utteranceAbsMs) active = entry;
   }
   return active.name;
@@ -509,6 +558,20 @@ function formatLegTranscript(leg) {
   }
   const closerIndexes = inboundRecordingCloserIndexes(utterances, assignment.roles, book, leg.direction);
   const recordingIndexes = recordingIndexesFor(utterances, assignment, book, leg, closerIndexes);
+  const legStartMs = legStartMsOf(leg);
+  let firstTeamAbsMs = null;
+  if (leg.direction === 'OUTBOUND' && legStartMs != null) {
+    utterances.forEach((utterance, index) => {
+      if (recordingIndexes.has(index)) return;
+      const role = roleOnChannel(assignment, utterance.channel, leg);
+      const loneName = role === 'customer' && chainClaimsSpokenName(csrChain, utterance.text);
+      if (role !== 'team' && !loneName) return;
+      const abs = legStartMs + (Number(utterance.startTimeMs) || 0);
+      if (firstTeamAbsMs == null || abs < firstTeamAbsMs) firstTeamAbsMs = abs;
+    });
+  }
+  let introName = null;
+  let introAbsMs = null;
 
   return utterances.map((u, index) => {
     const seconds = Math.max(0, Math.round((u.startTimeMs - startMs) / 1000));
@@ -521,7 +584,19 @@ function formatLegTranscript(leg) {
       && leg.direction === 'OUTBOUND'
       && chainClaimsSpokenName(csrChain, u.text);
     if (role === 'team' || loneName) {
-      label = teamMemberNameForUtterance(csrChain, leg, u) || 'Team Member';
+      const chainName = teamMemberNameForUtterance(csrChain, leg, u, firstTeamAbsMs);
+      if (leg.direction === 'OUTBOUND') {
+        const spoken = callParties.speakerFromSelfIntroduction(u.text, book);
+        const abs = legStartMs == null ? null : legStartMs + (Number(u.startTimeMs) || 0);
+        if (spoken && spoken.name && chainName) {
+          introName = spoken.name;
+          introAbsMs = abs;
+        }
+        const introduced = nameAfterOutboundIntro(csrChain, leg, u, introName, introAbsMs);
+        label = introduced || chainName || 'Team Member';
+      } else {
+        label = chainName || 'Team Member';
+      }
     } else if (role === 'customer') {
       label = 'Customer';
     } else if (role === 'system') {

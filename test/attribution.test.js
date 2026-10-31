@@ -3018,3 +3018,234 @@ describe('2026-10-28 outbound dialer, prompt fragments, and missing transcript',
     assert.equal(interactions.peekLeg('conv-retry-empty').transcript, null);
   });
 });
+
+// 2026-10-30: outbound chain Emily Kingdon -> Joshua Simington. Both were on the
+// chain before Emily spoke ("My name is Emily"), and every team line was labeled
+// with the chain tail. The dialer speaks unless a later member joins after a
+// team utterance. A self-introduction beats that order.
+describe('outbound dialer speaks unless a later member joins after them', () => {
+  const book = roster.createRoster(ROSTER_CONFIG, [OFFICE]);
+  const callCreated = '2026-10-30T21:37:00.000Z';
+
+  beforeEach(() => interactions.resetForTests());
+
+  function emilyThenJoshua(emilyAt, joshuaAt) {
+    return [
+      { name: 'Emily Kingdon', extension: '00006', enteredAt: emilyAt },
+      { name: 'Joshua Simington', extension: '00003', enteredAt: joshuaAt },
+    ];
+  }
+
+  it('keeps the dialer on every team line when the later name was already on the chain', () => {
+    const transcript = {
+      results: [
+        { transcript: 'Hello?', channel: 1, startTimeMs: 0 },
+        { transcript: "I'm fair. My name is Emily. I'm calling a Baffle Budget Blinds.", channel: 0, startTimeMs: 3000 },
+        { transcript: 'I was just returning a call. It looks like we had just missed.', channel: 0, startTimeMs: 7000 },
+        { transcript: "Oh, I'm talking to Amy right now.", channel: 1, startTimeMs: 10000 },
+        { transcript: "Oh, gotcha. No problem. I'll leave you to it. Bye-bye.", channel: 0, startTimeMs: 13000 },
+        { transcript: 'Okay. Thank you. Bye.', channel: 1, startTimeMs: 15000 },
+      ],
+    };
+    const rows = openaiClient.formatLegTranscript({
+      direction: 'OUTBOUND',
+      callCreated,
+      csrChain: emilyThenJoshua(callCreated, '2026-10-30T21:37:01.000Z'),
+      transcript,
+    });
+    assert.deepEqual(rows.map((row) => row.label), [
+      'Customer',
+      'Emily Kingdon',
+      'Emily Kingdon',
+      'Customer',
+      'Emily Kingdon',
+      'Customer',
+    ]);
+
+    const built = openaiClient.buildSummaryMessages({
+      legRecords: [{
+        direction: 'OUTBOUND',
+        callCreated,
+        csrChain: emilyThenJoshua(callCreated, '2026-10-30T21:37:01.000Z'),
+        transcript,
+      }],
+      csrPath: ['Emily Kingdon (00006)', 'Joshua Simington (00003)'],
+      externalNumber: '9168013215',
+      direction: 'OUTBOUND',
+      callCreated,
+      callEnded: '2026-10-30T21:37:20.000Z',
+      answered: true,
+    });
+    assert.match(built.user, /\[3s\] Emily Kingdon: I'm fair\. My name is Emily/);
+    assert.match(built.user, /\[7s\] Emily Kingdon:/);
+    assert.doesNotMatch(built.user, /Joshua Simington:/);
+    assert.match(built.user, /Emily Kingdon \(00006\) -> Joshua Simington \(00003\)/);
+  });
+
+  it('uses a self-introduction when chain order lists the other person first', () => {
+    const rows = openaiClient.formatLegTranscript({
+      direction: 'OUTBOUND',
+      callCreated,
+      csrChain: [
+        { name: 'Joshua Simington', extension: '00003', enteredAt: callCreated },
+        { name: 'Emily Kingdon', extension: '00006', enteredAt: '2026-10-30T21:37:01.000Z' },
+      ],
+      transcript: {
+        results: [
+          { transcript: 'Hello?', channel: 1, startTimeMs: 0 },
+          { transcript: 'My name is Emily. I am returning your call.', channel: 0, startTimeMs: 3000 },
+          { transcript: 'We missed you a minute ago.', channel: 0, startTimeMs: 8000 },
+        ],
+      },
+    });
+    assert.deepEqual(rows.map((row) => row.label), [
+      'Customer',
+      'Emily Kingdon',
+      'Emily Kingdon',
+    ]);
+  });
+
+  it('does not use the chain tail when the outbound leg has no callCreated anchor', () => {
+    const rows = openaiClient.formatLegTranscript({
+      direction: 'OUTBOUND',
+      csrChain: emilyThenJoshua(callCreated, '2026-10-30T21:37:01.000Z'),
+      transcript: {
+        results: [
+          { transcript: 'I was returning your call about the shade.', channel: 0, startTimeMs: 0 },
+          { transcript: 'Hello?', channel: 1, startTimeMs: 2000 },
+        ],
+      },
+    });
+    assert.deepEqual(rows.map((row) => row.label), ['Emily Kingdon', 'Customer']);
+  });
+
+  it('switches to a later member only after they join during the recording', () => {
+    const rows = openaiClient.formatLegTranscript({
+      direction: 'OUTBOUND',
+      callCreated,
+      csrChain: emilyThenJoshua(callCreated, '2026-10-30T21:37:30.000Z'),
+      transcript: {
+        results: [
+          { transcript: 'My name is Emily. Let me get someone who has your file.', channel: 0, startTimeMs: 2000 },
+          { transcript: 'Okay.', channel: 1, startTimeMs: 6000 },
+          { transcript: 'I have the order in front of me.', channel: 0, startTimeMs: 35000 },
+        ],
+      },
+    });
+    assert.deepEqual(rows.map((row) => row.label), [
+      'Emily Kingdon',
+      'Customer',
+      'Joshua Simington',
+    ]);
+  });
+
+  it('still follows an inbound handoff by who had already joined', () => {
+    const rows = openaiClient.formatLegTranscript({
+      direction: 'INBOUND',
+      callCreated,
+      csrChain: emilyThenJoshua(callCreated, '2026-10-30T21:37:30.000Z'),
+      transcript: {
+        results: [
+          { transcript: 'I can help with that.', channel: 1, startTimeMs: 5000 },
+          { transcript: 'I have the file.', channel: 1, startTimeMs: 40000 },
+        ],
+      },
+    });
+    assert.deepEqual(rows.map((row) => row.label), ['Emily Kingdon', 'Joshua Simington']);
+  });
+
+  it('names an outbound dialer from caller-id when the leg has no line, and from a ringing report line', async () => {
+    const withName = callParties.analyzeCallState({
+      content: {
+        metadata: {
+          conversationSpaceId: '8bc5e972-0988-3456-9ebe-de3546590d99',
+          direction: 'OUTBOUND',
+          callCreated: '2026-10-30T20:43:00.000Z',
+        },
+        state: {
+          type: 'ACTIVE',
+          participants: [{
+            participantId: 'pstn',
+            legId: 'leg-pstn',
+            status: { value: 'RINGING' },
+            type: {
+              value: 'PHONE_NUMBER',
+              caller: { name: 'Emily Kingdon', number: OFFICE },
+              callee: { number: '8014558364' },
+            },
+          }],
+        },
+      },
+    }, book);
+    assert.equal(withName.lines[0].name, 'Emily Kingdon');
+    assert.equal(withName.lines[0].extension, '00006');
+    assert.equal(withName.lines[0].isOriginator, true);
+    assert.equal(withName.lines[0].matchedBy, 'caller-id');
+    assert.equal(roster.last10(withName.externalNumber), '8014558364');
+
+    interactions.recordLegState('conv-emily-caller-id', {
+      lines: withName.lines,
+      direction: 'OUTBOUND',
+      directionSource: 'metadata',
+      externalNumber: withName.externalNumber,
+      callCreated: '2026-10-30T20:43:00.000Z',
+      callEnded: '2026-10-30T20:44:00.000Z',
+    });
+    assert.deepEqual(names(interactions.peekLeg('conv-emily-caller-id')), ['Emily Kingdon (00006)']);
+    assert.equal(interactions.peekLeg('conv-emily-caller-id').teamMemberSource, 'outbound caller id');
+
+    const ringing = callParties.dialersFromCallReport({
+      direction: 'OUTBOUND',
+      callStates: [{
+        sequenceNumber: 1,
+        participants: [
+          {
+            status: { value: 'RINGING' },
+            type: { value: 'LINE', extensionNumber: '00006', name: 'Emily Kingdon' },
+          },
+          {
+            status: { value: 'RINGING' },
+            type: { value: 'PHONE_NUMBER', callee: { number: '8014558364' } },
+          },
+        ],
+      }],
+    }, book);
+    assert.deepEqual(ringing.map((entry) => entry.name), ['Emily Kingdon']);
+
+    const twoRinging = callParties.dialersFromCallReport({
+      direction: 'OUTBOUND',
+      callStates: [{
+        participants: [
+          { status: { value: 'RINGING' }, type: { value: 'LINE', extensionNumber: '00006', name: 'Emily Kingdon' } },
+          { status: { value: 'RINGING' }, type: { value: 'LINE', extensionNumber: '00003', name: 'Joshua Simington' } },
+        ],
+      }],
+    }, book);
+    assert.deepEqual(twoRinging, []);
+
+    interactions.recordLegState('conv-emily-ringing-report', {
+      lines: [],
+      direction: 'OUTBOUND',
+      directionSource: 'metadata',
+      externalNumber: '8014558364',
+      callCreated: '2026-10-30T20:43:00.000Z',
+      callEnded: '2026-10-30T20:44:00.000Z',
+    });
+    interactions.setCallReportFetcherForTests(async () => ({
+      callStates: [{
+        participants: [
+          {
+            status: { value: 'RINGING' },
+            type: { value: 'LINE', extensionNumber: '00006', name: 'Emily Kingdon' },
+          },
+        ],
+      }],
+      callee: { number: '8014558364' },
+    }));
+    await interactions.attributeInboundAnswerers('conv-emily-ringing-report');
+    const described = interactions.describeForTests('conv-emily-ringing-report');
+    assert.deepEqual(described.csrPath, ['Emily Kingdon (00006)']);
+    assert.equal(described.teamMemberSource, 'call events report');
+    assert.equal(described.answered, null);
+  });
+});
