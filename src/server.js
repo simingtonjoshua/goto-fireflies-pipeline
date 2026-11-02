@@ -20,6 +20,8 @@ const roster = require('./roster');
 const { requireAdmin, warnIfAdminOpen } = require('./adminAuth');
 const { healthPayload } = require('./health');
 const { listAccountUsers } = require('./gotoClient');
+const sheetsClient = require('./sheetsClient');
+const callIntent = require('./callIntent');
 
 const app = express();
 app.use(express.json({ limit: '5mb' }));
@@ -549,8 +551,12 @@ app.post('/admin/reprocess-call', async (req, res) => {
                       callEnded,
                       answered: answered === true ? true : answered === false ? false : null,
           });
-          const summaryText = summaryResult.summary;
-          const callTypeLabel = summaryResult.callTypeLabel;
+          const tagged = await callIntent.applyPipedrive(summaryResult, {
+                      externalNumber,
+                      direction,
+                      answered: answered === true ? true : answered === false ? false : null,
+          });
+          const summaryText = tagged.summary;
 
           const topFolderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
                   const folderName = driveClient.buildCallFolderName({ callCreated, direction, externalNumber });
@@ -558,41 +564,48 @@ app.post('/admin/reprocess-call', async (req, res) => {
                     ? { id: folderId, webViewLink: `https://drive.google.com/drive/folders/${folderId}` }
                               : await driveClient.getOrCreateCallFolder(topFolderId, folderName);
 
-          const metaRows = [['Phone number', driveClient.formatPhoneForDisplay(externalNumber)]];
-                  if (direction !== 'OUTBOUND' && externalName) {
-                              metaRows.push(['Caller ID', externalName]);
-                  }
-                  metaRows.push(
-                              ['Direction', direction || 'unknown'],
-                              ['Team Member(s)', csrPath.join(' → ') || 'unknown'],
-                              ['Call type', callTypeLabel || 'Other'],
-                  );
-                  if (summaryResult.partyName) {
-                              const who = summaryResult.partyRole
-                                ? `${summaryResult.partyName} (${summaryResult.partyRole})`
-                                : summaryResult.partyName;
-                              metaRows.push(['Other party', who]);
-                  }
-                  metaRows.push(
-                              ['Call started', driveClient.formatPacific(callCreated)],
-                              ['Call ended', driveClient.formatPacific(callEnded)]
-                            );
-                  const metaHtml = metaRows.map(([label, value]) => `<p><b>${label}:</b> ${value}</p>`).join('\n');
-                  const summaryHtml = summaryText.split('\n').map((line) => `<p>${line}</p>`).join('\n');
-                  const transcriptHtml = openaiClient.formatTranscriptForDoc(legRecords);
-                  const docHtml = `<html><body>\n<h1>Call Summary</h1>\n${metaHtml}\n<hr>\n<h2>Summary</h2>\n${summaryHtml}\n<hr>\n<h2>Transcript</h2>\n${transcriptHtml}\n</body></html>`;
+          const headerFields = {
+                      externalName,
+                      externalNumber,
+                      direction,
+                      csrPath,
+                      callCreated,
+                      callEnded,
+                      callTypeLabel: tagged.callTypeLabel,
+                      partyName: tagged.partyName,
+                      partyRole: tagged.partyRole,
+                      intent: tagged.intent,
+                      outcome: tagged.outcome,
+                      lead: tagged.lead,
+                      pipedriveDeal: tagged.pipedriveDeal,
+          };
+                  const docHtml = interactions.buildTranscriptDocHtml({
+                      ...headerFields,
+                      summaryText,
+                      legRecords,
+                  });
 
-          await driveClient.createTranscriptDoc(folder.id, `${folderName} - Call Summary & Transcript`, docHtml);
+          const createdDoc = await driveClient.createTranscriptDoc(folder.id, `${folderName} - Call Summary & Transcript`, docHtml);
                   console.log(`Admin: created transcript Doc for reprocessed call in folder ${folder.id}.`);
 
           const noteText = openaiClient.formatCallNote({
                       summary: summaryText,
                       folderLink: folder.webViewLink,
+                      headerLines: callIntent.headerRows(headerFields),
           });
                   await heymarketClient.postPrivateNote(externalNumber, noteText, direction);
                   console.log(`Admin: posted Heymarket private note for reprocessed call (${externalNumber}).`);
 
-          res.json({ ok: true, folderLink: folder.webViewLink, summary: summaryText });
+          res.json({
+                      ok: true,
+                      folderLink: folder.webViewLink,
+                      transcriptLink: createdDoc && (createdDoc.webViewLink || null),
+                      summary: summaryText,
+                      intent: tagged.intent,
+                      outcome: tagged.outcome,
+                      lead: tagged.lead,
+                      pipedriveDeal: tagged.pipedriveDeal,
+          });
         } catch (err) {
                   console.error('Admin: failed to reprocess call:', err);
                   res.status(500).json({ error: err.message });
@@ -656,6 +669,23 @@ res.status(500).json({ error: err.message });
 }
 });
 
+// Where the Call Intent Master sheet lives. Creates it on first use if needed.
+app.get('/admin/intent-sheet', async (req, res) => {
+        try {
+                  const sheet = await sheetsClient.getOrCreateIntentSheet();
+                  res.json({
+                            title: sheetsClient.INTENT_SHEET_NAME,
+                            tab: sheetsClient.INTENT_TAB,
+                            spreadsheetId: sheet.id,
+                            url: sheet.url,
+                            created: sheet.created,
+                  });
+        } catch (err) {
+                  console.error('Admin: Call Intent Master sheet is unavailable:', err);
+                  res.status(500).json({ error: err.message });
+        }
+});
+
 app.get('/healthz', (req, res) => res.json(healthPayload()));
 
 const port = process.env.PORT || 3001;
@@ -672,4 +702,7 @@ app.listen(port, () => {
     console.error('Roster is empty. A transcript introduction cannot be matched to a team member, so inbound Team Member(s) stays unknown.');
   }
   warnIfAdminOpen();
+  sheetsClient.announceIntentSheet().catch((err) => {
+    console.error(`Call Intent Master sheet is unavailable (Docs and HeyMarket notes will still post): ${err.message}`);
+  });
 });

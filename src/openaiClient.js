@@ -232,6 +232,7 @@ const callParties = require('./callParties');
 const roster = require('./roster');
 const cardRedact = require('./cardRedact');
 const callType = require('./callType');
+const callIntent = require('./callIntent');
 
 const OPENAI_URL = 'https://api.openai.com/v1/chat/completions';
 const MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
@@ -1144,10 +1145,32 @@ function summaryResult(summary, callTypeName, extra = {}) {
   return {
     summary,
     callType: type,
-    callTypeLabel: callType.labelFor(type),
+    callTypeLabel: extra.callTypeLabel || callType.labelFor(type),
     partyName: extra.partyName || null,
     partyRole: extra.partyRole || null,
+    intent: extra.intent || null,
+    outcome: extra.outcome || null,
+    lead: extra.lead || null,
+    routedAway: Boolean(extra.routedAway),
+    bookedConsultation: Boolean(extra.bookedConsultation),
+    hasTranscript: Boolean(extra.hasTranscript),
+    pipedriveDeal: extra.pipedriveDeal || null,
   };
+}
+
+function tagsFor(built, summary, context, model, rawSummary) {
+  const preliminaryType = callType.callTypeForNote(built.callType, rawSummary == null ? summary : rawSummary);
+  return callIntent.finalizeTags({
+    model,
+    summary,
+    transcriptText: built.conversationText,
+    direction: context.direction,
+    answered: context.answered,
+    reachedVoicemail: context.reachedVoicemail,
+    voicemail: built.voicemail,
+    callType: preliminaryType,
+    hasTranscript: Boolean(built.conversationText),
+  });
 }
 
 // Sends the assembled call context to OpenAI and returns { summary, callType, callTypeLabel }.
@@ -1185,8 +1208,26 @@ async function summarizeInteraction({
           partyRole: built.partyRole,
           hasRecording,
         });
-        return summaryResult(summary, callType.callTypeForNote(built.callType, summary), built);
+        const model = await callIntent.interpret({
+          conversationText: '',
+          direction,
+          answered,
+          reachedVoicemail,
+          voicemail: built.voicemail,
+          callType: built.callType,
+        });
+        const tags = tagsFor(built, summary, { direction, answered, reachedVoicemail }, model);
+        return summaryResult(summary, tags.callType, { ...built, ...tags });
   }
+
+  const interpretation = callIntent.interpret({
+    conversationText: built.conversationText,
+    direction,
+    answered,
+    reachedVoicemail,
+    voicemail: built.voicemail,
+    callType: built.callType,
+  });
 
   const userPrompt = built.user;
 
@@ -1222,11 +1263,13 @@ async function summarizeInteraction({
   // before ever reaching Heymarket or the Doc.
   summary = summary.replace(/^\s*(CONSULTATION BOOKING|SERVICE\/SUPPORT ISSUE|GENERAL INQUIRY)\s*[-:]\s*/i, '');
 
-  const callTypeName = callType.callTypeForNote(built.callType, summary);
+  const model = await interpretation;
+  const rawSummary = summary;
   summary = callType.stripSummaryHeaders(summary);
   summary = guardVoicemailSummary(summary, { voicemail: built.voicemail });
+  const tags = tagsFor(built, summary, { direction, answered, reachedVoicemail }, model, rawSummary);
 
-  return summaryResult(summary, callTypeName, built);
+  return summaryResult(summary, tags.callType, { ...built, ...tags });
 }
 
 module.exports = {
