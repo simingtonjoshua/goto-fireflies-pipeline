@@ -137,11 +137,21 @@ GoTo webhook notification  ──►  this service
 
 ## Admin routes
 
-`/admin/*` (`/admin/post-note`, `/admin/reprocess-call`, and the others) is on the public URL. Set `ADMIN_TOKEN` and send that value in the `X-Admin-Token` header, or as `Authorization: Bearer <token>`. If `ADMIN_TOKEN` is unset, the routes stay open and the process logs `ADMIN_TOKEN is not set. /admin routes are open until it is configured.`
+`/admin/*` (`/admin/post-note`, `/admin/reprocess-call`, `/admin/intent-sheet`, and the others) is on the public URL. Set `ADMIN_TOKEN` and send that value in the `X-Admin-Token` header, or as `Authorization: Bearer <token>`. If `ADMIN_TOKEN` is unset, the routes stay open and the process logs `ADMIN_TOKEN is not set. /admin routes are open until it is configured.`
+
+## Call intent
+
+Each finalized call is classified into one of twelve intents, a short outcome, and Lead (`Yes`, `No`, or `Unknown`). Those fields are added to the transcript Google Doc header and the Heymarket note header. The summary paragraph is unchanged. Rows are written only for calls finalized after deploy; nothing is backfilled. `GET /admin/intent-sheet` returns the sheet URL, and startup logs `Call Intent Master sheet: ...`.
+
+The sheet is titled **Call Intent Master** (tab `Calls`) and is created in `GOOGLE_DRIVE_FOLDER_ID` if it is not already there. Columns, in order: Date, Caller ID, Direction, Team Member, Call Type, Intent, Outcome, Lead, Transcript Link. Transcript Link is the Google Doc URL. A sheet failure does not block the Doc or the note.
+
+`PIPEDRIVE_API_TOKEN` is optional. When it is set, a phone lookup can add `Pipedrive deal: <id> — <title>`. When it is unset or the lookup fails, that line is omitted.
 
 ## Heymarket note text
 
-A private note is the summary narrative and, when a Drive folder exists, one final line: `Call recording & transcript: <link>`. It does not start with `Call type:` or any other header. Call type still goes on the transcript Google Doc. `/admin/post-note` and `/admin/reprocess-call` use the same formatter as the automatic pipeline.
+A finalized note starts with the same header lines as the transcript Doc (`Phone number`, `Direction`, `Team Member(s)`, `Call type`, `Call started`, `Call ended`, plus `Caller ID` or `Other party` when those exist), then `Intent`, `Outcome`, `Lead`, and `Pipedrive deal` when a deal was found. A blank line, the word `Summary`, the summary narrative, and when a Drive folder exists one final line: `Call recording & transcript: <folder link>`.
+
+`/admin/post-note` still posts a summary plus the link when no header fields are sent. `/admin/reprocess-call` uses the same header as the automatic pipeline and does not append a sheet row.
 
 ## Team member cell phones
 

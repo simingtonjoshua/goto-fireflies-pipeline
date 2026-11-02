@@ -307,15 +307,16 @@ function callTypeForNote(classifiedType, summary) {
 }
 
 // Heymarket notes are the narrative plus the recording link. A "Call type:" line,
-// or an older category header, is removed wherever it was added. Call type stays
-// available to the sheet/doc through the classification result, not this string.
+// or an older category header, is removed wherever it was added so the prose stays
+// prose. Structured header lines (phone, call type, intent, outcome, lead) are
+// passed in separately and are not taken from the model.
 function stripSummaryHeaders(summary) {
   let text = String(summary || '').replace(/^\uFEFF/, '').trim();
   let guard = 0;
   while (text && guard < 6) {
     guard += 1;
     const next = text
-      .replace(/^\s*(?:\*\*|__)?\s*(?:call type|type|category|label)\s*:\s*[^\n]*\s*(?:\*\*|__)?\s*(?:\n+\s*)?/i, '')
+      .replace(/^\s*(?:\*\*|__)?\s*(?:call type|type|category|label|intent|outcome|lead|pipedrive(?: deal)?)\s*:\s*[^\n]*\s*(?:\*\*|__)?\s*(?:\n+\s*)?/i, '')
       .replace(/^\s*(?:\*\*|__)?\s*(?:CONSULTATION BOOKING|SERVICE\/SUPPORT ISSUE|GENERAL INQUIRY)\s*(?:\*\*|__)?\s*(?:[-:]\s*|\n+\s*)?/i, '')
       .trim();
     if (next === text) break;
@@ -324,12 +325,26 @@ function stripSummaryHeaders(summary) {
   return text.replace(/\n+\s*(?:\*\*|__)?\s*call type\s*:\s*[^\n]*\s*$/i, '').trim();
 }
 
-function formatCallNote({ summary, folderLink } = {}) {
+function formatHeaderBlock(headerLines) {
+  return (headerLines || [])
+    .filter((row) => Array.isArray(row) && row[0] && row[1] != null && String(row[1]).trim() !== '')
+    .map(([label, value]) => `${label}: ${String(value).replace(/\s+/g, ' ').trim()}`)
+    .join('\n');
+}
+
+// Without headerLines this stays the summary narrative plus the recording link.
+// With headerLines (the automatic pipeline) the note is those lines, then
+// "Summary", then the narrative, then "Call recording & transcript: <folder link>".
+function formatCallNote({ summary, folderLink, headerLines } = {}) {
   const body = stripSummaryHeaders(summary);
-  if (!folderLink) return body;
-  if (/call recording & transcript:/i.test(body)) return body;
-  if (!body) return `Call recording & transcript: ${folderLink}`;
-  return `${body}\n\nCall recording & transcript: ${folderLink}`;
+  const header = formatHeaderBlock(headerLines);
+  let text = header
+    ? (body ? `${header}\n\nSummary\n${body}` : `${header}\n\nSummary`)
+    : body;
+  if (!folderLink) return text;
+  if (/call recording & transcript:/i.test(text)) return text;
+  if (!text) return `Call recording & transcript: ${folderLink}`;
+  return `${text}\n\nCall recording & transcript: ${folderLink}`;
 }
 
 module.exports = {

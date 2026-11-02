@@ -184,6 +184,7 @@ const openaiClient = require('./openaiClient');
 const heymarketClient = require('./heymarketClient');
 const driveClient = require('./driveClient');
 const sheetsClient = require('./sheetsClient');
+const callIntent = require('./callIntent');
 const callParties = require('./callParties');
 const roster = require('./roster');
 const cardRedact = require('./cardRedact');
@@ -1178,25 +1179,13 @@ function escapeHtml(text) {
 // inbound calls, and only as a clearly separate line - never presented as if it were the
 // customer's name, and never shown at all for outbound calls (where that metadata
 // describes our own line, not the customer's).
-function buildTranscriptDocHtml({ externalName, externalNumber, direction, csrPath, callCreated, callEnded, summaryText, legRecords, callTypeLabel, partyName, partyRole }) {
-            const metaRows = [['Phone number', escapeHtml(driveClient.formatPhoneForDisplay(externalNumber))]];
-            if (direction !== 'OUTBOUND' && externalName) {
-                          metaRows.push(['Caller ID', escapeHtml(externalName)]);
-            }
-            metaRows.push(
-                          ['Direction', escapeHtml(direction || 'unknown')],
-                          ['Team Member(s)', escapeHtml((csrPath || []).join(' → ') || 'unknown')]
-                        );
-            if (callTypeLabel) metaRows.push(['Call type', escapeHtml(callTypeLabel)]);
-            if (partyName) {
-                          const who = partyRole ? `${partyName} (${partyRole})` : partyName;
-                          metaRows.push(['Other party', escapeHtml(who)]);
-            }
-            metaRows.push(
-                          ['Call started', escapeHtml(driveClient.formatPacific(callCreated))],
-                          ['Call ended', escapeHtml(driveClient.formatPacific(callEnded))]
-                        );
-            const metaHtml = metaRows.map(([label, value]) => `<p><b>${label}:</b> ${value}</p>`).join('\n');
+function buildTranscriptDocHtml(fields) {
+            const metaHtml = callIntent.headerRows(fields)
+              .map(([label, value]) => `<p><b>${escapeHtml(label)}:</b> ${escapeHtml(value)}</p>`)
+              .join('\n');
+            const {
+              summaryText, legRecords,
+            } = fields;
 
   const summaryHtml = escapeHtml(summaryText || '')
               .split('\n')
@@ -1689,8 +1678,30 @@ async function finalizeInteraction(groupKey) {
                                           reachedVoicemail,
                                           otherParty,
                           });
-                          const summaryText = summaryResult.summary;
-                          const callTypeLabel = summaryResult.callTypeLabel;
+                          const tagged = await callIntent.applyPipedrive(summaryResult, {
+                                          externalNumber,
+                                          direction,
+                                          answered,
+                                          reachedVoicemail,
+                          });
+                          console.log(
+                            `Call tags ${groupKey}: intent="${tagged.intent}" outcome="${tagged.outcome}" lead=${tagged.lead} type=${tagged.callTypeLabel} pipedrive=${tagged.pipedriveDeal || 'none'}`
+                          );
+                          const headerFields = {
+                                          externalName,
+                                          externalNumber,
+                                          direction,
+                                          csrPath,
+                                          callCreated,
+                                          callEnded,
+                                          callTypeLabel: tagged.callTypeLabel,
+                                          partyName: tagged.partyName,
+                                          partyRole: tagged.partyRole,
+                                          intent: tagged.intent,
+                                          outcome: tagged.outcome,
+                                          lead: tagged.lead,
+                                          pipedriveDeal: tagged.pipedriveDeal,
+                          };
 
               // Find-or-create the same per-call subfolder server.js's archiveToDrive already
               // created (or will create) for this call's recording - both sides compute the
@@ -1701,6 +1712,7 @@ async function finalizeInteraction(groupKey) {
               // with that same folder name as a prefix, so either file carries its own
               // date/direction/phone context even when viewed outside the folder.
               let folderLink = existingFolderLeg?.folderLink;
+              let transcriptLink = '';
                 try {
                                 const topFolderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
                                 const folderName = driveClient.buildCallFolderName({ callCreated, direction, externalNumber });
@@ -1718,36 +1730,34 @@ async function finalizeInteraction(groupKey) {
                                 folderLink = folder.webViewLink;
 
                   const docHtml = buildTranscriptDocHtml({
-                                    externalName,
-                                    externalNumber,
-                                    direction,
-                                    csrPath,
-                                    callCreated,
-                                    callEnded,
-                                    summaryText,
+                                    ...headerFields,
+                                    summaryText: tagged.summary,
                                     legRecords,
-                                    callTypeLabel,
-                                    partyName: summaryResult.partyName,
-                                    partyRole: summaryResult.partyRole,
                   });
-                                await driveClient.createTranscriptDoc(folder.id, `${folderName} - Call Summary & Transcript`, docHtml);
-                                console.log(`Created transcript Doc for interaction ${groupKey} in folder ${folder.id}.`);
+                                const createdDoc = await driveClient.createTranscriptDoc(folder.id, `${folderName} - Call Summary & Transcript`, docHtml);
+                                transcriptLink = (createdDoc && (createdDoc.webViewLink || (createdDoc.id ? `https://docs.google.com/document/d/${createdDoc.id}/edit` : ''))) || '';
+                                console.log(`Created transcript Doc for interaction ${groupKey} in folder ${folder.id}: ${transcriptLink}`);
                 } catch (err) {
                                 console.error(`Error creating transcript Doc for interaction ${groupKey}:`, err);
                 }
 
               const noteText = openaiClient.formatCallNote({
-                                summary: summaryText,
+                                summary: tagged.summary,
                                 folderLink,
+                                headerLines: callIntent.headerRows(headerFields),
               });
 
-                          if (plan.action === 'post' && externalNumber) {
-                                          await heymarketClient.postPrivateNote(externalNumber, noteText, direction);
-                                          console.log(`Posted Heymarket private note for interaction ${groupKey}.`);
-                          } else if (plan.action === 'review') {
-                                          console.log(`REVIEW: interaction ${groupKey} not posted (${plan.reason}).`);
-                          } else {
-                                          console.log(`Interaction ${groupKey} not posted (${plan.reason}).`);
+                          try {
+                                          if (plan.action === 'post' && externalNumber) {
+                                                          await heymarketClient.postPrivateNote(externalNumber, noteText, direction);
+                                                          console.log(`Posted Heymarket private note for interaction ${groupKey}.`);
+                                          } else if (plan.action === 'review') {
+                                                          console.log(`REVIEW: interaction ${groupKey} not posted (${plan.reason}).`);
+                                          } else {
+                                                          console.log(`Interaction ${groupKey} not posted (${plan.reason}).`);
+                                          }
+                          } catch (err) {
+                                          console.error(`Error posting Heymarket note for interaction ${groupKey} (Doc and intent sheet still proceed):`, err);
                           }
 
                           // Sheet row is the Calls index. A suppressed duplicate does not get a
@@ -1767,6 +1777,17 @@ async function finalizeInteraction(groupKey) {
                                           } catch (err) {
                                                           console.error(`Error logging interaction ${groupKey} to the Calls feedback sheet:`, err);
                                           }
+                                          await sheetsClient.appendIntentCall(callIntent.intentSheetRow({
+                                                          callCreated,
+                                                          externalNumber: sheetPhone,
+                                                          direction,
+                                                          csrPath,
+                                                          callTypeLabel: tagged.callTypeLabel,
+                                                          intent: tagged.intent,
+                                                          outcome: tagged.outcome,
+                                                          lead: tagged.lead,
+                                                          transcriptLink,
+                                          }));
                           }
             } catch (err) {
                           console.error(`Error summarizing/posting interaction ${groupKey}:`, err);
