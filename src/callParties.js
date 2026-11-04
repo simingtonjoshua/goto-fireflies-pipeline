@@ -67,6 +67,10 @@ const ALWAYS_SYSTEM = [
   /at the tone, please record your message/i,
   /no call parked/i,
   /please enter your (?:zip|postal|pin|extension|account)/i,
+  // 2026-11-03 Wesolowski: GoTo split the consultation menu before "please press 1",
+  // so the first half missed every prompt rule and was labeled Team Member.
+  /\bif you would like to schedule a free in-home consultation\b/i,
+  /\bfor all other calls\b/i,
   /\bhours of \d/i,
   /\b\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)\s+to\s+\d/i,
   /\bour (normal )?business hours\b/i,
@@ -218,6 +222,20 @@ function looksLikeLiveTurn(text, roster) {
   return /\b(?:this is|i'm|i am|my name is|speaking)\b/i.test(value);
 }
 
+// A menu sentence split before "please press 1". The stem alone is not a person
+// when the next line on that channel, within the continuation window, is the
+// press prompt. A live "if you would like to schedule Thursday" is not this:
+// the following line has to be a known prompt.
+function isSplitMenuFragment(current, next, roster) {
+  if (!current || !next) return false;
+  const text = String(current.text || '').trim();
+  if (!text || looksLikeLiveTurn(text, roster)) return false;
+  if (!/^\s*(?:if you would like to schedule|for all other calls)\b/i.test(text)) return false;
+  const gap = (Number(next.startTimeMs) || 0) - (Number(current.startTimeMs) || 0);
+  if (!Number.isFinite(gap) || gap < 0 || gap > CONTINUATION_GAP_MS) return false;
+  return isKnownPromptPhrase(next.text, roster) || isSystemRecordingUtterance(next.text, roster);
+}
+
 // The next utterance on the same channel continues the prompt that just played:
 // it starts a new sentence in lowercase, or it finishes a known prompt phrase,
 // and it is not a person introducing themselves.
@@ -234,7 +252,7 @@ function continuesRecordingPrompt(previous, current, roster) {
 }
 
 function systemRecordingPromptLine() {
-  return 'System recordings (never a live person, even if a name is spoken): the "this call may be recorded" announcement, the "thank you for calling" / "it\'s a great day here" greeting, the "we are currently assisting other callers" queue message and its continuation ("your call is very important to us", "please stay on the line"), the "best in custom blinds" tagline, the queue apology ("we apologize for the extended wait", "our representatives are currently helping other customers", "we will call you as soon as possible"), the after-hours greeting in Joshua\'s voice that asks the caller to leave their name, "if you have reached this message", carrier voicemail prompts ("your call has been forwarded to voicemail", "automated voice messaging system", "mailbox is full", "at the tone, please record your message", "when you have finished recording, you may hang up", "please leave a message after the tone"), the "no call parked on that extension" message, business-hours messages, IVR menus ("press 1", "press one"), vendor hold queues ("estimated wait time", "save your place in line", "welcome to Bright"), and prompts that ask the caller to enter a zip code.';
+  return 'System recordings (never a live person, even if a name is spoken): the "this call may be recorded" announcement, the "thank you for calling" / "it\'s a great day here" greeting, the "we are currently assisting other callers" queue message and its continuation ("your call is very important to us", "please stay on the line"), the "best in custom blinds" tagline, the queue apology ("we apologize for the extended wait", "our representatives are currently helping other customers", "we will call you as soon as possible"), the after-hours greeting in Joshua\'s voice that asks the caller to leave their name, "if you have reached this message", carrier voicemail prompts ("your call has been forwarded to voicemail", "automated voice messaging system", "mailbox is full", "at the tone, please record your message", "when you have finished recording, you may hang up", "please leave a message after the tone"), the "no call parked on that extension" message, business-hours messages, IVR menus ("press 1", "press one", "if you would like to schedule a free in-home consultation", "for all other calls"), vendor hold queues ("estimated wait time", "save your place in line", "welcome to Bright"), and prompts that ask the caller to enter a zip code.';
 }
 
 // Queue and voicemail wording, used to tell a one-sided inbound message apart
@@ -1841,6 +1859,7 @@ module.exports = {
   channelRolesForLeg,
   isSystemRecordingUtterance,
   isKnownPromptPhrase,
+  isSplitMenuFragment,
   continuesRecordingPrompt,
   isQueueOrVoicemailCue,
   systemRecordingPromptLine,

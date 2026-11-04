@@ -509,21 +509,47 @@ function roleOnChannel(assignment, channel, leg) {
 // channel (lowercase fragment, or "line assisting another customer") inherits
 // Recording. Once a live team member has spoken on the channel, only a known
 // prompt is relabeled — "you have reached the wrong franchise" stays theirs.
+function nextUtteranceOnChannel(utterances) {
+  const next = new Map();
+  const lastIndex = new Map();
+  utterances.forEach((utterance, index) => {
+    const channel = Number(utterance.channel);
+    if (lastIndex.has(channel)) next.set(lastIndex.get(channel), index);
+    lastIndex.set(channel, index);
+  });
+  return next;
+}
+
+const RECORDING_CLOSER = /^\s*(?:thanks|thank you)[.!]?\s*$/i;
+
 function recordingIndexesFor(utterances, assignment, book, leg, closerIndexes) {
   const recording = new Set();
   const live = new Set();
   const last = new Map();
+  const nextOnChannel = nextUtteranceOnChannel(utterances);
   utterances.forEach((utterance, index) => {
     const channel = Number(utterance.channel);
     const role = roleOnChannel(assignment, channel, leg);
     const known = callParties.isKnownPromptPhrase(utterance.text, book);
     const system = callParties.isSystemRecordingUtterance(utterance.text, book);
     const previous = last.get(channel);
-    const continuation = !live.has(channel)
-      && previous
+    const nextIndex = nextOnChannel.get(index);
+    const splitMenu = callParties.isSplitMenuFragment(
+      utterance,
+      nextIndex == null ? null : utterances[nextIndex],
+      book,
+    );
+    const continues = Boolean(previous
       && previous.recording
-      && callParties.continuesRecordingPrompt(previous.utterance, utterance, book);
+      && callParties.continuesRecordingPrompt(previous.utterance, utterance, book));
+    // "Thank you." right after a queue or voicemail prompt is the prompt closing,
+    // even when an earlier fragment on this channel was mistaken for a person.
+    const closesVoicemailPrompt = continues
+      && callParties.isQueueOrVoicemailCue(previous.utterance.text)
+      && RECORDING_CLOSER.test(utterance.text);
+    const continuation = continues && (!live.has(channel) || closesVoicemailPrompt);
     const asRecording = known
+      || splitMenu
       || closerIndexes.has(index)
       || role === 'system'
       || (!live.has(channel) && system)
@@ -702,6 +728,40 @@ function formatHoldContextLine(holds) {
     return `Hold periods detected: ${parts.join('; ')}.`;
 }
 
+// Inbound only. The first chain member's only live lines are a hold request, and
+// a later member is on the chain. Post-hold work (often only on the customer
+// channel after the transfer) belongs to the later member. Outbound dialer
+// rules are untouched: this returns null for OUTBOUND.
+function holdHandoffCredit(rows, csrPath, direction) {
+  if (direction === 'OUTBOUND') return null;
+  const names = [];
+  for (const entry of csrPath || []) {
+    const name = pathName([entry], 'first');
+    if (!name) continue;
+    if (names.some((existing) => existing.toLowerCase() === name.toLowerCase())) continue;
+    names.push(name);
+  }
+  if (names.length < 2) return null;
+  const teamLabels = new Set(names.map((name) => name.toLowerCase()));
+  teamLabels.add('team member');
+  const teamRows = (rows || []).filter((row) => (
+    row && teamLabels.has(String(row.label || '').toLowerCase()) && String(row.text || '').trim()
+  ));
+  if (!teamRows.length) return null;
+  if (!teamRows.every((row) => HOLD_REQUEST_PATTERN.test(row.text))) return null;
+  const holdAt = Math.max(...teamRows.map((row) => Number(row.seconds) || 0));
+  const customerAfter = (rows || []).some((row) => (
+    row && row.label === 'Customer' && (Number(row.seconds) || 0) > holdAt && String(row.text || '').trim()
+  ));
+  if (!customerAfter) return null;
+  return { from: names[0], to: names[names.length - 1] };
+}
+
+function formatHoldHandoffLine(handoff) {
+  if (!handoff) return null;
+  return `Post-hold credit: ${handoff.from} only asked the caller to hold. ${handoff.to} is the team member who joined after the hold. Attribute scheduling and everything after the hold to ${handoff.to}. Do not credit that work to ${handoff.from}.`;
+}
+
 // Free-form call summary instructions (see header comment item 9 - FORMAT REDESIGN,
 // 2026-07-21). Replaced the earlier three-rigid-category design: rather than picking
 // between fixed templates, the model just describes what happened, as accurately and
@@ -751,6 +811,8 @@ IMPORTANT - supplier/vendor support calls (the reverse case): sometimes this cal
 IMPORTANT - automated systems are not customers: if the "Customer"-labeled channel is clearly an automated phone system, IVR menu, or hold-queue recording (menu options, "press one," hold-time announcements, a scripted greeting) rather than a live person, describe it as such (e.g. "an automated support line" or "the hold system") rather than treating it as a customer. This is common when a Budget Blinds team member calls an outside vendor's own support line, and there may be no real third-party "customer" on the call at all. Lines labeled Recording — "thank you for calling", "press one", "estimated wait time", "save your place in line", "welcome to Bright", "when you have finished recording, you may hang up" — are never the customer. A call that is a team member waiting on a vendor menu or hold queue is a hold call: say they were on hold, and do not say the customer explained the menu, the portal, or the wait time. Words the team member says to someone who is not on the phone, while that hold is playing, are still the team member on a hold call.
 
 IMPORTANT - hold time: if the metadata includes a "Hold periods detected" line, mention in the summary that the caller was placed on hold and roughly how long it lasted (e.g. "the customer was placed on hold for about 45 seconds while ___ checked on availability"). If that line is absent, don't mention holds at all - don't guess at a hold happening just because there was a pause in the transcript.
+
+IMPORTANT - post-hold credit: if the metadata includes a "Post-hold credit" line, follow it. The team member who only asked the caller to hold did not do the scheduling or other work after the hold. Attribute that later work to the team member named on the Post-hold credit line.
 
 ${KNOWN_TEAM_NAME_RULE}`;
 
@@ -807,9 +869,8 @@ const UNKNOWN_SYSTEM_PROMPT = `${UNKNOWN_TYPE_RULES}${SYSTEM_PROMPT.replace(
 // time).
 
 // "Thank you." at the end of a queue script is not a person joining the call.
-// The same words after a live team member has already spoken stay theirs.
-const RECORDING_CLOSER = /^\s*(?:thanks|thank you)[.!]?\s*$/i;
-
+// The same words after a live team member has already spoken stay theirs,
+// unless they close a queue or voicemail prompt (see recordingIndexesFor).
 function inboundRecordingCloserIndexes(utterances, roles, book, direction) {
   if (direction === 'OUTBOUND') return new Set();
   const system = utterances.map((utterance) => callParties.isSystemRecordingUtterance(utterance.text, book));
@@ -870,7 +931,7 @@ function inboundVoicemailKind({ rows, direction, answered, reachedVoicemail }) {
 
 function answeredFactLine(answered, twoSided, voicemailKind) {
     if (voicemailKind === 'message') {
-          return 'Answered: no. No representative joined this call. The caller reached the queue and voicemail and left a message. Say that plainly, including what they asked for and any callback number they gave. Do not describe a live conversation with staff.';
+          return 'Answered: no. No representative joined this call. The caller reached the queue and voicemail and left a message. Say that they left a voicemail, including what they asked for and any callback number they gave. Do not claim that anyone from the office joined the call.';
     }
     if (voicemailKind === 'greeting') {
           return 'Answered: no. No representative joined this call. The caller reached the queue or voicemail. Do not describe a live conversation with staff.';
@@ -1005,12 +1066,13 @@ function systemPromptFor(type) {
   return SYSTEM_PROMPT;
 }
 
-function customerContextLines({ direction, answered, twoSided, voicemailKind, csrPath, externalNumber, externalName, callCreated, callEnded, rows }) {
+function customerContextLines({ direction, answered, twoSided, voicemailKind, csrPath, externalNumber, externalName, callCreated, callEnded, rows, holdHandoff }) {
   return [
     'Fixed facts (do not change these):',
     `Call direction: ${direction || 'unknown'} (OUTBOUND = a Budget Blinds team member placed this call to the customer; INBOUND = the outside party called Budget Blinds. Do not call them the customer when they are a coworker. Never describe an outbound call as something the customer did)`,
     answeredFactLine(answered, twoSided, voicemailKind),
     `Team member path (in order, if transferred/parked): ${(csrPath || []).join(' -> ') || 'unknown'}`,
+    formatHoldHandoffLine(holdHandoff),
     'Commercial roles (do not reverse): the team member sends any service order or warranty paperwork; the customer signs it and pays.',
     `Customer phone number: ${driveClient.formatPhoneForDisplay(externalNumber)}`,
     callParties.systemRecordingPromptLine(),
@@ -1031,7 +1093,7 @@ function partyIdentity(classified) {
   return classified.partyName;
 }
 
-function typedContextLines({ classified, direction, answered, twoSided, voicemailKind, csrPath, externalNumber, externalName, callCreated, callEnded, rows }) {
+function typedContextLines({ classified, direction, answered, twoSided, voicemailKind, csrPath, externalNumber, externalName, callCreated, callEnded, rows, holdHandoff }) {
   const identity = partyIdentity(classified);
   const who = identity || (classified.type === 'vendor' ? 'the vendor' : 'the other team member');
   const directionLine = classified.type === 'unknown'
@@ -1052,6 +1114,7 @@ function typedContextLines({ classified, direction, answered, twoSided, voicemai
     directionLine,
     answeredFactLine(answered, twoSided, voicemailKind),
     `Team member path (in order, if transferred/parked): ${(csrPath || []).join(' -> ') || 'unknown'}`,
+    formatHoldHandoffLine(holdHandoff),
     `Phone number: ${driveClient.formatPhoneForDisplay(externalNumber)}`,
     callParties.systemRecordingPromptLine(),
     direction !== 'OUTBOUND' && externalName
@@ -1093,12 +1156,13 @@ function buildSummaryMessages({
     });
     const modelRows = rowsForModel(rows, classified);
     const conversationText = buildConversationText(modelRows);
+    const holdHandoff = holdHandoffCredit(rows, csrPath, direction);
     const contextLines = classified.type === 'customer'
       ? customerContextLines({
-        direction, answered, twoSided, voicemailKind, csrPath, externalNumber, externalName, callCreated, callEnded, rows,
+        direction, answered, twoSided, voicemailKind, csrPath, externalNumber, externalName, callCreated, callEnded, rows, holdHandoff,
       })
       : typedContextLines({
-        classified, direction, answered, twoSided, voicemailKind, csrPath, externalNumber, externalName, callCreated, callEnded, rows,
+        classified, direction, answered, twoSided, voicemailKind, csrPath, externalNumber, externalName, callCreated, callEnded, rows, holdHandoff,
       });
     return {
           system: systemPromptFor(classified.type),
@@ -1110,6 +1174,7 @@ function buildSummaryMessages({
           partyRole: classified.partyRole || null,
           callTypeSource: classified.source,
           voicemail: Boolean(voicemailKind),
+          holdHandoff,
     };
 }
 
@@ -1121,8 +1186,8 @@ function guardVoicemailSummary(summary, options = {}) {
   text = text.replace(/\b(?:was|were|got|been)\s+connected to (?:a |the )?(?:budget blinds )?team member\b/gi, 'reached the voicemail');
   text = text.replace(/\bconnected to (?:a |the )?(?:budget blinds )?team member\b/gi, 'reached the voicemail');
   text = text.replace(/\banswered by (?:a |the )?(?:budget blinds )?team member\b/gi, 'reached the voicemail');
-  text = text.replace(/\bspoke with (?:a |the )?(?:budget blinds )?team member\b/gi, 'left a message');
-  text = text.replace(/\bspeaking with (?:a |the )?(?:budget blinds )?team member\b/gi, 'leaving a message');
+  text = text.replace(/\bspoke with (?:a |the )?(?:budget blinds )?team member\b/gi, 'left a voicemail');
+  text = text.replace(/\bspeaking with (?:a |the )?(?:budget blinds )?team member\b/gi, 'leaving a voicemail');
   text = text.replace(/\bthe team member then started to respond\b/gi, 'the recording continued');
   text = text.replace(/\b(?:a|the) team member's message\b/gi, 'the recorded greeting');
   text = text.replace(/\b([A-Z][a-z]+(?: [A-Z][a-z]+)?) from Budget Blinds answered(?: the call)?\b/g, 'The caller reached the voicemail');
@@ -1130,6 +1195,56 @@ function guardVoicemailSummary(summary, options = {}) {
     text = `The caller reached the queue and voicemail and left a message. ${text}`.trim();
   }
   return text;
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// When the first chain member only asked the caller to hold, summaries still
+// credited that person with the booking. Rewrite work sentences onto the later
+// member. A sentence that only mentions the hold keeps the first name.
+function guardHoldHandoffSummary(summary, handoff) {
+  if (!handoff || !handoff.from || !handoff.to) return String(summary || '').trim();
+  const from = handoff.from;
+  const to = handoff.to;
+  const fromPattern = new RegExp(escapeRegExp(from), 'gi');
+  const first = from.split(/\s+/)[0];
+  const firstPattern = first && first.toLowerCase() !== from.toLowerCase()
+    ? new RegExp(`\\b${escapeRegExp(first)}\\b`, 'gi')
+    : null;
+  const workPattern = /\b(schedul\w*|book\w*|assist\w*|help\w*|set up|appointment)\b/i;
+  const sentences = String(summary || '').trim().split(/(?<=[.!?])\s+/);
+  return sentences.map((sentence) => {
+    const mentionsFrom = fromPattern.test(sentence) || (firstPattern && firstPattern.test(sentence));
+    fromPattern.lastIndex = 0;
+    if (firstPattern) firstPattern.lastIndex = 0;
+    if (!mentionsFrom) return sentence;
+    if (!workPattern.test(sentence)) return sentence;
+    if (/\bhold\b/i.test(sentence)) {
+      const parts = sentence.split(/\s+\band\b\s+/i);
+      if (parts.length > 1) {
+        return parts.map((part) => creditWorkClause(part, { fromPattern, firstPattern, to, workPattern })).join(' and ');
+      }
+    }
+    return creditWorkClause(sentence, { fromPattern, firstPattern, to, workPattern });
+  }).join(' ');
+}
+
+function creditWorkClause(part, { fromPattern, firstPattern, to, workPattern }) {
+  fromPattern.lastIndex = 0;
+  if (firstPattern) firstPattern.lastIndex = 0;
+  const work = workPattern.test(part);
+  const hold = /\bhold\b/i.test(part);
+  if (!work || hold) return part;
+  let next = part.replace(fromPattern, to);
+  if (firstPattern) {
+    next = next.replace(firstPattern, (match) => (to.toLowerCase().startsWith(match.toLowerCase()) ? match : to));
+  }
+  if (new RegExp(escapeRegExp(to), 'i').test(next)) return next;
+  const stripped = next.replace(/^\s*then\s+/i, '');
+  const body = stripped.charAt(0).toLowerCase() + stripped.slice(1);
+  return `${to} ${body}`;
 }
 
 // Heymarket POST /v1/contact/get returns HTTP 400 for these numbers, and logging
@@ -1267,6 +1382,7 @@ async function summarizeInteraction({
   const rawSummary = summary;
   summary = callType.stripSummaryHeaders(summary);
   summary = guardVoicemailSummary(summary, { voicemail: built.voicemail });
+  summary = guardHoldHandoffSummary(summary, built.holdHandoff);
   const tags = tagsFor(built, summary, { direction, answered, reachedVoicemail }, model, rawSummary);
 
   return summaryResult(summary, tags.callType, { ...built, ...tags });
@@ -1279,6 +1395,7 @@ module.exports = {
   buildNoTranscriptSummary,
   buildSummaryMessages,
   guardVoicemailSummary,
+  guardHoldHandoffSummary,
   lookupContactName,
   formatCallNote: callType.formatCallNote,
 };
