@@ -17,6 +17,11 @@
 //   and the call is not outbound.
 //
 // No transcript always uses intent "No conversation or no transcript".
+// A transcript where both a team member and the other party speak live never
+// does, even when GoTo marked the call unanswered or the model says so. There
+// is no call-duration cutoff in this module. Short calls were mis-tagged
+// because Answered: no / Voicemail: yes was handed to the classifier and the
+// result was trusted over the transcript.
 // Spam, wrong number, and no-conversation calls that were not already internal
 // or vendor are Call type Other. The four call types stay Customer, Internal
 // team, Vendor, and Other.
@@ -222,7 +227,7 @@ Definitions:
 - Internal team: a designer, installer, or staff member.
 - Spam or solicitation: solicitation or a robocall.
 - Wrong number: the caller reached the wrong place.
-- No conversation or no transcript: missed, abandoned, silent, or no transcript. Use this only when there is nothing to classify.
+- No conversation or no transcript: missed, abandoned, silent, or no transcript. Use this only when there is nothing to classify. If both a team member and the other party have live lines in the transcript, do not choose this intent. Do not use "no answer", "voicemail", or "abandoned" as the outcome of that call.
 
 outcome is one short line. Prefer one of: ${outcomes}. You may add a brief specific detail after it. Do not write the call summary.
 
@@ -234,15 +239,65 @@ Do not decide whether the call is a sales lead. Do not invent a deal id.`;
 }
 
 function classifierUser(input) {
-  return [
+  const lines = [
     `Call direction: ${input.direction || 'unknown'}`,
     `Answered: ${input.answered === true ? 'yes' : input.answered === false ? 'no' : 'unknown'}`,
     `Voicemail: ${input.voicemail || input.reachedVoicemail ? 'yes' : 'no'}`,
     `Existing call type (a hint, not the intent): ${input.callType || 'unknown'}`,
-    '',
-    'Transcript:',
-    input.conversationText,
-  ].join('\n');
+  ];
+  if (input.liveConversation) {
+    lines.push('Live conversation: yes. Both a team member and the other party spoke. This call was answered.');
+  }
+  lines.push('', 'Transcript:', input.conversationText);
+  return lines.join('\n');
+}
+
+const LIVE_CLOSER = /^\s*(?:thanks|thank you)[.!]?\s*$/i;
+
+// Labeled transcript lines ("[3s] Emily Kingdon: ..."). Recording closers and
+// system prompts do not count. Both sides must have said something live.
+function transcriptShowsLiveConversation(text) {
+  const rows = [];
+  const pattern = /^\[(\d+)s\]\s+([^:\n]+):\s*(.+)$/gm;
+  let match = pattern.exec(String(text || ''));
+  while (match) {
+    rows.push({ label: match[2].trim(), text: match[3].trim() });
+    match = pattern.exec(String(text || ''));
+  }
+  const substantive = rows.filter((row) => {
+    if (!row.label || !row.text || row.label === 'Recording') return false;
+    if (row.label.startsWith('Channel ')) return false;
+    if (row.label !== 'Customer' && LIVE_CLOSER.test(row.text)) return false;
+    return true;
+  });
+  const customer = substantive.some((row) => row.label === 'Customer');
+  const team = substantive.some((row) => row.label !== 'Customer');
+  return customer && team;
+}
+
+function withLiveConversationFacts(input = {}) {
+  if (!transcriptShowsLiveConversation(input.conversationText)) return input;
+  return {
+    ...input,
+    answered: true,
+    voicemail: false,
+    reachedVoicemail: false,
+    liveConversation: true,
+  };
+}
+
+function outcomeContradictsLiveConversation(outcome) {
+  return /\b(no answer|voicemails?|abandoned|ended quickly|did not engage|didn't engage|didnt engage)\b/i.test(String(outcome || ''));
+}
+
+function liveConversationOutcome(summary) {
+  const text = oneLine(summary);
+  if (/\b(?:call(?:\s+\w+){0,4}\s+back|callbacks?|talk next week|next week|another time)\b/i.test(text)) {
+    return 'callback promised';
+  }
+  if (/\bdeclin\w*/i.test(text)) return 'declined';
+  if (/\bbooked\b/i.test(text)) return 'booked consultation';
+  return 'info given';
 }
 
 function parseModelJson(content) {
@@ -291,7 +346,8 @@ function normalizeModel(payload, input) {
 }
 
 async function interpret(input = {}) {
-  if (!oneLine(input.conversationText)) {
+  const request = withLiveConversationFacts(input);
+  if (!oneLine(request.conversationText)) {
     return {
       intent: NO_CONVERSATION,
       outcome: noTranscriptOutcome(input),
@@ -303,8 +359,8 @@ async function interpret(input = {}) {
   let lastError = null;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      const payload = await requestModel(input);
-      return { ...normalizeModel(payload, input), source: 'model' };
+      const payload = await requestModel(request);
+      return { ...normalizeModel(payload, request), source: 'model' };
     } catch (err) {
       lastError = err;
     }
@@ -333,6 +389,17 @@ function finalizeTags(input = {}) {
     || textShowsRoutedAway(input.transcriptText);
   let outcome = cleanOutcome(model.outcome) || (hasTranscript ? 'unknown' : noTranscriptOutcome(input));
   if (!hasTranscript) outcome = noTranscriptOutcome(input);
+
+  const live = hasTranscript && transcriptShowsLiveConversation(input.transcriptText);
+  if (live && intent === NO_CONVERSATION) {
+    intent = fallbackIntent({
+      conversationText: input.transcriptText,
+      callType: input.callType,
+    });
+  }
+  if (live && !routedAway && outcomeContradictsLiveConversation(outcome)) {
+    outcome = liveConversationOutcome(input.summary);
+  }
   if (routedAway) outcome = ensureRoutedOutcome(outcome);
 
   const adjustedType = callTypeAfterIntent(input.callType, intent);
@@ -459,6 +526,7 @@ module.exports = {
   ROUTED_PHRASE,
   canonicalizeIntent,
   textShowsRoutedAway,
+  transcriptShowsLiveConversation,
   interpret,
   finalizeTags,
   applyPipedrive,
