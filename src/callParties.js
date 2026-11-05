@@ -35,6 +35,10 @@
 // channelRolesForLeg() keeps the GoTo map and flips it only when one channel has a
 // content-safe team self-introduction that the map labeled as the customer. Talk
 // order is not used. See callIdVersion() for why some of Joshua's rows look different.
+// Outbound, a far-side business greeting or IVR ("you've reached the branch",
+// "para continuar en español", "in observance of") is the external party even
+// when GoTo mapped that channel to the dialer. IVR prompt text is never a
+// roster member.
 
 const rosterApi = require('./roster');
 
@@ -90,6 +94,13 @@ const ALWAYS_SYSTEM = [
   /\byour call may be monitored\b/i,
   /\bthis call may be monitored\b/i,
   /\bour team is currently in training\b/i,
+  // "Our entire team is currently in a company-wide training" is the same kind of
+  // recorded announcement. The words between "currently" and "training" vary.
+  /\bour (?:entire )?team is currently\b[^.]{0,80}\btraining\b/i,
+  /^\s*(?:[\[(])?\s*(?:music|beep|tone|ringing)\s*(?:[\])])?\s*[.!]?\s*$/i,
+  /\bpara continuar\b/i,
+  /\boprima\b/i,
+  /\bin observance of\b/i,
   /\bback on the phones\b/i,
   /\bto avoid waiting on hold\b/i,
   /\bplease select the callback\b/i,
@@ -116,7 +127,7 @@ const SCRIPT_UNLESS_LIVE = [
 // reached the wrong franchise" is Jessica talking, not the IVR. The dedicated
 // support-line pattern above still catches the real prompt.
 const UNTIL_LIVE_SYSTEM = [
-  /\byou have reached the\b/i,
+  /\byou(?:'ve| have) reached the\b/i,
 ];
 
 // Mid-sentence pieces of a queue or IVR prompt. GoTo splits one recorded
@@ -222,6 +233,98 @@ function looksLikeLiveTurn(text, roster) {
   return /\b(?:this is|i'm|i am|my name is|speaking)\b/i.test(value);
 }
 
+// A person joining the call. "I'm sorry" and "this is your account" are not.
+function isLivePersonIntro(text, roster) {
+  const value = String(text || '');
+  if (!value.trim()) return false;
+  if (mentionsLivePerson(value, roster)) return true;
+  if (/\b(?:this is|my name is)\s+(?!the\b|a\b|an\b|our\b|your\b|my\b|it\b)[A-Za-z]/i.test(value)) return true;
+  if (/\b(?:i'm|i am)\s+(?!sorry\b|afraid\b|calling\b|going\b|here\b|just\b|not\b|with\b|back\b|currently\b|in\b|out\b|on\b|at\b|trying\b|returning\b|looking\b|glad\b|happy\b)[A-Za-z]/i.test(value)) return true;
+  if (/\b[A-Za-z][A-Za-z']+\s+speaking\b/i.test(value)) return true;
+  return false;
+}
+
+function isVoicemailBoundary(text) {
+  const value = String(text || '').trim();
+  if (/^(?:[\[(])?\s*(?:beep|tone)\s*(?:[\])])?\s*[.!]?\s*$/i.test(value)) return true;
+  if (/\b(?:after the tone|at the tone)\b/i.test(value)) return true;
+  if (/\bplease leave (?:your name|(?:a |your )?message|a voicemail)\b/i.test(value)) return true;
+  if (/\bleave a (?:message|voicemail)\b/i.test(value)) return true;
+  if (/\bwhen you have finished recording\b/i.test(value)) return true;
+  return false;
+}
+
+function isGreetingAnchor(text, roster) {
+  const value = String(text || '');
+  if (!value.trim()) return false;
+  if (/\bthank you for calling\b/i.test(value)) return true;
+  if (/\bit'?s a (?:great|good) day\b/i.test(value)) return true;
+  if (/\bthis call may be (?:recorded|monitored)\b/i.test(value)) return true;
+  if (/\bbest in custom blinds\b/i.test(value)) return true;
+  return isKnownPromptPhrase(value, roster);
+}
+
+function rosterMemberOnLeg(leg, roster) {
+  const book = roster || rosterApi.getRoster();
+  for (const entry of (leg && leg.csrChain) || []) {
+    if (!entry || entry.answered === false) continue;
+    if (entry.extension && book.personByExtension(entry.extension)) return true;
+    if (entry.name && (book.personByName(entry.name) || book.primaryByName(entry.name))) return true;
+  }
+  return false;
+}
+
+// No roster member answered, and this channel opens with a greeting and later
+// hits a voicemail beep or "please leave a message". Lines in between stay part
+// of the greeting even when the wording is new. A live introduction ends the
+// greeting. A channel that starts with the caller does not.
+function preBeepGreetingIndexes(utterances, roster, leg) {
+  const indexes = new Set();
+  if (!utterances || !utterances.length || rosterMemberOnLeg(leg, roster)) return indexes;
+  const byChannel = new Map();
+  utterances.forEach((utterance, index) => {
+    const channel = Number(utterance && utterance.channel);
+    if (!byChannel.has(channel)) byChannel.set(channel, []);
+    byChannel.get(channel).push(index);
+  });
+  for (const group of byChannel.values()) {
+    if (!isGreetingAnchor(utterances[group[0]].text, roster)) continue;
+    const boundaries = group.filter((index) => isVoicemailBoundary(utterances[index].text));
+    if (!boundaries.length) continue;
+    const end = Math.max(...boundaries);
+    let sawIntro = false;
+    for (const index of group) {
+      if (index > end) continue;
+      if (isLivePersonIntro(utterances[index].text, roster)) {
+        sawIntro = true;
+        continue;
+      }
+      if (sawIntro) continue;
+      indexes.add(index);
+    }
+  }
+  return indexes;
+}
+
+// The far side of an outbound call answering with its own phone system.
+// "Thank you for calling Budget Blinds" is ours. "You've reached the wrong
+// franchise" is a person, handled by UNTIL_LIVE_SYSTEM once someone is live.
+function isExternalBusinessGreeting(text) {
+  const value = String(text || '');
+  if (!value.trim()) return false;
+  if (/\bpara continuar\b/i.test(value)) return true;
+  if (/\boprima\b/i.test(value)) return true;
+  if (/\bin observance of\b/i.test(value)) return true;
+  if (/\bthank you for calling\b/i.test(value) && !new RegExp(BUSINESS_NAME, 'i').test(value)) return true;
+  if (
+    /\byou(?:'ve| have) reached\b/i.test(value)
+    && /\b(?:branch|bank|department)\b/i.test(value)
+    && !/\bwrong franchise\b/i.test(value)
+    && !new RegExp(BUSINESS_NAME, 'i').test(value)
+  ) return true;
+  return false;
+}
+
 // A menu sentence split before "please press 1". The stem alone is not a person
 // when the next line on that channel, within the continuation window, is the
 // press prompt. A live "if you would like to schedule Thursday" is not this:
@@ -252,7 +355,7 @@ function continuesRecordingPrompt(previous, current, roster) {
 }
 
 function systemRecordingPromptLine() {
-  return 'System recordings (never a live person, even if a name is spoken): the "this call may be recorded" announcement, the "thank you for calling" / "it\'s a great day here" greeting, the "we are currently assisting other callers" queue message and its continuation ("your call is very important to us", "please stay on the line"), the "best in custom blinds" tagline, the queue apology ("we apologize for the extended wait", "our representatives are currently helping other customers", "we will call you as soon as possible"), the after-hours greeting in Joshua\'s voice that asks the caller to leave their name, "if you have reached this message", carrier voicemail prompts ("your call has been forwarded to voicemail", "automated voice messaging system", "mailbox is full", "at the tone, please record your message", "when you have finished recording, you may hang up", "please leave a message after the tone"), the "no call parked on that extension" message, business-hours messages, IVR menus ("press 1", "press one", "if you would like to schedule a free in-home consultation", "for all other calls"), vendor hold queues ("estimated wait time", "save your place in line", "welcome to Bright"), and prompts that ask the caller to enter a zip code.';
+  return 'System recordings (never a live person, even if a name is spoken): the "this call may be recorded" announcement, the "thank you for calling" / "it\'s a great day here" greeting, the "we are currently assisting other callers" queue message and its continuation ("your call is very important to us", "please stay on the line"), the "best in custom blinds" tagline, the queue apology ("we apologize for the extended wait", "our representatives are currently helping other customers", "we will call you as soon as possible"), the after-hours greeting in Joshua\'s voice that asks the caller to leave their name, "if you have reached this message", carrier voicemail prompts ("your call has been forwarded to voicemail", "automated voice messaging system", "mailbox is full", "at the tone, please record your message", "when you have finished recording, you may hang up", "please leave a message after the tone"), the "no call parked on that extension" message, business-hours messages, IVR menus ("press 1", "press one", "if you would like to schedule a free in-home consultation", "for all other calls"), vendor hold queues ("estimated wait time", "save your place in line", "welcome to Bright"), prompts that ask the caller to enter a zip code, "Music" and "Beep" tokens, and any greeting played before the voicemail beep when no roster member answered, even if that greeting\'s wording is new.';
 }
 
 // Queue and voicemail wording, used to tell a one-sided inbound message apart
@@ -263,12 +366,14 @@ function isQueueOrVoicemailCue(text) {
     || /\bextended wait\b/i.test(value)
     || /\b(?:assisting|helping) other (?:callers|customers)\b/i.test(value)
     || /\bafter the tone\b/i.test(value)
-    || /\byou have reached\b/i.test(value)
+    || /\byou(?:'ve| have) reached\b/i.test(value)
     || /\bvoicemail\b/i.test(value)
     || /\bthis is josh\b/i.test(value)
     || /\bplease stay on the line\b/i.test(value)
     || /\bas soon as possible\b/i.test(value)
-    || /\bwe apologize\b/i.test(value);
+    || /\bwe apologize\b/i.test(value)
+    || /\bcompany-wide training\b/i.test(value)
+    || /^(?:[\[(])?\s*(?:beep|tone)\s*(?:[\])])?\s*[.!]?\s*$/i.test(value.trim());
 }
 
 function customerDialString(dialString, roster) {
@@ -1165,6 +1270,30 @@ function channelRolesForLeg(utterances, leg, roster = rosterApi.getRoster()) {
       return { roles, corrected: true, teamChannel: proof[0] };
     }
   }
+
+  // Outbound only. The channel that answers with a business IVR or branch
+  // greeting is the external party. A roster self-introduction on that same
+  // channel keeps the GoTo map. One channel of prompt audio is not a swap.
+  if ((leg && leg.direction) === 'OUTBOUND' && present.length > 1) {
+    const externalChannels = present.filter((channel) => (utterances || []).some((utterance) => (
+      Number(utterance && utterance.channel) === channel && isExternalBusinessGreeting(utterance.text)
+    )));
+    if (externalChannels.length === 1) {
+      const external = externalChannels[0];
+      const externalText = (utterances || [])
+        .filter((utterance) => Number(utterance.channel) === external && utteranceCanProveTeamChannel(utterance.text, roster))
+        .map((utterance) => utterance.text)
+        .join(' ');
+      const provedTeam = textHasTeamSelfIdentification(externalText, leg || {}, roster);
+      if (!provedTeam && roles[external] === 'team') {
+        const teamChannel = present.find((channel) => channel !== external);
+        if (teamChannel != null) {
+          claimTeamChannel(roles, present, teamChannel);
+          return { roles, corrected: true, teamChannel, reason: 'external-greeting' };
+        }
+      }
+    }
+  }
   return { roles, corrected: false };
 }
 
@@ -1862,6 +1991,8 @@ module.exports = {
   isSplitMenuFragment,
   continuesRecordingPrompt,
   isQueueOrVoicemailCue,
+  preBeepGreetingIndexes,
+  isExternalBusinessGreeting,
   systemRecordingPromptLine,
   reportHumanAnswer,
   transcriptIsSubstantive,

@@ -24,6 +24,20 @@ const VENDOR_IVR = /\b(dedicated support line|estimated wait time|save your plac
 
 const VENDOR_REACHED = /\byou have reached\b[\s\S]{0,80}\bsupport\b/i;
 
+// A business answering its own line: a branch greeting, a language menu, or a
+// holiday closure. Our "thank you for calling Budget Blinds" greeting is not this.
+// "you have reached the wrong franchise" is a person at another office, not a vendor menu.
+function externalBusinessIvrText(text) {
+  const value = String(text || '');
+  if (/\bpara continuar\b/i.test(value) && /\bespa/i.test(value)) return true;
+  if (/\bin observance of\b/i.test(value)) return true;
+  if (
+    /\byou(?:'ve| have) reached\b[\s\S]{0,80}\b(?:branch|bank|department)\b/i.test(value)
+    && !/\bwrong franchise\b/i.test(value)
+  ) return true;
+  return false;
+}
+
 // "This is <Person> from/with <Company>" only. "I'm calling from…", "here with…",
 // and "at <street>" are customer speech and are not matched here.
 const COMPANY_INTRO = /\bthis is\s+([a-z][a-z']+(?:\s+[a-z][a-z']+){0,2})\s+(?:from|with)\s+([a-z0-9][a-z0-9&.'’ -]{1,60})/gi;
@@ -206,7 +220,7 @@ function vendorIvr(rows) {
   const text = joined(rows);
   // A "thank you for calling …" greeting is not a vendor menu. A garbled
   // "Thank you for calling Budget Brinds of Sacramento" is still our customer line.
-  return VENDOR_IVR.test(text) || VENDOR_REACHED.test(text);
+  return VENDOR_IVR.test(text) || VENDOR_REACHED.test(text) || externalBusinessIvrText(text);
 }
 
 function otherPartyOf(legRecords, explicit) {
@@ -349,6 +363,7 @@ function formatCallNote({ summary, folderLink, headerLines } = {}) {
 
 module.exports = {
   classifyCall,
+  transcriptHasExternalBusinessIvr: externalBusinessIvrText,
   contactName,
   parseCallTypeLine,
   stripCallTypeLine,
