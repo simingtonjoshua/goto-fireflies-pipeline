@@ -31,6 +31,7 @@ const driveClient = require('./driveClient');
 const callTypes = require('./callType');
 const callParties = require('./callParties');
 const pipedriveClient = require('./pipedriveClient');
+const roster = require('./roster');
 
 const OPENAI_URL = 'https://api.openai.com/v1/chat/completions';
 
@@ -231,7 +232,7 @@ Definitions:
 
 outcome is one short line. Prefer one of: ${outcomes}. You may add a brief specific detail after it. Do not write the call summary.
 
-routedAway is true only when this call was sent to another Budget Blinds franchise or territory (zip-code call tracking, a named team such as Schab, "wrong franchise", another city's franchise). Our own Sacramento office is not routed away.
+routedAway is true only when this call was sent to another Budget Blinds franchise or territory (zip-code call tracking, a named team such as Schab, "wrong franchise", another city's franchise, or a person who is not on our roster answering after the national zip-code prompt). Our own Sacramento office is not routed away. The zip-code prompt by itself, including a voicemail after it, is not routed away.
 
 bookedConsultation is true only when a new consultation was actually booked on this call. Confirming, moving, or asking about an existing appointment is false. An install booking is false.
 
@@ -254,16 +255,21 @@ function classifierUser(input) {
 
 const LIVE_CLOSER = /^\s*(?:thanks|thank you)[.!]?\s*$/i;
 
-// Labeled transcript lines ("[3s] Emily Kingdon: ..."). Recording closers and
-// system prompts do not count. Both sides must have said something live.
-function transcriptShowsLiveConversation(text) {
+function labeledTranscriptRows(text) {
   const rows = [];
   const pattern = /^\[(\d+)s\]\s+([^:\n]+):\s*(.+)$/gm;
   let match = pattern.exec(String(text || ''));
   while (match) {
-    rows.push({ label: match[2].trim(), text: match[3].trim() });
+    rows.push({ seconds: Number(match[1]), label: match[2].trim(), text: match[3].trim() });
     match = pattern.exec(String(text || ''));
   }
+  return rows;
+}
+
+// Labeled transcript lines ("[3s] Emily Kingdon: ..."). Recording closers and
+// system prompts do not count. Both sides must have said something live.
+function transcriptShowsLiveConversation(text) {
+  const rows = labeledTranscriptRows(text);
   const substantive = rows.filter((row) => {
     if (!row.label || !row.text || row.label === 'Recording') return false;
     if (row.label.startsWith('Channel ')) return false;
@@ -273,6 +279,68 @@ function transcriptShowsLiveConversation(text) {
   const customer = substantive.some((row) => row.label === 'Customer');
   const team = substantive.some((row) => row.label !== 'Customer');
   return customer && team;
+}
+
+const NOT_INTRO_NAME = /^(?:the|a|an|our|your|my|this|that|just|sorry|here|there|calling|going|with|from|not|afraid|busy|back|good|great|glad|happy|currently|now|also|still|it)$/i;
+
+function rosterFirstName(token, book) {
+  const target = String(token || '').trim().toLowerCase();
+  if (!target || !book || typeof book.listPeople !== 'function') return false;
+  const canonical = target === 'josh' ? 'joshua' : target;
+  return book.listPeople().some((person) => {
+    const first = String(person.name || '').trim().split(/\s+/)[0].toLowerCase();
+    if (!first) return false;
+    if (first === canonical) return true;
+    return first === 'joshua' && canonical === 'josh';
+  });
+}
+
+function captureNames(text, pattern) {
+  const found = [];
+  const re = new RegExp(pattern.source, pattern.flags);
+  let match = re.exec(String(text || ''));
+  while (match) {
+    const name = match[1];
+    if (name && !NOT_INTRO_NAME.test(name)) found.push(name);
+    match = re.exec(String(text || ''));
+  }
+  return found;
+}
+
+function labelIsRosterMember(label, book) {
+  const text = String(label || '').trim();
+  if (!text || text === 'Team Member' || text === 'Customer' || text === 'Recording') return false;
+  if (text.startsWith('Channel ')) return false;
+  if (book.personByName(text) || book.primaryByName(text)) return true;
+  if (typeof book.matchTeamName === 'function' && book.matchTeamName(text)) return true;
+  return rosterFirstName(text.split(/\s+/)[0], book);
+}
+
+// Zip-code call tracking handed the caller to a live person who is not on our
+// roster. The national prompt by itself is not enough: our own voicemail plays
+// it too. A roster name, including a phone-only designer, is our office.
+function transcriptShowsOtherFranchise(text, direction) {
+  if (direction === 'OUTBOUND') return false;
+  const book = roster.getRoster();
+  const rows = labeledTranscriptRows(text);
+  if (!rows.length) return false;
+  const zipAt = rows.findIndex((row) => (
+    /nearest\b.{0,60}\blocation/i.test(row.text)
+    || /enter your zip(?:\s|-)?code/i.test(row.text)
+  ));
+  if (zipAt < 0) return false;
+  if (rows.some((row) => labelIsRosterMember(row.label, book))) return false;
+  const live = rows.slice(zipAt + 1).filter((row) => {
+    const label = String(row.label || '').trim();
+    return label && label !== 'Customer' && label !== 'Recording' && !label.startsWith('Channel ');
+  });
+  if (!live.length) return false;
+  const liveText = live.map((row) => row.text).join('\n');
+  const intros = captureNames(liveText, /\b(?:this is|i'm|i am|my name is)\s+([A-Za-z][A-Za-z']+)\b/gi);
+  if (intros.some((name) => rosterFirstName(name, book))) return false;
+  if (intros.some((name) => !rosterFirstName(name, book))) return true;
+  const consultants = captureNames(liveText, /\b(?:consultant|designer|specialist)\s+([A-Za-z][A-Za-z']+)\b/gi);
+  return consultants.some((name) => !rosterFirstName(name, book));
 }
 
 function withLiveConversationFacts(input = {}) {
@@ -384,9 +452,15 @@ function finalizeTags(input = {}) {
   });
   if (!hasTranscript) intent = NO_CONVERSATION;
 
+  const otherFranchise = transcriptShowsOtherFranchise(input.transcriptText, input.direction);
+  const externalBusiness = callTypes.transcriptHasExternalBusinessIvr(input.transcriptText);
+  const saidWrongNumber = intent === 'Wrong number';
+  if (externalBusiness && saidWrongNumber) intent = 'Vendor or other business';
+
   const routedAway = Boolean(model.routedAway)
     || textShowsRoutedAway(input.summary)
-    || textShowsRoutedAway(input.transcriptText);
+    || textShowsRoutedAway(input.transcriptText)
+    || otherFranchise;
   let outcome = cleanOutcome(model.outcome) || (hasTranscript ? 'unknown' : noTranscriptOutcome(input));
   if (!hasTranscript) outcome = noTranscriptOutcome(input);
 
@@ -400,10 +474,13 @@ function finalizeTags(input = {}) {
   if (live && !routedAway && outcomeContradictsLiveConversation(outcome)) {
     outcome = liveConversationOutcome(input.summary);
   }
-  if (routedAway) outcome = ensureRoutedOutcome(outcome);
+  if (otherFranchise) outcome = ROUTED_PHRASE;
+  else if (routedAway) outcome = ensureRoutedOutcome(outcome);
+  if (externalBusiness && saidWrongNumber && /wrong number/i.test(outcome)) outcome = 'info given';
 
-  const adjustedType = callTypeAfterIntent(input.callType, intent);
-  const bookedConsultation = consultationBooked(
+  let adjustedType = callTypeAfterIntent(input.callType, intent);
+  if (externalBusiness && adjustedType !== 'internal') adjustedType = 'vendor';
+  const bookedConsultation = otherFranchise ? false : consultationBooked(
     { bookedConsultation: asBool(model.bookedConsultation) },
     outcome,
   );
@@ -441,7 +518,8 @@ async function applyPipedrive(result, context = {}) {
       bookedConsultation: result.bookedConsultation,
     },
     summary: result.summary,
-    direction: context.direction,
+    transcriptText: result.transcriptText,
+    direction: context.direction || result.direction,
     answered: context.answered,
     reachedVoicemail: context.reachedVoicemail,
     voicemail: context.voicemail,
@@ -527,6 +605,7 @@ module.exports = {
   canonicalizeIntent,
   textShowsRoutedAway,
   transcriptShowsLiveConversation,
+  transcriptShowsOtherFranchise,
   interpret,
   finalizeTags,
   applyPipedrive,

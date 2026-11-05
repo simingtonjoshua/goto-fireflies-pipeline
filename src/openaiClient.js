@@ -527,6 +527,7 @@ function recordingIndexesFor(utterances, assignment, book, leg, closerIndexes) {
   const live = new Set();
   const last = new Map();
   const nextOnChannel = nextUtteranceOnChannel(utterances);
+  const greetingSpan = callParties.preBeepGreetingIndexes(utterances, book, leg);
   utterances.forEach((utterance, index) => {
     const channel = Number(utterance.channel);
     const role = roleOnChannel(assignment, channel, leg);
@@ -551,6 +552,7 @@ function recordingIndexesFor(utterances, assignment, book, leg, closerIndexes) {
     const asRecording = known
       || splitMenu
       || closerIndexes.has(index)
+      || greetingSpan.has(index)
       || role === 'system'
       || (!live.has(channel) && system)
       || continuation;
@@ -578,8 +580,9 @@ function formatLegTranscript(leg) {
   const startMs = utterances[0].startTimeMs || 0;
   const assignment = callParties.channelRolesForLeg(utterances, leg, book);
   if (assignment.corrected) {
+    const why = assignment.reason === 'external-greeting' ? 'an external business greeting' : 'a team self-introduction';
     console.log(
-      `Speaker channels corrected from a team self-introduction on channel ${assignment.teamChannel}`
+      `Speaker channels corrected from ${why} on channel ${assignment.teamChannel}`
       + ` (direction ${leg.direction || 'unknown'}, recording ${leg.recordingId || 'n/a'}).`,
     );
   }
@@ -838,7 +841,7 @@ The metadata call type is fixed. Do not change it. Do not add a "Call type" line
 
 Write a plain-language summary of the vendor conversation: orders, pricing, backorders, shipments, accounts, invoices, or what they were pitching. Name the person and company when stated. Budget Blinds is the customer of this vendor, so a missing or wrong shipment is Budget Blinds' issue with the vendor. Do not invent a homeowner, a consultation, or customer next steps unless a specific end customer was actually discussed as a third party.
 
-Keep every concrete detail (PO numbers, order numbers, dates, amounts, ETAs, product names). Do not invent a phone number or any other detail that was not said. Attribute each statement to the speaker who said it. OUTBOUND means the team member placed the call to the vendor. Use the times exactly as given. A one-sided transcript, including a team member waiting on a vendor menu, is still a transcript: say they were on hold or left a message, and do not pretend the recording explained the order. If a "Hold periods detected" line is present, mention it. If it is absent, do not invent a hold.
+Keep every concrete detail (PO numbers, order numbers, dates, amounts, ETAs, product names). Do not invent a phone number or any other detail that was not said. Attribute each statement to the speaker who said it. OUTBOUND means the team member placed the call to the vendor. Use the times exactly as given. A one-sided transcript, including a team member waiting on a vendor menu, is still a transcript: say they were on hold or left a message, and do not pretend the recording explained the order. A language menu, branch greeting ("you've reached"), or holiday closure is the other party's phone system, not the team member who dialed. The person who answers that greeting is the outside party. If a "Hold periods detected" line is present, mention it. If it is absent, do not invent a hold.
 
 ${KNOWN_TEAM_NAME_RULE}`;
 
@@ -1066,11 +1069,17 @@ function systemPromptFor(type) {
   return SYSTEM_PROMPT;
 }
 
-function customerContextLines({ direction, answered, twoSided, voicemailKind, csrPath, externalNumber, externalName, callCreated, callEnded, rows, holdHandoff }) {
+function routedAwayFact(routedAway) {
+  if (!routedAway) return null;
+  return 'Other franchise: the person who answered is not on our roster. Say the call was answered by another Budget Blinds location. Do not say our team booked a consultation. This call was routed away and is not our lead.';
+}
+
+function customerContextLines({ direction, answered, twoSided, voicemailKind, csrPath, externalNumber, externalName, callCreated, callEnded, rows, holdHandoff, routedAway }) {
   return [
     'Fixed facts (do not change these):',
     `Call direction: ${direction || 'unknown'} (OUTBOUND = a Budget Blinds team member placed this call to the customer; INBOUND = the outside party called Budget Blinds. Do not call them the customer when they are a coworker. Never describe an outbound call as something the customer did)`,
     answeredFactLine(answered, twoSided, voicemailKind),
+    routedAwayFact(routedAway),
     `Team member path (in order, if transferred/parked): ${(csrPath || []).join(' -> ') || 'unknown'}`,
     formatHoldHandoffLine(holdHandoff),
     'Commercial roles (do not reverse): the team member sends any service order or warranty paperwork; the customer signs it and pays.',
@@ -1093,7 +1102,7 @@ function partyIdentity(classified) {
   return classified.partyName;
 }
 
-function typedContextLines({ classified, direction, answered, twoSided, voicemailKind, csrPath, externalNumber, externalName, callCreated, callEnded, rows, holdHandoff }) {
+function typedContextLines({ classified, direction, answered, twoSided, voicemailKind, csrPath, externalNumber, externalName, callCreated, callEnded, rows, holdHandoff, routedAway }) {
   const identity = partyIdentity(classified);
   const who = identity || (classified.type === 'vendor' ? 'the vendor' : 'the other team member');
   const directionLine = classified.type === 'unknown'
@@ -1113,6 +1122,7 @@ function typedContextLines({ classified, direction, answered, twoSided, voicemai
     partyLine,
     directionLine,
     answeredFactLine(answered, twoSided, voicemailKind),
+    routedAwayFact(routedAway),
     `Team member path (in order, if transferred/parked): ${(csrPath || []).join(' -> ') || 'unknown'}`,
     formatHoldHandoffLine(holdHandoff),
     `Phone number: ${driveClient.formatPhoneForDisplay(externalNumber)}`,
@@ -1157,12 +1167,13 @@ function buildSummaryMessages({
     const modelRows = rowsForModel(rows, classified);
     const conversationText = buildConversationText(modelRows);
     const holdHandoff = holdHandoffCredit(rows, csrPath, direction);
+    const routedAway = callIntent.transcriptShowsOtherFranchise(conversationText, direction);
     const contextLines = classified.type === 'customer'
       ? customerContextLines({
-        direction, answered, twoSided, voicemailKind, csrPath, externalNumber, externalName, callCreated, callEnded, rows, holdHandoff,
+        direction, answered, twoSided, voicemailKind, csrPath, externalNumber, externalName, callCreated, callEnded, rows, holdHandoff, routedAway,
       })
       : typedContextLines({
-        classified, direction, answered, twoSided, voicemailKind, csrPath, externalNumber, externalName, callCreated, callEnded, rows, holdHandoff,
+        classified, direction, answered, twoSided, voicemailKind, csrPath, externalNumber, externalName, callCreated, callEnded, rows, holdHandoff, routedAway,
       });
     return {
           system: systemPromptFor(classified.type),
@@ -1175,6 +1186,7 @@ function buildSummaryMessages({
           callTypeSource: classified.source,
           voicemail: Boolean(voicemailKind),
           holdHandoff,
+          routedAway,
     };
 }
 
@@ -1191,8 +1203,22 @@ function guardVoicemailSummary(summary, options = {}) {
   text = text.replace(/\bthe team member then started to respond\b/gi, 'the recording continued');
   text = text.replace(/\b(?:a|the) team member's message\b/gi, 'the recorded greeting');
   text = text.replace(/\b([A-Z][a-z]+(?: [A-Z][a-z]+)?) from Budget Blinds answered(?: the call)?\b/g, 'The caller reached the voicemail');
-  if (!/\b(voicemail|left a message|reached the queue)\b/i.test(text)) {
+  text = text.replace(/\breached (?:a |the )?(?:budget blinds )?team member\b/gi, 'reached the voicemail');
+  text = text.replace(/\b(?:a|the) team member (?:who )?informed\b/gi, 'the recorded greeting informed');
+  text = text.replace(/\bwas reached the voicemail\b/gi, 'reached the voicemail');
+  if (!/\b(voicemail|left a message|reached the queue|recorded greeting)\b/i.test(text)) {
     text = `The caller reached the queue and voicemail and left a message. ${text}`.trim();
+  }
+  return text;
+}
+
+// Last-resort rewrite when a zip-routed call is still narrated as our booking.
+function guardRoutedAwaySummary(summary, options = {}) {
+  if (!options.routedAway) return String(summary || '').trim();
+  let text = String(summary || '').trim();
+  text = text.replace(/\b(?:a|the) team member\b/gi, 'the other Budget Blinds location');
+  if (!/budget blinds location/i.test(text)) {
+    text = `The call was answered by another Budget Blinds location. ${text}`.trim();
   }
   return text;
 }
@@ -1270,6 +1296,7 @@ function summaryResult(summary, callTypeName, extra = {}) {
     bookedConsultation: Boolean(extra.bookedConsultation),
     hasTranscript: Boolean(extra.hasTranscript),
     pipedriveDeal: extra.pipedriveDeal || null,
+    transcriptText: extra.transcriptText || extra.conversationText || null,
   };
 }
 
@@ -1383,6 +1410,7 @@ async function summarizeInteraction({
   summary = callType.stripSummaryHeaders(summary);
   summary = guardVoicemailSummary(summary, { voicemail: built.voicemail });
   summary = guardHoldHandoffSummary(summary, built.holdHandoff);
+  summary = guardRoutedAwaySummary(summary, { routedAway: built.routedAway });
   const tags = tagsFor(built, summary, { direction, answered, reachedVoicemail }, model, rawSummary);
 
   return summaryResult(summary, tags.callType, { ...built, ...tags });
@@ -1396,6 +1424,7 @@ module.exports = {
   buildSummaryMessages,
   guardVoicemailSummary,
   guardHoldHandoffSummary,
+  guardRoutedAwaySummary,
   lookupContactName,
   formatCallNote: callType.formatCallNote,
 };
