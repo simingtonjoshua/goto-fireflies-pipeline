@@ -4,8 +4,8 @@
 // detected). Reuses driveClient.js's existing OAuth access token rather than a second
 // credential set - the token was authorized with the `drive.file` scope, which Google
 // also honors for the separate Sheets API (sheets.googleapis.com) as long as the
-// spreadsheet itself was created by this same app/token, which getOrCreateFeedbackSheet
-// below always does.
+// spreadsheet itself was created by this same app/token. getOrCreateFeedbackSheet
+// below reuses that file by id.
 //
 // Two tabs live in one spreadsheet rather than two separate files, so there's only ever
 // one thing to find in Drive:
@@ -17,11 +17,19 @@
 // - "Flags": one row per detected "@transcript" feedback note, written by
 //   feedbackMonitor.js.
 //
-// No new env vars - this reuses GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET/
-// GOOGLE_REFRESH_TOKEN/GOOGLE_DRIVE_FOLDER_ID, exactly as driveClient.js already does.
+// FEEDBACK_SHEET_ID and INTENT_SHEET_ID pin the spreadsheets that already live in
+// the shared drive (same ids as before the 2026-11-13 move). When either env var is
+// unset, that default id is used directly: a failed name lookup must not create a
+// new spreadsheet in My Drive. Set the env var to an empty string only to fall back
+// to find-or-create by name under GOOGLE_DRIVE_FOLDER_ID. The other Google env vars
+// are still GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET/GOOGLE_REFRESH_TOKEN/
+// GOOGLE_DRIVE_FOLDER_ID, exactly as driveClient.js already uses them.
 
 const fetch = require('node-fetch');
-const { getAccessToken } = require('./driveClient');
+const { getAccessToken, ALL_DRIVES_LIST_PARAMS, ALL_DRIVES_WRITE_PARAMS } = require('./driveClient');
+
+const DEFAULT_FEEDBACK_SHEET_ID = '1Ik9Hyg1UK2_CP06aJcWeLU_2IsmyZCPOYyWS1ckf5qg';
+const DEFAULT_INTENT_SHEET_ID = '1sNmgoaTApQt-bP5IDEUDZq4kKiJUO0N0sb50_boETHs';
 
 let request = fetch;
 let tokenProvider = getAccessToken;
@@ -118,26 +126,94 @@ async function getSheetValues(spreadsheetId, sheetName) {
   return data.values || [];
 }
 
-// Finds (or creates, with its two tabs + header rows) the shared "Call Feedback Log"
-// spreadsheet under GOOGLE_DRIVE_FOLDER_ID - looked up by exact name the same way
-// driveClient.getOrCreateCallFolder finds/creates per-call subfolders, so this is safe
-// to call from multiple code paths (interactions.js and feedbackMonitor.js) without
-// ever creating a duplicate.
+// An explicit empty FEEDBACK_SHEET_ID / INTENT_SHEET_ID disables the pin. Unset uses
+// the production spreadsheet, so a lookup miss cannot create another file in My Drive.
+function pinnedSheetId(envName, fallback) {
+  if (Object.prototype.hasOwnProperty.call(process.env, envName)) {
+    const value = String(process.env[envName] ?? '').trim();
+    return value || null;
+  }
+  return fallback;
+}
+
+async function readErrorDetail(res) {
+  if (!res || typeof res.text !== 'function') return '';
+  try {
+    return await res.text();
+  } catch (err) {
+    return '';
+  }
+}
+
+// Confirms a pinned spreadsheet is readable. A miss logs and throws; it never falls
+// through to spreadsheets.create, which is what littered My Drive with stray copies
+// after the folder moved onto the shared drive.
+async function assertPinnedSheetReachable(spreadsheetId, title, accessToken) {
+  const res = await request(
+    SHEETS_API_URL + '/' + encodeURIComponent(spreadsheetId) + '?fields=spreadsheetId',
+    { headers: { Authorization: 'Bearer ' + accessToken } },
+  );
+  if (res.ok) return;
+  const detail = await readErrorDetail(res);
+  console.error(
+    'Pinned "' + title + '" spreadsheet ' + spreadsheetId + ' is unreachable ('
+    + res.status + '): ' + detail + '. Refusing to create a stray spreadsheet.',
+  );
+  throw new Error('Pinned "' + title + '" spreadsheet ' + spreadsheetId + ' is unreachable (' + res.status + ')');
+}
+
+async function findSheetInFolder(parentId, name, accessToken) {
+  const q = "'" + parentId + "' in parents and name = '" + name + "' and mimeType = '" + SHEET_MIME + "' and trashed = false";
+  const listRes = await request(
+    DRIVE_FILES_URL + '?q=' + encodeURIComponent(q) + '&fields=files(id)&' + ALL_DRIVES_LIST_PARAMS,
+    { headers: { Authorization: 'Bearer ' + accessToken } },
+  );
+  if (!listRes.ok) {
+    const detail = await readErrorDetail(listRes);
+    console.error(
+      '"' + name + '" lookup failed (' + listRes.status + '): ' + detail
+      + '. Refusing to create a stray spreadsheet.',
+    );
+    throw new Error('"' + name + '" lookup failed (' + listRes.status + ')');
+  }
+  const listData = await listRes.json();
+  if (listData.files && listData.files[0]) return listData.files[0].id;
+  return null;
+}
+
+async function moveSheetIntoFolder(spreadsheetId, parentId, title, accessToken) {
+  const moveRes = await request(
+    DRIVE_FILES_URL + '/' + spreadsheetId + '?addParents=' + parentId + '&fields=id,parents&' + ALL_DRIVES_WRITE_PARAMS,
+    {
+      method: 'PATCH',
+      headers: { Authorization: 'Bearer ' + accessToken },
+    },
+  );
+  if (!moveRes.ok) {
+    const detail = await readErrorDetail(moveRes);
+    console.error('Warning: created "' + title + '" but failed to move it into the destination folder (' + moveRes.status + '): ' + detail);
+  }
+}
+
+// Finds (or, only when FEEDBACK_SHEET_ID is explicitly empty, creates) the shared
+// "Call Feedback Log" spreadsheet. The default pin is the sheet that already lives
+// in the shared-drive folder, so interactions.js and feedbackMonitor.js cannot each
+// create a duplicate when Drive's name search misses.
 async function getOrCreateFeedbackSheet() {
   if (cachedSpreadsheetId) return cachedSpreadsheetId;
   const accessToken = await tokenProvider();
-  const parentId = process.env.GOOGLE_DRIVE_FOLDER_ID;
+  const pinned = pinnedSheetId('FEEDBACK_SHEET_ID', DEFAULT_FEEDBACK_SHEET_ID);
+  if (pinned) {
+    await assertPinnedSheetReachable(pinned, SHEET_NAME, accessToken);
+    cachedSpreadsheetId = pinned;
+    return cachedSpreadsheetId;
+  }
 
-  const q = "'" + parentId + "' in parents and name = '" + SHEET_NAME + "' and mimeType = '" + SHEET_MIME + "' and trashed = false";
-  const listRes = await request(DRIVE_FILES_URL + '?q=' + encodeURIComponent(q) + '&fields=files(id)', {
-    headers: { Authorization: 'Bearer ' + accessToken },
-  });
-  if (listRes.ok) {
-    const listData = await listRes.json();
-    if (listData.files && listData.files[0]) {
-      cachedSpreadsheetId = listData.files[0].id;
-      return cachedSpreadsheetId;
-    }
+  const parentId = process.env.GOOGLE_DRIVE_FOLDER_ID;
+  const existingId = await findSheetInFolder(parentId, SHEET_NAME, accessToken);
+  if (existingId) {
+    cachedSpreadsheetId = existingId;
+    return cachedSpreadsheetId;
   }
 
   // Create a blank spreadsheet with both tabs named up front via the Sheets API itself
@@ -145,7 +221,7 @@ async function getOrCreateFeedbackSheet() {
   // name every tab in the same request. Sheets' create endpoint doesn't accept a
   // `parents` field, so the new spreadsheet lands in "My Drive" root by default - a
   // second Drive API call below moves it into GOOGLE_DRIVE_FOLDER_ID alongside every
-  // call's own per-call subfolder.
+  // call's own per-call subfolder. This path runs only when the pin is turned off.
   const createRes = await request(SHEETS_API_URL, {
     method: 'POST',
     headers: {
@@ -158,18 +234,12 @@ async function getOrCreateFeedbackSheet() {
     }),
   });
   if (!createRes.ok) {
-    throw new Error('Failed to create "' + SHEET_NAME + '" spreadsheet (' + createRes.status + '): ' + (await createRes.text()));
+    throw new Error('Failed to create "' + SHEET_NAME + '" spreadsheet (' + createRes.status + '): ' + (await readErrorDetail(createRes)));
   }
   const created = await createRes.json();
   const spreadsheetId = created.spreadsheetId;
 
-  const moveRes = await request(DRIVE_FILES_URL + '/' + spreadsheetId + '?addParents=' + parentId + '&fields=id,parents', {
-    method: 'PATCH',
-    headers: { Authorization: 'Bearer ' + accessToken },
-  });
-  if (!moveRes.ok) {
-    console.error('Warning: created "' + SHEET_NAME + '" but failed to move it into the destination folder (' + moveRes.status + '): ' + (await moveRes.text()));
-  }
+  await moveSheetIntoFolder(spreadsheetId, parentId, SHEET_NAME, accessToken);
 
   await appendRow(spreadsheetId, 'Calls', CALLS_HEADER);
   await appendRow(spreadsheetId, 'Flags', FLAGS_HEADER);
@@ -201,9 +271,10 @@ async function ensureIntentHeader(spreadsheetId, accessToken) {
   }
 }
 
-// Finds or creates the "Call Intent Master" spreadsheet in GOOGLE_DRIVE_FOLDER_ID.
-// One tab, "Calls", with the intent columns. A sheet this app already created is
-// reused; the header row is written only when this process creates the file.
+// Finds or creates the "Call Intent Master" spreadsheet. The default pin is the
+// sheet already in the shared drive, used directly. Find-or-create by name runs
+// only when INTENT_SHEET_ID is explicitly empty. The header row is written when
+// this process creates the file, or when a reused file has an empty header.
 async function getOrCreateIntentSheet() {
   if (cachedIntentSpreadsheetId) {
     return {
@@ -213,22 +284,28 @@ async function getOrCreateIntentSheet() {
     };
   }
   const accessToken = await tokenProvider();
+  const pinned = pinnedSheetId('INTENT_SHEET_ID', DEFAULT_INTENT_SHEET_ID);
+  if (pinned) {
+    await assertPinnedSheetReachable(pinned, INTENT_SHEET_NAME, accessToken);
+    cachedIntentSpreadsheetId = pinned;
+    await ensureIntentHeader(pinned, accessToken);
+    return {
+      id: pinned,
+      url: spreadsheetUrl(pinned),
+      created: false,
+    };
+  }
+
   const parentId = process.env.GOOGLE_DRIVE_FOLDER_ID;
-  const q = "'" + parentId + "' in parents and name = '" + INTENT_SHEET_NAME + "' and mimeType = '" + SHEET_MIME + "' and trashed = false";
-  const listRes = await request(DRIVE_FILES_URL + '?q=' + encodeURIComponent(q) + '&fields=files(id)', {
-    headers: { Authorization: 'Bearer ' + accessToken },
-  });
-  if (listRes.ok) {
-    const listData = await listRes.json();
-    if (listData.files && listData.files[0]) {
-      cachedIntentSpreadsheetId = listData.files[0].id;
-      await ensureIntentHeader(cachedIntentSpreadsheetId, accessToken);
-      return {
-        id: cachedIntentSpreadsheetId,
-        url: spreadsheetUrl(cachedIntentSpreadsheetId),
-        created: false,
-      };
-    }
+  const existingId = await findSheetInFolder(parentId, INTENT_SHEET_NAME, accessToken);
+  if (existingId) {
+    cachedIntentSpreadsheetId = existingId;
+    await ensureIntentHeader(existingId, accessToken);
+    return {
+      id: existingId,
+      url: spreadsheetUrl(existingId),
+      created: false,
+    };
   }
 
   const createRes = await request(SHEETS_API_URL, {
@@ -243,23 +320,13 @@ async function getOrCreateIntentSheet() {
     }),
   });
   if (!createRes.ok) {
-    const detail = typeof createRes.text === 'function' ? await createRes.text() : '';
+    const detail = await readErrorDetail(createRes);
     throw new Error('Failed to create "' + INTENT_SHEET_NAME + '" spreadsheet (' + createRes.status + '): ' + detail);
   }
   const created = await createRes.json();
   const spreadsheetId = created.spreadsheetId;
 
-  const moveRes = await request(
-    DRIVE_FILES_URL + '/' + spreadsheetId + '?addParents=' + parentId + '&fields=id,parents',
-    {
-      method: 'PATCH',
-      headers: { Authorization: 'Bearer ' + accessToken },
-    },
-  );
-  if (!moveRes.ok) {
-    const detail = typeof moveRes.text === 'function' ? await moveRes.text() : '';
-    console.error('Warning: created "' + INTENT_SHEET_NAME + '" but failed to move it into the destination folder (' + moveRes.status + '): ' + detail);
-  }
+  await moveSheetIntoFolder(spreadsheetId, parentId, INTENT_SHEET_NAME, accessToken);
 
   await appendRow(spreadsheetId, INTENT_TAB, INTENT_HEADER);
   cachedIntentSpreadsheetId = spreadsheetId;
@@ -296,6 +363,8 @@ module.exports = {
   INTENT_SHEET_NAME,
   INTENT_TAB,
   INTENT_HEADER,
+  DEFAULT_FEEDBACK_SHEET_ID,
+  DEFAULT_INTENT_SHEET_ID,
   spreadsheetUrl,
   setSheetsTransportForTests,
   resetSheetsTransportForTests,

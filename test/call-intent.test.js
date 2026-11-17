@@ -20,6 +20,8 @@ const JAMES_CELL = '5550101444';
 const savedEnv = {
   pipedrive: process.env.PIPEDRIVE_API_TOKEN,
   folder: process.env.GOOGLE_DRIVE_FOLDER_ID,
+  intentSheet: process.env.INTENT_SHEET_ID,
+  feedbackSheet: process.env.FEEDBACK_SHEET_ID,
 };
 
 function jsonResponse(status, body) {
@@ -41,6 +43,10 @@ after(() => {
   else process.env.PIPEDRIVE_API_TOKEN = savedEnv.pipedrive;
   if (savedEnv.folder === undefined) delete process.env.GOOGLE_DRIVE_FOLDER_ID;
   else process.env.GOOGLE_DRIVE_FOLDER_ID = savedEnv.folder;
+  if (savedEnv.intentSheet === undefined) delete process.env.INTENT_SHEET_ID;
+  else process.env.INTENT_SHEET_ID = savedEnv.intentSheet;
+  if (savedEnv.feedbackSheet === undefined) delete process.env.FEEDBACK_SHEET_ID;
+  else process.env.FEEDBACK_SHEET_ID = savedEnv.feedbackSheet;
 });
 
 describe('intent list', () => {
@@ -505,12 +511,17 @@ describe('Call Intent Master sheet', () => {
   it('creates the sheet in the Drive folder and reuses it', async () => {
     sheetsClient.resetSheetsTransportForTests();
     process.env.GOOGLE_DRIVE_FOLDER_ID = 'folder-1';
+    process.env.INTENT_SHEET_ID = '';
     const calls = [];
     sheetsClient.setSheetsTransportForTests({
       tokenProvider: async () => 'token',
       fetch: async (url, options = {}) => {
         calls.push({ url, method: options.method || 'GET', body: options.body });
-        if (String(url).includes('/drive/v3/files?')) return jsonResponse(200, { files: [] });
+        if (String(url).includes('/drive/v3/files?')) {
+          assert.match(String(url), /supportsAllDrives=true/);
+          assert.match(String(url), /includeItemsFromAllDrives=true/);
+          return jsonResponse(200, { files: [] });
+        }
         if (url === 'https://sheets.googleapis.com/v4/spreadsheets' && options.method === 'POST') {
           const body = JSON.parse(options.body);
           assert.equal(body.properties.title, 'Call Intent Master');
@@ -519,6 +530,8 @@ describe('Call Intent Master sheet', () => {
         }
         if (String(url).includes('/drive/v3/files/sheet123') && options.method === 'PATCH') {
           assert.match(String(url), /addParents=folder-1/);
+          assert.match(String(url), /supportsAllDrives=true/);
+          assert.doesNotMatch(String(url), /includeItemsFromAllDrives/);
           return jsonResponse(200, { id: 'sheet123' });
         }
         if (String(url).includes(':append')) {
@@ -541,12 +554,17 @@ describe('Call Intent Master sheet', () => {
   it('does not create a second file when the sheet already exists', async () => {
     sheetsClient.resetSheetsTransportForTests();
     process.env.GOOGLE_DRIVE_FOLDER_ID = 'folder-1';
+    process.env.INTENT_SHEET_ID = '';
     const calls = [];
     sheetsClient.setSheetsTransportForTests({
       tokenProvider: async () => 'token',
       fetch: async (url, options = {}) => {
         calls.push({ url, method: options.method || 'GET' });
-        if (String(url).includes('/drive/v3/files?')) return jsonResponse(200, { files: [{ id: 'abc' }] });
+        if (String(url).includes('/drive/v3/files?')) {
+          assert.match(String(url), /supportsAllDrives=true/);
+          assert.match(String(url), /includeItemsFromAllDrives=true/);
+          return jsonResponse(200, { files: [{ id: 'abc' }] });
+        }
         if (String(url).includes('/values/')) return jsonResponse(200, { values: [sheetsClient.INTENT_HEADER] });
         throw new Error(`unexpected ${options.method || 'GET'} ${url}`);
       },
