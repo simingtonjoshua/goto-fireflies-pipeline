@@ -143,7 +143,7 @@ GoTo webhook notification  ──►  this service
 
 Each finalized call is classified into one of twelve intents, a short outcome, and Lead (`Yes`, `No`, or `Unknown`). Those fields are added to the transcript Google Doc header and the Heymarket note header. The summary paragraph is unchanged. Rows are written only for calls finalized after deploy; nothing is backfilled. `GET /admin/intent-sheet` returns the sheet URL, and startup logs `Call Intent Master sheet: ...`.
 
-The sheet is titled **Call Intent Master** (tab `Calls`) and is created in `GOOGLE_DRIVE_FOLDER_ID` if it is not already there. Columns, in order: Date, Caller ID, Direction, Team Member, Call Type, Intent, Outcome, Lead, Transcript Link. Transcript Link is the Google Doc URL. A sheet failure does not block the Doc or the note.
+The sheet is titled **Call Intent Master** (tab `Calls`). `INTENT_SHEET_ID` pins it; when that variable is unset the app uses the spreadsheet already in the shared-drive folder (`1sNmgoaTApQt-bP5IDEUDZq4kKiJUO0N0sb50_boETHs`) and does not create a new file if a name lookup misses. `FEEDBACK_SHEET_ID` does the same for **Call Feedback Log** (`1Ik9Hyg1UK2_CP06aJcWeLU_2IsmyZCPOYyWS1ckf5qg`). Columns, in order: Date, Caller ID, Direction, Team Member, Call Type, Intent, Outcome, Lead, Transcript Link. Transcript Link is the Google Doc URL. A sheet failure does not block the Doc or the note.
 
 `PIPEDRIVE_API_TOKEN` is optional. When it is set, a phone lookup can add `Pipedrive deal: <id> — <title>`. When it is unset or the lookup fails, that line is omitted.
 

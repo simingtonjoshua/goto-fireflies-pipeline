@@ -1,17 +1,19 @@
-// Archives call recordings AND transcript/summary Google Docs to Joshua's personal
-// Google Drive for indefinite long-term storage. Uses a single pre-authorized OAuth2
-// refresh token rather than a service account, because the target is a folder on
-// Joshua's own personal Drive, not a Shared Drive - service accounts have no personal
-// storage quota of their own and can't own files there. The refresh token was obtained
+// Archives call recordings AND transcript/summary Google Docs to Google Drive for
+// indefinite long-term storage. Uses a single pre-authorized OAuth2 refresh token
+// rather than a service account, because a service account has no storage quota of
+// its own and cannot own files in a user's My Drive. The refresh token was obtained
 // via Google's OAuth 2.0 Playground on 2026-07-20/21, authorizing as
 // jsimington@budgetblinds.com with the minimal, non-sensitive `drive.file` scope (this
 // app can only see/manage files it creates itself - it cannot browse or read the rest
-// of Joshua's Drive). The top-level destination folder is named "Call Recordings &
+// of that account's Drive). The top-level destination folder is named "Call Recordings &
 // Transcriptions" (renamed 2026-07-21 from "Call Recordings" now that transcripts live
-// here too); Joshua can move it under "Budget Blinds Company File Center" (or anywhere
-// else) in the Drive UI at any time without breaking this app's access, since
-// drive.file grants are tied to the file's resource id, not its location in the folder
-// hierarchy.
+// here too). On 2026-11-13 that folder, with the Call Feedback Log and Call Intent
+// Master spreadsheets, was moved into the shared drive 0AMp-dLExMKeuUk9PVA. The file
+// ids did not change, and jsimington@budgetblinds.com is an organizer there.
+// drive.file grants follow the file id, but Drive still hides shared-drive items unless
+// every files.list sets supportsAllDrives and includeItemsFromAllDrives, and every
+// files.create / files.update / upload sets supportsAllDrives. Without those flags,
+// list returns nothing and create/upload/update return 404.
 //
 // As of 2026-07-21, each call gets its own subfolder (see buildCallFolderName /
 // getOrCreateCallFolder below) containing both the audio recording and a transcript+
@@ -29,7 +31,11 @@ const fetch = require('node-fetch');
 
 const TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const DRIVE_FILES_URL = 'https://www.googleapis.com/drive/v3/files';
-const UPLOAD_URL = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,webViewLink';
+// files.list must ask for shared-drive items. Create, update, and upload only need
+// supportsAllDrives; includeItemsFromAllDrives is not a valid parameter on those methods.
+const ALL_DRIVES_LIST_PARAMS = 'supportsAllDrives=true&includeItemsFromAllDrives=true';
+const ALL_DRIVES_WRITE_PARAMS = 'supportsAllDrives=true';
+const UPLOAD_URL = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,webViewLink&' + ALL_DRIVES_WRITE_PARAMS;
 const FOLDER_MIME = 'application/vnd.google-apps.folder';
 const DOC_MIME = 'application/vnd.google-apps.document';
 
@@ -59,6 +65,25 @@ async function getAccessToken() {
         const data = await res.json();
         cachedToken = { accessToken: data.access_token, expiresAt: Date.now() + data.expires_in * 1000 };
         return cachedToken.accessToken;
+}
+
+let driveRequest = fetch;
+let driveTokenProvider = null;
+
+function setDriveTransportForTests(transport = {}) {
+        driveRequest = transport.fetch || fetch;
+        driveTokenProvider = transport.tokenProvider || null;
+}
+
+function resetDriveTransportForTests() {
+        driveRequest = fetch;
+        driveTokenProvider = null;
+        cachedToken = null;
+}
+
+async function currentAccessToken() {
+        if (driveTokenProvider) return driveTokenProvider();
+        return getAccessToken();
 }
 
 // Maps a recording's Content-Type to a sensible file extension for the Drive filename.
@@ -123,11 +148,11 @@ function buildCallFolderName({ callCreated, direction, externalNumber }) {
 // to call from both the recording-upload path and the transcript-doc path for the same
 // call without creating two folders.
 async function getOrCreateCallFolder(parentId, folderName) {
-        const accessToken = await getAccessToken();
+        const accessToken = await currentAccessToken();
         const escapedName = folderName.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
         const q = `'${parentId}' in parents and name = '${escapedName}' and mimeType = '${FOLDER_MIME}' and trashed = false`;
 
-  const listRes = await fetch(`${DRIVE_FILES_URL}?q=${encodeURIComponent(q)}&fields=files(id,webViewLink)`, {
+  const listRes = await driveRequest(`${DRIVE_FILES_URL}?q=${encodeURIComponent(q)}&fields=files(id,webViewLink)&${ALL_DRIVES_LIST_PARAMS}`, {
             headers: { Authorization: `Bearer ${accessToken}` },
   });
         if (listRes.ok) {
@@ -135,7 +160,7 @@ async function getOrCreateCallFolder(parentId, folderName) {
                   if (listData.files && listData.files[0]) return listData.files[0];
         }
 
-  const createRes = await fetch(`${DRIVE_FILES_URL}?fields=id,webViewLink`, {
+  const createRes = await driveRequest(`${DRIVE_FILES_URL}?fields=id,webViewLink&${ALL_DRIVES_WRITE_PARAMS}`, {
             method: 'POST',
             headers: {
                         Authorization: `Bearer ${accessToken}`,
@@ -154,8 +179,8 @@ async function getOrCreateCallFolder(parentId, folderName) {
 // /admin/rename-drive-folder route in server.js since Render's free tier has no Shell
 // access to run a one-off script directly.
 async function renameFolder(folderId, newName) {
-        const accessToken = await getAccessToken();
-        const res = await fetch(`${DRIVE_FILES_URL}/${folderId}?fields=id,name,webViewLink`, {
+        const accessToken = await currentAccessToken();
+        const res = await driveRequest(`${DRIVE_FILES_URL}/${folderId}?fields=id,name,webViewLink&${ALL_DRIVES_WRITE_PARAMS}`, {
                   method: 'PATCH',
                   headers: {
                               Authorization: `Bearer ${accessToken}`,
@@ -174,7 +199,7 @@ async function renameFolder(folderId, newName) {
 // id + a webViewLink. Files land with Drive's default sharing (private to the
 // authorizing account, i.e. Joshua) - nothing here makes them public.
 async function uploadRecording(buffer, contentType, filename, folderId) {
-        const accessToken = await getAccessToken();
+        const accessToken = await currentAccessToken();
         const targetFolderId = folderId || process.env.GOOGLE_DRIVE_FOLDER_ID;
 
   const boundary = `goto_drive_upload_${Date.now()}_${Math.random().toString(16).slice(2)}`;
@@ -193,7 +218,7 @@ async function uploadRecording(buffer, contentType, filename, folderId) {
 
   const body = Buffer.concat([Buffer.from(preamble, 'utf8'), buffer, Buffer.from(closing, 'utf8')]);
 
-  const res = await fetch(UPLOAD_URL, {
+  const res = await driveRequest(UPLOAD_URL, {
             method: 'POST',
             headers: {
                         Authorization: `Bearer ${accessToken}`,
@@ -218,7 +243,7 @@ async function uploadRecording(buffer, contentType, filename, folderId) {
 // finalizeInteraction turns the assembled transcript + summary + metadata into a
 // document that lives alongside the audio recording in the same per-call subfolder.
 async function createTranscriptDoc(folderId, title, htmlContent) {
-        const accessToken = await getAccessToken();
+        const accessToken = await currentAccessToken();
 
   const boundary = `goto_drive_doc_${Date.now()}_${Math.random().toString(16).slice(2)}`;
         const metadata = {
@@ -241,7 +266,7 @@ async function createTranscriptDoc(folderId, title, htmlContent) {
             Buffer.from(closing, 'utf8'),
           ]);
 
-  const res = await fetch(UPLOAD_URL, {
+  const res = await driveRequest(UPLOAD_URL, {
             method: 'POST',
             headers: {
                         Authorization: `Bearer ${accessToken}`,
@@ -270,4 +295,9 @@ module.exports = {
         formatDateForFilename,
         formatPhoneForDisplay,
         getAccessToken,
+        ALL_DRIVES_LIST_PARAMS,
+        ALL_DRIVES_WRITE_PARAMS,
+        UPLOAD_URL,
+        setDriveTransportForTests,
+        resetDriveTransportForTests,
 };
